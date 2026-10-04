@@ -1,0 +1,12 @@
+{
+  "algorithm": "relay-pop-v1",
+  "vectorKind": "encoding-only",
+  "note": "Validates digest framing with compact ranges; production challenges always contain four 4096-byte ranges.",
+  "localDataPattern": "UTF-8 relay repeated 20000 times",
+  "nonceHex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+  "ranges": [
+    {"offset": 17, "length": 32},
+    {"offset": 8192, "length": 64}
+  ],
+  "expectedDigestHex": "4fe40797c3496e5114d7f293d8948e76f48fbd8bf7e9bd7249194a4b597c46ac"
+}

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  DriverKit entitlements for ProvenanceCompanionOpticalDriveDriverKit.dext
+
+	  IMPORTANT: The following entitlements require Apple approval before distribution.
+	  Request via: https://developer.apple.com/contact/request/driverkit/
+	  JoeMatt has initiated the entitlement request (March 2026).
+
+	  Re-add when approved:
+	    com.apple.developer.driverkit
+	    com.apple.developer.driverkit.transport.usb
+	    com.apple.developer.driverkit.allow-any-usb-device
+	    com.apple.developer.driverkit.userclient-access (array: org.provenance-emu.provenance, org.provenance-emu.ProvenanceCompanion)
+	-->
+
+	<!-- App sandbox (required for DriverKit extensions on iPadOS) -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+</dict>
+</plist>

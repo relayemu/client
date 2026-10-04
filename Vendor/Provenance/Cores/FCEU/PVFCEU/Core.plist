@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PVCoreIdentifier</key>
+	<string>com.provenance.core.fceu</string>
+	<key>PVPrincipleClass</key>
+	<string>PVFCEU.PVFCEUEmulatorCore</string>
+	<key>PVSupportedSystems</key>
+	<array>
+		<string>com.provenance.nes</string>
+		<string>com.provenance.fds</string>
+	</array>
+	<key>PVProjectName</key>
+	<string>FCEUX</string>
+	<key>PVProjectURL</key>
+	<string>http://sourceforge.net/projects/fceultra/</string>
+	<key>PVProjectVersion</key>
+	<string>2.6.2</string>
+	<key>PVSupportedCheatTypes</key>
+	<array>
+		<string>Game Genie</string>
+	</array>
+	<key>PVCapabilities</key>
+	<array>
+		<string>lightgunSupport</string>
+	</array>
+	<key>PVLicenseName</key>
+	<string>GPL-2.0-or-later</string>
+	<key>PVLicenseURL</key>
+	<string>https://github.com/TASEmulators/fceux/blob/HEAD/COPYING</string>
+	<key>PVCopyright</key>
+	<string>Copyright © 2000-2024 FCEUX Team</string>
+</dict>
+</plist>

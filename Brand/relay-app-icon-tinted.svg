@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- iOS/iPadOS tinted appearance: greyscale, no ground; the system maps luminance to the tint. -->
+  <g transform="translate(512 532) scale(7.016) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="#FFFFFF"/>
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="#949494"/>
+  </g>
+</svg>

@@ -1,0 +1,239 @@
+//
+//  SpotlightHelper.swift
+//  PVLibrary
+//
+//  Created by Joseph Mattiello on 4/16/25.
+//  Copyright © 2025 Provenance Emu. All rights reserved.
+//
+
+import Foundation
+import CoreSpotlight
+import PVPrimitives
+import PVSupport
+import RealmSwift
+import UniformTypeIdentifiers
+import PVMediaCache
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+typealias UIImage = NSImage
+#endif
+
+/// Encoding parameters for Spotlight thumbnail payloads.
+enum SpotlightThumbnail {
+    /// Spotlight renders these small; 0.8 keeps the payload well under the
+    /// attribute-set size guidance without a visible quality drop.
+    static let jpegCompressionQuality: CGFloat = 0.8
+}
+
+/// Helper class for Spotlight operations
+public class SpotlightHelper {
+    
+    /// Shared instance for easy access
+    public static let shared = SpotlightHelper()
+    
+    /// Domain identifier for all Provenance items
+    public static let domainIdentifier = "org.provenance-emu.games"
+
+    private init() {}
+    
+    /// Force reindex all Provenance content in Spotlight
+    /// - Parameter completion: Optional completion handler called when reindexing is complete
+    public func forceReindexAll(completion: (() -> Void)? = nil) {
+        #if !os(tvOS)
+        ILOG("Starting Spotlight reindexing for all Provenance content")
+        
+        // Get the default searchable index
+        let searchableIndex = CSSearchableIndex.default()
+        
+        // Delete all Provenance items from the index first
+        searchableIndex.deleteSearchableItems(withDomainIdentifiers: [SpotlightHelper.domainIdentifier]) { [weak self] error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                ELOG("Error deleting existing Spotlight items: \(error)")
+            } else {
+                ILOG("Successfully deleted existing Spotlight items")
+            }
+            
+            // Now reindex all games and save states
+            Task {
+                do {
+                    try await self.reindexAllGames()
+                    try await self.reindexAllSaveStates()
+                    ILOG("Successfully reindexed Spotlight items")
+                } catch {
+                    ELOG("Error during Spotlight reindexing: \(error)")
+                }
+                
+                // Call completion handler if provided
+                DispatchQueue.main.async {
+                    completion?()
+                }
+            }
+        }
+        #endif
+    }
+    
+    /// Reindex all games in Spotlight
+    private func reindexAllGames() async throws {
+        ILOG("Reindexing all games in Spotlight")
+        #if !os(tvOS)
+
+        // Get the default searchable index
+        let searchableIndex = CSSearchableIndex.default()
+        
+        // Create a batch processor to handle multiple items at once
+        var pendingItems: [CSSearchableItem] = []
+        let batchSize = 50 // Smaller batch size for more frequent updates
+        var totalIndexed = 0
+        
+        // Function to process a batch of items
+        func processBatch() async throws {
+            guard !pendingItems.isEmpty else { return }
+            
+            try await searchableIndex.indexSearchableItems(pendingItems)
+            totalIndexed += pendingItems.count
+            ILOG("Indexed batch of \(pendingItems.count) games (Total: \(totalIndexed))")
+            pendingItems.removeAll(keepingCapacity: true)
+        }
+        
+        // Use the shared RomDatabase instance to access Realm safely
+        // This ensures we use the same database as the main app
+        let database = RomDatabase.sharedInstance
+        let realm = database.realm
+        
+        // Get all games from the database and freeze them individually for thread-safe access
+        let allGames = realm.objects(PVGame.self)
+        let totalGames = allGames.count
+        ILOG("Found \(totalGames) games to index")
+        
+        // Process each game
+        for game in allGames {
+            let frozenGame = game.freeze()
+            
+            // Create the searchable item
+            let attributeSet = frozenGame.spotlightContentSet
+            
+            // Add keywords for better searchability
+            if var keywords = attributeSet.keywords as? [String] {
+                if let systemName = frozenGame.system?.name, !keywords.contains(systemName) {
+                    keywords.append(systemName)
+                }
+                if let manufacturer = frozenGame.system?.manufacturer, !keywords.contains(manufacturer) {
+                    keywords.append(manufacturer)
+                }
+                attributeSet.keywords = keywords
+            }
+            
+            // Create the searchable item
+            let item = CSSearchableItem(
+                uniqueIdentifier: "org.provenance-emu.game.\(frozenGame.md5Hash)",
+                domainIdentifier: SpotlightHelper.domainIdentifier,
+                attributeSet: attributeSet
+            )
+            
+            pendingItems.append(item)
+            
+            // Process batch if we've reached the batch size
+            if pendingItems.count >= batchSize {
+                try await processBatch()
+            }
+        }
+        
+        // Process any remaining items
+        try await processBatch()
+        #endif
+    }
+    
+    /// Reindex all save states in Spotlight
+    private func reindexAllSaveStates() async throws {
+        ILOG("Reindexing all save states in Spotlight")
+        #if !os(tvOS)
+        // Get the default searchable index
+        let searchableIndex = CSSearchableIndex.default()
+        
+        // Create a batch processor to handle multiple items at once
+        var pendingItems: [CSSearchableItem] = []
+        let batchSize = 50 // Smaller batch size for more frequent updates
+        var totalIndexed = 0
+        
+        // Function to process a batch of items
+        func processBatch() async throws {
+            guard !pendingItems.isEmpty else { return }
+            
+            try await searchableIndex.indexSearchableItems(pendingItems)
+            totalIndexed += pendingItems.count
+            ILOG("Indexed batch of \(pendingItems.count) save states (Total: \(totalIndexed))")
+            pendingItems.removeAll(keepingCapacity: true)
+        }
+        
+        // Use the shared RomDatabase instance to access Realm safely
+        // This ensures we use the same database as the main app
+        let database = RomDatabase.sharedInstance
+        let realm = database.realm
+        
+        // Get all save states from the database
+        let allSaveStates = realm.objects(PVSaveState.self)
+        ILOG("Found \(allSaveStates.count) save states to index")
+        
+        // Process each save state
+        for saveState in allSaveStates {
+            // Create a frozen copy of the save state to safely use across threads
+            let frozenSaveState = saveState.freeze()
+            
+            // Get the associated game
+            guard let game = frozenSaveState.game else { continue }
+            
+            // Create attribute set using the registered Provenance save-state UTI
+            // com.provenance.savestate is exported in the app's Info.plist and conforms to public.data
+            let attributeSet = CSSearchableItemAttributeSet(contentType: .savestate)
+            let saveStateTitle = "Save State: \(game.title)"
+            attributeSet.title = saveStateTitle
+            attributeSet.displayName = saveStateTitle
+            attributeSet.contentDescription = "Save state for \(game.title) on \(game.system?.name ?? "Unknown System")"
+            
+            // Add date information
+            attributeSet.contentCreationDate = frozenSaveState.date
+            attributeSet.contentModificationDate = frozenSaveState.date
+            
+            // Add screenshot thumbnail if available.
+            // Downsample at decode time: save-state screenshots are full device
+            // resolution (~12 MB decoded) and Spotlight only shows a thumbnail.
+            if let imageURL = frozenSaveState.image?.url {
+                attributeSet.thumbnailURL = imageURL
+                attributeSet.thumbnailData = autoreleasepool {
+                    ArtworkDownsampler
+                        .image(atPath: imageURL.path, target: .thumbnail)?
+                        .jpegData(compressionQuality: SpotlightThumbnail.jpegCompressionQuality)
+                }
+            }
+
+            // Add keywords
+            var keywords = ["save state", "saved game", "provenance", "emulator"]
+            if let systemName = game.system?.name {
+                keywords.append(systemName)
+            }
+            attributeSet.keywords = keywords
+            
+            // Create searchable item
+            let item = CSSearchableItem(
+                uniqueIdentifier: "org.provenance-emu.savestate.\(frozenSaveState.id)",
+                domainIdentifier: SpotlightHelper.domainIdentifier,
+                attributeSet: attributeSet
+            )
+            
+            pendingItems.append(item)
+            
+            // Process batch if we've reached the batch size
+            if pendingItems.count >= batchSize {
+                try await processBatch()
+            }
+        }
+        
+        // Process any remaining items
+        try await processBatch()
+        #endif
+    }
+}

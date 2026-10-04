@@ -1,0 +1,3572 @@
+//
+//  PVLibretro.m
+//  PVRetroArch
+//
+//  Created by Joseph Mattiello on 6/15/22.
+//  Copyright © 2022 Provenance Emu. All rights reserved.
+//
+
+#import <Foundation/Foundation.h>
+#import <objc/message.h>
+#import "PVCoreBridgeRetro.h"
+
+@import PVLoggingObjC;
+@import PVSettings;
+@import PVAudio;
+@import PVCoreBridge;
+#if TARGET_OS_IOS || TARGET_OS_TV || TARGET_OS_MACCATALYST
+@import UIKit; // UIDevice battery, UIEvent/sendEvent, touchpad forwarding
+#endif
+
+#include "libretro.h"
+#include "libretro_vulkan.h"
+
+/// Returns true if Provenance has acquired JIT at runtime (bridged from DOLJitManager).
+/// Defined in PVLibRetro+JIT.swift via @_cdecl("pvjit_acquired").
+extern bool pvjit_acquired(void);
+
+/// Returns the shared CoreMIDI-backed retro_midi_interface defined in PVThinLibretroFrontend.mm.
+/// Declared here so the ObjC env callback can fill the pointer without C++ headers.
+extern struct retro_midi_interface *pv_libretro_midi_interface(void);
+
+/// Injects a raw MIDI byte into the shared input ring buffer (PVThinLibretroFrontend.mm).
+/// Used by MIDIResponder implementations to forward decoded MIDI events from MIDIDeviceManager.
+extern void pv_libretro_midi_inject_byte(uint8_t byte);
+
+// ---------------------------------------------------------------------------
+// MARK: - Performance interface (local copy for legacy core)
+// ---------------------------------------------------------------------------
+
+#include <mach/mach_time.h>
+#include <os/signpost.h>
+
+#define PV_PERF_MAX_COUNTERS 256
+
+static double pv_legacy_perf_timebase_ratio = 0.0;
+
+static void pv_legacy_perf_ensure_timebase(void) {
+    if (pv_legacy_perf_timebase_ratio == 0.0) {
+        mach_timebase_info_data_t info;
+        mach_timebase_info(&info);
+        pv_legacy_perf_timebase_ratio = (double)info.numer / (double)info.denom;
+    }
+}
+
+static struct retro_perf_counter *pv_legacy_perf_counters[PV_PERF_MAX_COUNTERS];
+static unsigned pv_legacy_perf_counter_count = 0;
+
+#if DEBUG
+static os_log_t pv_legacy_perf_signpost_log(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("org.provenance-emu.PVCoreBridgeRetro", "libretro-perf-legacy");
+    });
+    return log;
+}
+#endif
+
+static retro_time_t pv_legacy_perf_get_time_usec(void) {
+    pv_legacy_perf_ensure_timebase();
+    return (retro_time_t)(mach_absolute_time() * pv_legacy_perf_timebase_ratio / 1000.0);
+}
+
+static retro_perf_tick_t pv_legacy_perf_get_counter(void) {
+    return (retro_perf_tick_t)mach_absolute_time();
+}
+
+static uint64_t pv_legacy_perf_get_cpu_features(void) {
+#if defined(__aarch64__) || defined(__arm64__)
+    return RETRO_SIMD_NEON | RETRO_SIMD_ASIMD;
+#elif defined(__x86_64__)
+    return RETRO_SIMD_SSE | RETRO_SIMD_SSE2;
+#else
+    return 0;
+#endif
+}
+
+static void pv_legacy_perf_register(struct retro_perf_counter *counter) {
+    if (!counter || counter->registered || pv_legacy_perf_counter_count >= PV_PERF_MAX_COUNTERS)
+        return;
+    pv_legacy_perf_counters[pv_legacy_perf_counter_count++] = counter;
+    counter->registered = true;
+}
+
+static void pv_legacy_perf_start(struct retro_perf_counter *counter) {
+    if (!counter) return;
+    counter->call_cnt++;
+    counter->start = mach_absolute_time();
+#if DEBUG
+    if (counter->ident) {
+        os_signpost_interval_begin(pv_legacy_perf_signpost_log(),
+            (os_signpost_id_t)(uintptr_t)counter,
+            "perf_counter", "%s", counter->ident);
+    }
+#endif
+}
+
+static void pv_legacy_perf_stop(struct retro_perf_counter *counter) {
+    if (!counter) return;
+    counter->total += mach_absolute_time() - counter->start;
+#if DEBUG
+    if (counter->ident) {
+        os_signpost_interval_end(pv_legacy_perf_signpost_log(),
+            (os_signpost_id_t)(uintptr_t)counter,
+            "perf_counter", "%s", counter->ident);
+    }
+#endif
+}
+
+static void pv_legacy_perf_log(void) {
+    pv_legacy_perf_ensure_timebase();
+    double ns_ratio = pv_legacy_perf_timebase_ratio;
+    for (unsigned i = 0; i < pv_legacy_perf_counter_count; i++) {
+        struct retro_perf_counter *c = pv_legacy_perf_counters[i];
+        if (!c) continue;
+        double total_ms = (double)c->total * ns_ratio / 1e6;
+        ILOG(@"[PERF] %s: %.3f ms (%llu calls)",
+             c->ident ? c->ident : "(null)", total_ms, (unsigned long long)c->call_cnt);
+    }
+#if DEBUG
+    os_signpost_event_emit(pv_legacy_perf_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
+                           "perf_log", "dumped %u counters", pv_legacy_perf_counter_count);
+#endif
+}
+
+/// Forward declaration so `@selector` / strict selector checks see the Swift `@objc` class method.
+@interface NSObject (PVLibRetroRumbleHelperDecl)
++ (void)rumbleWithPort:(uint32_t)port isStrong:(BOOL)isStrong strength:(uint16_t)strength;
+@end
+
+/// Rumble callback matching retro_set_rumble_state_t.
+/// Dispatches to PVLibRetroRumbleHelper (Swift) via ObjC runtime.
+static bool pv_retro_rumble_callback(unsigned port, enum retro_rumble_effect effect, uint16_t strength) {
+    Class helper = NSClassFromString(@"PVLibRetro.PVLibRetroRumbleHelper");
+    if (!helper) helper = NSClassFromString(@"PVLibRetroRumbleHelper");
+    if (!helper) return false;
+    BOOL isStrong = (effect == RETRO_RUMBLE_STRONG);
+    SEL sel = @selector(rumbleWithPort:isStrong:strength:);
+    if ([helper respondsToSelector:sel]) {
+        ((void(*)(id, SEL, uint32_t, BOOL, uint16_t))objc_msgSend)(helper, sel, (uint32_t)port, isStrong, strength);
+        return true;
+    }
+    return false;
+}
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "dynamic.h"
+#include <dynamic/dylib.h>
+#include <string/stdstring.h>
+
+#include "command.h"
+#include "core_info.h"
+
+#include "managers/state_manager.h"
+//#include "audio/audio_driver.h"
+//#include "camera/camera_driver.h"
+//#include "location/location_driver.h"
+//#include "record/record_driver.h"
+#include "core.h"
+#include "runloop.h"
+#include "performance_counters.h"
+#include "system.h"
+#include "record/record_driver.h"
+//#include "queues/message_queue.h"
+#include "gfx/video_driver.h"
+#include "gfx/video_context_driver.h"
+#include "gfx/scaler/scaler.h"
+//#include "gfx/video_frame.h"
+
+#include <retro_assert.h>
+
+#include "cores/internal_cores.h"
+#include "frontend/frontend_driver.h"
+#include "content.h"
+#ifdef HAVE_CHEEVOS
+#include "cheevos.h"
+#endif
+#include "retroarch.h"
+#include "configuration.h"
+#include "general.h"
+#include "msg_hash.h"
+#include "verbosity.h"
+#include "input/input_keyboard.h"
+#include "input/input_keymaps.h"
+#include <os/lock.h>
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wall"
+#pragma clang diagnostic ignored "-Wdocumentation"
+#pragma clang diagnostic ignored "-Wdocumentation-unknown-command"
+#pragma clang diagnostic ignored "-Wmacro-redefined"
+#pragma clang diagnostic ignored "-Wstrict-prototypes"
+/// Controller/options/saves/cheats live in `PVLibRetroCore+*.m`; Clang only type-checks each TU separately.
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
+#pragma clang diagnostic ignored "-Wprotocol"
+
+@interface PVLibRetroCoreBridge ()
+{
+    BOOL loaded;
+
+    // Touch and mouse input state
+    CGPoint currentTouchPosition;
+    BOOL touchPressed;
+    CGPoint currentMousePosition;
+    BOOL mousePressed;
+    BOOL leftMousePressed;
+    BOOL rightMousePressed;
+    // Accumulated relative mouse deltas for RETRO_DEVICE_MOUSE X/Y queries.
+    // Protected by @synchronized(self) since setMousePosition: (UI thread)
+    // and getPointerState: (emulator thread) access these concurrently.
+    float mouseDeltaX;
+    float mouseDeltaY;
+    CGPoint lastMousePosition;
+    BOOL lastMousePositionValid;
+}
+@property (nonatomic, strong) NSData *currentRomData;
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+@property (nonatomic, weak) UITouch *activeStylusTouch;
+#endif
+@end
+
+video_driver_t video_gl;
+video_driver_t video_null;
+
+static struct retro_callbacks   retro_ctx;
+//static retro_video_refresh_t video_cb;
+//static retro_audio_sample_t audio_cb;
+//static retro_audio_sample_batch_t audio_batch_cb;
+static retro_environment_t environ_cb;
+//static retro_input_poll_t input_poll_cb;
+//static retro_input_state_t input_state_cb;
+
+static dylib_t lib_handle;
+/// Standalone `PVLibRetro` keeps negotiation state locally rather than
+/// depending on the RetroArch `video_driver.c` singleton.
+static const struct retro_hw_render_context_negotiation_interface *pv_hw_render_context_negotiation_interface = NULL;
+
+// MARK: - Runloop
+//static rarch_dir_list_t runloop_shader_dir;
+static char runloop_fullpath[PATH_MAX_LENGTH];
+static char runloop_default_shader_preset[PATH_MAX_LENGTH];
+static rarch_system_info_t runloop_system;
+static unsigned runloop_pending_windowed_scale;
+static struct retro_frame_time_callback runloop_frame_time;
+static retro_keyboard_event_t runloop_key_event          = NULL;
+static retro_keyboard_event_t runloop_frontend_key_event = NULL;
+static retro_usec_t runloop_frame_time_last      = 0;
+static unsigned runloop_max_frames               = false;
+static bool runloop_force_nonblock               = false;
+static bool runloop_frame_time_last_enable       = false;
+static bool runloop_set_frame_limit              = false;
+static bool runloop_paused                       = false;
+static bool runloop_idle                         = false;
+static bool runloop_exec                         = false;
+static bool runloop_slowmotion                   = false;
+static void pv_set_context_negotiation_interface(const struct retro_hw_render_context_negotiation_interface *iface)
+{
+    pv_hw_render_context_negotiation_interface = iface;
+}
+
+static bool runloop_shutdown_initiated           = false;
+static bool runloop_core_shutdown_initiated      = false;
+static bool runloop_perfcnt_enable               = false;
+static bool runloop_overrides_active             = false;
+static bool runloop_game_options_active          = false;
+//static core_option_manager_t *runloop_core_options = NULL;
+#ifdef HAVE_THREADS
+static slock_t *_runloop_msg_queue_lock           = NULL;
+#endif
+//static msg_queue_t *runloop_msg_queue            = NULL;
+
+// MARK: - Netpacket interface (env 78)
+
+static struct retro_netpacket_callback *s_netpacketCallback = NULL;
+static BOOL s_netpacketSessionActive = NO;
+static NSMutableArray<NSData *> *s_netpacketIncomingQueue = nil;
+static NSMutableArray<NSNumber *> *s_netpacketIncomingClientIDs = nil;
+static os_unfair_lock s_netpacketQueueLock = OS_UNFAIR_LOCK_INIT;
+
+/// Block set by the Swift transport layer to forward outgoing packets.
+static void (^s_netpacketSendBlock)(int flags, const void *buf, size_t len, uint16_t clientID) = nil;
+
+/// Called by the core to send a packet to a peer or broadcast.
+static void legacy_netpacket_send(int flags, const void *buf, size_t len, uint16_t client_id) {
+    if (!s_netpacketSessionActive) return;
+    if (s_netpacketSendBlock) {
+        s_netpacketSendBlock(flags, buf, len, client_id);
+    }
+}
+
+/// Called by the core to receive all queued incoming packets.
+static void legacy_netpacket_poll_receive(void) {
+    if (!s_netpacketCallback || !s_netpacketCallback->receive) return;
+    os_unfair_lock_lock(&s_netpacketQueueLock);
+    NSArray<NSData *> *packets = [s_netpacketIncomingQueue copy];
+    NSArray<NSNumber *> *clientIDs = [s_netpacketIncomingClientIDs copy];
+    [s_netpacketIncomingQueue removeAllObjects];
+    [s_netpacketIncomingClientIDs removeAllObjects];
+    os_unfair_lock_unlock(&s_netpacketQueueLock);
+
+    for (NSUInteger i = 0; i < packets.count; i++) {
+        NSData *pkt = packets[i];
+        uint16_t cid = clientIDs[i].unsignedShortValue;
+        s_netpacketCallback->receive(pkt.bytes, pkt.length, cid);
+    }
+}
+
+// MARK: - Config
+
+static char path_libretro[PATH_MAX_LENGTH];
+
+char *config_get_active_core_path_ptr(void) {
+    return path_libretro;
+}
+
+//const char *config_get_active_core_path(void)
+//{
+//   return path_libretro;
+//}
+
+NSString *privateFrameworkPath(void) {
+    NSBundle *bundle = [NSBundle bundleForClass:[_current class]];
+    //    const char* path = [bundle.executablePath fileSystemRepresentation];
+    NSString *executableName = bundle.infoDictionary[@"CFBundleExecutable"];
+
+    NSString *frameworkPath = [NSString stringWithFormat:@"%@/%@", bundle.bundlePath, executableName];
+
+    NSArray *fileNames = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworkPath error:nil];
+    for (NSString *fileName in fileNames) {
+        ILOG(@"%@", fileName);
+    }
+//    NSString *privateFrameworkPath = [[[NSBundle mainBundle] privateFrameworksPath] stringByAppendingPathComponent:frameworkPath];
+//    DLOG(@"%@", privateFrameworkPath);
+    return frameworkPath;
+}
+
+const char *config_get_active_core_path(void) {
+
+    return [privateFrameworkPath() fileSystemRepresentation];
+}
+
+bool config_active_core_path_is_empty(void) {
+    return !path_libretro[0];
+}
+
+size_t config_get_active_core_path_size(void) {
+    DLOG(@"");
+    return privateFrameworkPath().length; //sizeof(path_libretro);
+}
+
+void config_set_active_core_path(const char *path) {
+    DLOG(@"%s", path);
+    strlcpy(path_libretro, path, sizeof(path_libretro));
+}
+
+void config_clear_active_core_path(void) {
+    DLOG(@"");
+    *path_libretro = '\0';
+}
+
+const char *config_get_active_path(void)
+{
+    //   global_t   *global          = global_get_ptr();
+    //
+    //   if (!string_is_empty(global->path.config))
+    //	  return global->path.config;
+
+
+    return NULL;
+}
+
+void config_free_state(void)
+{
+}
+
+
+// MARK: - Retro typedefs
+typedef void *dylib_t;
+typedef void (*function_t)(void);
+
+// MARK: - Retro Macros
+
+void retroarch_fail(int error_code, const char *error) {
+    ELOG(@"Code: %i, Error: %s", error_code, error);
+}
+
+static void load_symbols(enum rarch_core_type type, struct retro_core_t *current_core);
+
+/**
+ * input_poll:
+ *
+ * Input polling callback function.
+ **/
+void input_poll(void);
+
+/**
+ * input_state:
+ * @port                 : user number.
+ * @device               : device identifier of user.
+ * @idx                  : index value of user.
+ * @id                   : identifier of key pressed by user.
+ *
+ * Input state callback function.
+ *
+ * Returns: Non-zero if the given key (identified by @id) was pressed by the user
+ * (assigned to @port).
+ **/
+int16_t input_state(unsigned port, unsigned device,
+                    unsigned idx, unsigned id);
+
+static void core_input_state_poll_maybe(void)
+{
+    GET_CURRENT_OR_RETURN();
+    if (current->core_poll_type == POLL_TYPE_NORMAL)
+        input_poll();
+}
+
+static int16_t core_input_state_poll(unsigned port,
+                                     unsigned device, unsigned idx, unsigned id)
+{
+    GET_CURRENT_OR_RETURN(0);
+    if (current->core_poll_type == POLL_TYPE_LATE)
+    {
+        if (!current->core_input_polled)
+            input_poll();
+
+        current->core_input_polled = true;
+    }
+    return input_state(port, device, idx, id);
+}
+
+void core_set_input_state(retro_ctx_input_state_info_t *info)
+{
+    GET_CURRENT_OR_RETURN();
+    current->core->retro_set_input_state(info->cb);
+}
+
+
+/**
+ * input_state:
+ * @port                 : user number.
+ * @device               : device identifier of user.
+ * @idx                  : index value of user.
+ * @id                   : identifier of key pressed by user.
+ *
+ * Input state callback function.
+ *
+ * Returns: Non-zero if the given key (identified by @id) was pressed by the user
+ * (assigned to @port).
+ **/
+int16_t input_state(unsigned port, unsigned device,
+                    unsigned idx, unsigned id)
+{
+    int16_t res                     = 0;
+    //   settings_t *settings            = config_get_ptr();
+
+    //
+    //   device &= RETRO_DEVICE_MASK;
+    //
+    //   if (bsv_movie_ctl(BSV_MOVIE_CTL_PLAYBACK_ON, NULL))
+    //   {
+    //      int16_t ret;
+    //      if (bsv_movie_ctl(BSV_MOVIE_CTL_GET_INPUT, &ret))
+    //         return ret;
+    //
+    //      bsv_movie_ctl(BSV_MOVIE_CTL_SET_END, NULL);
+    //   }
+    //
+    //   if (settings->input.remap_binds_enable)
+    //      input_remapping_state(port, &device, &idx, &id);
+    //
+    //   if (!input_driver_is_flushing_input()
+    //         && !input_driver_is_libretro_input_blocked())
+    //   {
+    //      if (((id < RARCH_FIRST_META_KEY) || (device == RETRO_DEVICE_KEYBOARD)))
+    //         res = current_input->input_state(
+    //               current_input_data, libretro_input_binds, port, device, idx, id);
+    //
+    //#ifdef HAVE_OVERLAY
+    //      input_state_overlay(&res, port, device, idx, id);
+    //#endif
+    //
+    //#ifdef HAVE_NETWORKGAMEPAD
+    //      input_remote_state(&res, port, device, idx, id);
+    //#endif
+    //   }
+    //
+    //   /* Don't allow turbo for D-pad. */
+    //   if (device == RETRO_DEVICE_JOYPAD && (id < RETRO_DEVICE_ID_JOYPAD_UP ||
+    //            id > RETRO_DEVICE_ID_JOYPAD_RIGHT))
+    //   {
+    //      /*
+    //       * Apply turbo button if activated.
+    //       *
+    //       * If turbo button is held, all buttons pressed except
+    //       * for D-pad will go into a turbo mode. Until the button is
+    //       * released again, the input state will be modulated by a
+    //       * periodic pulse defined by the configured duty cycle.
+    //       */
+    //      if (res && input_driver_turbo_btns.frame_enable[port])
+    //         input_driver_turbo_btns.enable[port] |= (1 << id);
+    //      else if (!res)
+    //         input_driver_turbo_btns.enable[port] &= ~(1 << id);
+    //
+    //      if (input_driver_turbo_btns.enable[port] & (1 << id))
+    //      {
+    //         /* if turbo button is enabled for this key ID */
+    //         res = res && ((input_driver_turbo_btns.count % settings->input.turbo_period)
+    //               < settings->input.turbo_duty_cycle);
+    //      }
+    //   }
+    //
+    //   if (bsv_movie_ctl(BSV_MOVIE_CTL_PLAYBACK_OFF, NULL))
+    //      bsv_movie_ctl(BSV_MOVIE_CTL_SET_INPUT, &res);
+
+    return res;
+}
+
+
+/**
+ * core_init_libretro_cbs:
+ * @data           : pointer to retro_callbacks object
+ *
+ * Initializes libretro callbacks, and binds the libretro callbacks
+ * to default callback functions.
+ **/
+static bool core_init_libretro_cbs(void *data)
+{
+    GET_CURRENT_OR_RETURN(false);
+
+    struct retro_callbacks *cbs = (struct retro_callbacks*)data;
+#ifdef HAVE_NETPLAY
+    global_t            *global = global_get_ptr();
+#endif
+
+    if (!cbs)
+        return false;
+
+    current->core->retro_set_video_refresh(video_driver_frame);
+    //   core->retro_set_audio_sample(audio_driver_sample);
+    //   core->retro_set_audio_sample_batch(audio_driver_sample_batch);
+    current->core->retro_set_input_state(core_input_state_poll);
+    current->core->retro_set_input_poll(core_input_state_poll_maybe);
+
+    core_set_default_callbacks(cbs);
+
+#ifdef HAVE_NETPLAY
+    if (!netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_DATA_INITED, NULL))
+        return true;
+
+    /* Force normal poll type for netplay. */
+    core_poll_type = POLL_TYPE_NORMAL;
+
+    if (global->netplay.is_spectate)
+    {
+        core->retro_set_input_state(
+                                   (global->netplay.is_client ?
+                                    input_state_spectate_client : input_state_spectate)
+                                   );
+    }
+    else
+    {
+        core->retro_set_video_refresh(video_frame_net);
+        core->retro_set_audio_sample(audio_sample_net);
+        core->retro_set_audio_sample_batch(audio_sample_batch_net);
+        core->retro_set_input_state(input_state_net);
+    }
+#endif
+
+    return true;
+}
+
+/**
+ * core_set_default_callbacks:
+ * @data           : pointer to retro_callbacks object
+ *
+ * Binds the libretro callbacks to default callback functions.
+ **/
+bool core_set_default_callbacks(void *data)
+{
+    struct retro_callbacks *cbs = (struct retro_callbacks*)data;
+
+    if (!cbs)
+        return false;
+
+    cbs->frame_cb        = video_driver_frame;
+    //	cbs->sample_cb       = audio_callback;
+    //	cbs->sample_batch_cb = audio_batch_callback;
+    cbs->state_cb        = core_input_state_poll;
+    cbs->poll_cb         = input_poll;
+
+    return true;
+}
+
+bool core_deinit(void *data)
+{
+    struct retro_callbacks *cbs = (struct retro_callbacks*)data;
+
+    if (!cbs)
+        return false;
+
+    cbs->frame_cb        = NULL;
+    cbs->sample_cb       = NULL;
+    cbs->sample_batch_cb = NULL;
+    cbs->state_cb        = NULL;
+    cbs->poll_cb         = NULL;
+
+    return true;
+}
+
+bool core_uninit_libretro_callbacks(void)
+{
+    return core_deinit(&retro_ctx);
+}
+
+/**
+ * core_set_rewind_callbacks:
+ *
+ * Sets the audio sampling callbacks based on whether or not
+ * rewinding is currently activated.
+ **/
+bool core_set_rewind_callbacks(void)
+{
+    //   if (state_manager_frame_is_reversed())
+    //   {
+    //	  core->retro_set_audio_sample(audio_driver_sample_rewind);
+    //	  core->retro_set_audio_sample_batch(audio_driver_sample_batch_rewind);
+    //   }
+    //   else
+    //   {
+    //	  core->retro_set_audio_sample(audio_driver_sample);
+    //	  core->retro_set_audio_sample_batch(audio_driver_sample_batch);
+    //   }
+    return true;
+}
+
+bool core_set_cheat(retro_ctx_cheat_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    current->core->retro_cheat_set(info->index, info->enabled, info->code);
+    return true;
+}
+
+bool core_reset_cheat(void) {
+    GET_CURRENT_OR_RETURN(false);
+    current->core->retro_cheat_reset();
+    return true;
+}
+
+bool core_api_version(retro_ctx_api_info_t *api)
+{
+    GET_CURRENT_OR_RETURN(false);
+    if (!api)
+        return false;
+    api->version = current->core->retro_api_version();
+    return true;
+}
+
+bool core_set_poll_type(unsigned *type)
+{
+    GET_CURRENT_OR_RETURN(false);
+    current->core_poll_type = *type;
+    return true;
+}
+
+void core_uninit_symbols(void)
+{
+    GET_CURRENT_OR_RETURN();
+    uninit_libretro_sym(current->core);
+}
+
+bool core_init_symbols(enum rarch_core_type *type)
+{
+    GET_CURRENT_OR_RETURN(false);
+    if (!type)
+        return false;
+    init_libretro_sym(*type, current->core);
+    return true;
+}
+
+bool core_set_controller_port_device(retro_ctx_controller_info_t *pad) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!pad)
+        return false;
+    current->core->retro_set_controller_port_device(pad->port, pad->device);
+    return true;
+}
+
+bool core_get_memory(retro_ctx_memory_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+
+    if (!info)
+        return false;
+    info->size  = current->core->retro_get_memory_size(info->id);
+    info->data  = current->core->retro_get_memory_data(info->id);
+    return true;
+}
+
+
+
+//static void video_configure(const struct retro_game_geometry * geom) {
+//    __strong PVLibRetroCore *strongCurrent = _current;
+//
+//    strongCurrent->_videoWidth  = geom->max_width;
+//    strongCurrent->_videoHeight = geom->max_height;
+//}
+
+
+bool core_load_game(retro_ctx_load_content_info_t *load_info)
+{
+    GET_CURRENT_OR_RETURN(false);
+
+    if (!load_info)
+        return false;
+
+    BOOL loaded = false;
+    if (load_info->special != nil) {
+        loaded = current->core->retro_load_game_special(load_info->special->id, load_info->info, load_info->content->size);
+    } else {
+//        if(load_info->content != nil && load_info->content->elems != nil) {
+//            const struct string_list *content = load_info->content;
+//            char *data = content->elems[0].data;
+//            struct retro_game_info *gameInfo = malloc(sizeof(struct retro_game_info));
+//            gameInfo->data = data;
+//            gameInfo->path = load_info->info->path;
+//            current->core->retro_load_game(gameInfo);
+//        } else {
+            loaded = current->core->retro_load_game(load_info->info);
+//        }
+    }
+
+    if (!loaded) {
+        ELOG(@"Core failed to load game.");
+        return false;
+    }
+
+    struct retro_system_timing timing = {
+        60.0f, 10000.0f
+    };
+    struct retro_game_geometry geom = {
+        100, 100, 100, 100, 1.0f
+    };
+    struct retro_system_av_info av = {
+        geom, timing
+    };
+    //    struct retro_system_info system = {
+    //      0, 0, 0, false, false
+    //    };
+    //
+    //    struct retro_game_info info = {
+    //      filename,
+    //      0,
+    //      0,
+    //      NULL
+    //    };
+
+
+    current->core->retro_get_system_av_info(&av);
+    ILOG(@"Video: %ix%i\n", av.geometry.base_width, av.geometry.base_height);
+    current->av_info = av;
+//    video_configure(&av.geometry);
+    return true;
+    //    audio_init(av.timing.sample_rate);
+}
+
+bool core_get_system_info(struct retro_system_info *system) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!system)
+        return false;
+    current->core->retro_get_system_info(system);
+    return true;
+}
+
+bool core_unserialize(retro_ctx_serialize_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!info)
+        return false;
+    if (!current->core->retro_unserialize(info->data_const, info->size))
+        return false;
+    return true;
+}
+
+bool core_serialize(retro_ctx_serialize_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!info)
+        return false;
+    if (!current->core->retro_serialize(info->data, info->size))
+        return false;
+    return true;
+}
+
+bool core_serialize_size(retro_ctx_size_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!info)
+        return false;
+    info->size = current->core->retro_serialize_size();
+    return true;
+}
+
+bool core_frame(retro_ctx_frame_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!info || !retro_ctx.frame_cb)
+        return false;
+
+    retro_ctx.frame_cb(
+                       info->data, info->width, info->height, info->pitch);
+    return true;
+}
+
+bool core_poll(void) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!retro_ctx.poll_cb)
+        return false;
+    retro_ctx.poll_cb();
+    return true;
+}
+
+bool core_set_environment(retro_ctx_environ_info_t *info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!info)
+        return false;
+    current->core->retro_set_environment(info->env);
+    return true;
+}
+
+bool core_get_system_av_info(struct retro_system_av_info *av_info) {
+    GET_CURRENT_OR_RETURN(false);
+    if (!av_info)
+        return false;
+    /// Use cached av_info — avoids calling retro_get_system_av_info before core is ready
+    *av_info = current->av_info;
+    return true;
+}
+
+bool core_reset(void) {
+    GET_CURRENT_OR_RETURN(false);
+    current->core->retro_reset();
+    return true;
+}
+
+bool core_init(void) {
+    GET_CURRENT_OR_RETURN(false);
+    current->core->retro_init();
+    return true;
+}
+
+bool core_unload(void) {
+    GET_CURRENT_OR_RETURN(false);
+    current->core->retro_deinit();
+    return true;
+}
+
+bool core_has_set_input_descriptor(void) {
+    GET_CURRENT_OR_RETURN(false);
+    return current->core_has_set_input_descriptors;
+}
+
+void core_set_input_descriptors(void) {
+    GET_CURRENT_OR_RETURN();
+    current->core_has_set_input_descriptors = true;
+}
+
+void core_unset_input_descriptors(void) {
+    GET_CURRENT_OR_RETURN();
+    current->core_has_set_input_descriptors = false;
+}
+
+static settings_t *configuration_settings = NULL;
+
+settings_t *config_get_ptr(void) {
+    return configuration_settings;
+}
+
+bool core_load(void) {
+    GET_CURRENT_OR_RETURN(false);
+
+    settings_t *settings = config_get_ptr();
+    current->core_poll_type = settings->input.poll_type_behavior;
+
+    if (!core_verify_api_version())
+        return false;
+    if (!core_init_libretro_cbs(&retro_ctx))
+        return false;
+
+    core_get_system_av_info(video_viewport_get_system_av_info());
+    runloop_ctl(RUNLOOP_CTL_SET_FRAME_LIMIT, NULL);
+
+    return true;
+}
+
+struct retro_system_av_info *video_viewport_get_system_av_info(void)
+{
+    static struct retro_system_av_info av_info;
+
+    return &av_info;
+}
+
+
+bool core_verify_api_version(void) {
+    GET_CURRENT_OR_RETURN(false);
+
+    //   unsigned api_version = core->retro_api_version();
+    //   RARCH_LOG("%s: %u\n",
+    //         msg_hash_to_str(MSG_VERSION_OF_LIBRETRO_API),
+    //         api_version);
+    //   RARCH_LOG("%s: %u\n",
+    //         msg_hash_to_str(MSG_COMPILED_AGAINST_API),
+    //         RETRO_API_VERSION);
+    //
+    //   if (api_version != RETRO_API_VERSION)
+    //   {
+    //      RARCH_WARN("%s\n", msg_hash_to_str(MSG_LIBRETRO_ABI_BREAK));
+    //      return false;
+    //   }
+    return true;
+}
+
+/**
+ * init_libretro_sym:
+ * @type                        : Type of core to be loaded.
+ *                                If CORE_TYPE_DUMMY, will
+ *                                load dummy symbols.
+ *
+ * Initializes libretro symbols and
+ * setups environment callback functions.
+ **/
+//void init_libretro_sym(enum rarch_core_type type, struct retro_core_t *current_core)
+//{
+/* Guarantee that we can do "dirty" casting.
+ * Every OS that this program supports should pass this. */
+//   retro_assert(sizeof(void*) == sizeof(void (*)(void)));
+//
+//   load_symbols(type, current_core);
+//}
+
+/**
+ * input_poll:
+ *
+ * Input polling callback function.
+ **/
+void input_poll(void)
+{
+    //   size_t i;
+    //   settings_t *settings           = config_get_ptr();
+    //
+    //   input_driver_poll();
+    //
+    //   for (i = 0; i < MAX_USERS; i++)
+    //      libretro_input_binds[i] = settings->input.binds[i];
+    //
+    //#ifdef HAVE_OVERLAY
+    //   input_poll_overlay(NULL, settings->input.overlay_opacity);
+    //#endif
+    //
+    //#ifdef HAVE_COMMAND
+    //   if (input_driver_command)
+    //      command_poll(input_driver_command);
+    //#endif
+    //
+    //#ifdef HAVE_NETWORKGAMEPAD
+    //   if (input_driver_remote)
+    //      input_remote_poll(input_driver_remote);
+    //#endif
+}
+
+/**
+ * uninit_libretro_sym:
+ *
+ * Frees libretro core->
+ *
+ * Frees all core options,
+ * associated state, and
+ * unbind all libretro callback symbols.
+ **/
+void uninit_libretro_sym(struct retro_core_t *current_core)
+{
+#ifdef HAVE_DYNAMIC
+    if (lib_handle)
+        dylib_close(lib_handle);
+    lib_handle = NULL;
+#endif
+    pv_set_context_negotiation_interface(NULL);
+
+    memset(current_core, 0, sizeof(struct retro_core_t));
+
+    runloop_ctl(RUNLOOP_CTL_CORE_OPTIONS_DEINIT, NULL);
+    runloop_ctl(RUNLOOP_CTL_SYSTEM_INFO_FREE, NULL);
+    runloop_ctl(RUNLOOP_CTL_FRAME_TIME_FREE, NULL);
+    //   camera_driver_ctl(RARCH_CAMERA_CTL_UNSET_ACTIVE, NULL);
+    ////   location_driver_ctl(RARCH_LOCATION_CTL_UNSET_ACTIVE, NULL);
+    //
+    //   /* Performance counters no longer valid. */
+    //   performance_counters_clear();
+}
+
+#ifdef HAVE_ZLIB
+#define DEFAULT_EXT "zip"
+#else
+#define DEFAULT_EXT ""
+#endif
+void audio_driver_unset_callback(void)
+{
+    //   audio_callback.callback  = NULL;
+    //   audio_callback.set_state = NULL;
+}
+
+bool runloop_ctl(enum runloop_ctl_state state, void *data) {
+    VLOG(@"runloop_ctl : %i", state);
+    switch (state)
+    {
+            //       case RUNLOOP_CTL_SHADER_DIR_DEINIT:
+            //          shader_dir_free(&runloop_shader_dir);
+            //          break;
+            //       case RUNLOOP_CTL_SHADER_DIR_INIT:
+            //          return shader_dir_init(&runloop_shader_dir);
+        case RUNLOOP_CTL_SYSTEM_INFO_INIT:
+            core_get_system_info(&runloop_system.info);
+
+            //          if (!runloop_system.info.library_name)
+            //             runloop_system.info.library_name = msg_hash_to_str(MSG_UNKNOWN);
+            if (!runloop_system.info.library_version)
+                runloop_system.info.library_version = "v0";
+
+            //          video_driver_set_title_buf();
+
+            strlcpy(runloop_system.valid_extensions,
+                    runloop_system.info.valid_extensions ?
+                    runloop_system.info.valid_extensions : DEFAULT_EXT,
+                    sizeof(runloop_system.valid_extensions));
+            break;
+        case RUNLOOP_CTL_GET_CORE_OPTION_SIZE:
+            //          {
+            //             unsigned *idx = (unsigned*)data;
+            //             if (!idx)
+            //                return false;
+            //             *idx = core_option_manager_size(runloop_core_options);
+            //          }
+            break;
+        case RUNLOOP_CTL_HAS_CORE_OPTIONS:
+            return false; //runloop_core_options;
+        case RUNLOOP_CTL_CORE_OPTIONS_LIST_GET:
+            //          {
+            //             core_option_manager_t **coreopts = (core_option_manager_t**)data;
+            //             if (!coreopts)
+            //                return false;
+            //             *coreopts = runloop_core_options;
+            //          }
+            break;
+        case RUNLOOP_CTL_SYSTEM_INFO_GET:
+        {
+            rarch_system_info_t **system = (rarch_system_info_t**)data;
+            if (!system)
+                return false;
+            *system = &runloop_system;
+        }
+            break;
+        case RUNLOOP_CTL_SYSTEM_INFO_FREE:
+
+            /* No longer valid. */
+            if (runloop_system.subsystem.data)
+                free(runloop_system.subsystem.data);
+            runloop_system.subsystem.data = NULL;
+            runloop_system.subsystem.size = 0;
+
+            if (runloop_system.ports.data)
+                free(runloop_system.ports.data);
+            runloop_system.ports.data = NULL;
+            runloop_system.ports.size = 0;
+
+            if (runloop_system.mmaps.descriptors)
+                free((void *)runloop_system.mmaps.descriptors);
+            runloop_system.mmaps.descriptors     = NULL;
+            runloop_system.mmaps.num_descriptors = 0;
+
+            runloop_key_event          = NULL;
+            runloop_frontend_key_event = NULL;
+
+            audio_driver_unset_callback();
+            memset(&runloop_system, 0, sizeof(rarch_system_info_t));
+            break;
+        case RUNLOOP_CTL_SET_FRAME_TIME_LAST:
+            runloop_frame_time_last_enable = true;
+            break;
+        case RUNLOOP_CTL_UNSET_FRAME_TIME_LAST:
+            if (!runloop_ctl(RUNLOOP_CTL_IS_FRAME_TIME_LAST, NULL))
+                return false;
+            runloop_frame_time_last        = 0;
+            runloop_frame_time_last_enable = false;
+            break;
+        case RUNLOOP_CTL_SET_OVERRIDES_ACTIVE:
+            runloop_overrides_active = true;
+            break;
+        case RUNLOOP_CTL_UNSET_OVERRIDES_ACTIVE:
+            runloop_overrides_active = false;
+            break;
+        case RUNLOOP_CTL_IS_OVERRIDES_ACTIVE:
+            return runloop_overrides_active;
+        case RUNLOOP_CTL_SET_GAME_OPTIONS_ACTIVE:
+            runloop_game_options_active = true;
+            break;
+        case RUNLOOP_CTL_UNSET_GAME_OPTIONS_ACTIVE:
+            runloop_game_options_active = false;
+            break;
+        case RUNLOOP_CTL_IS_GAME_OPTIONS_ACTIVE:
+            return runloop_game_options_active;
+        case RUNLOOP_CTL_IS_FRAME_TIME_LAST:
+            return runloop_frame_time_last_enable;
+        case RUNLOOP_CTL_SET_FRAME_LIMIT:
+            runloop_set_frame_limit = true;
+            break;
+        case RUNLOOP_CTL_UNSET_FRAME_LIMIT:
+            runloop_set_frame_limit = false;
+            break;
+        case RUNLOOP_CTL_SHOULD_SET_FRAME_LIMIT:
+            return runloop_set_frame_limit;
+        case RUNLOOP_CTL_GET_PERFCNT:
+        {
+            bool **perfcnt = (bool**)data;
+            if (!perfcnt)
+                return false;
+            *perfcnt = &runloop_perfcnt_enable;
+        }
+            break;
+        case RUNLOOP_CTL_SET_PERFCNT_ENABLE:
+            runloop_perfcnt_enable = true;
+            break;
+        case RUNLOOP_CTL_UNSET_PERFCNT_ENABLE:
+            runloop_perfcnt_enable = false;
+            break;
+        case RUNLOOP_CTL_IS_PERFCNT_ENABLE:
+            return runloop_perfcnt_enable;
+        case RUNLOOP_CTL_SET_NONBLOCK_FORCED:
+            runloop_force_nonblock = true;
+            break;
+        case RUNLOOP_CTL_UNSET_NONBLOCK_FORCED:
+            runloop_force_nonblock = false;
+            break;
+        case RUNLOOP_CTL_IS_NONBLOCK_FORCED:
+            return runloop_force_nonblock;
+        case RUNLOOP_CTL_SET_FRAME_TIME:
+        {
+            const struct retro_frame_time_callback *info =
+            (const struct retro_frame_time_callback*)data;
+#ifdef HAVE_NETPLAY
+            global_t *global = global_get_ptr();
+
+            /* retro_run() will be called in very strange and
+             * mysterious ways, have to disable it. */
+            if (global->netplay.enable)
+                return false;
+#endif
+            runloop_frame_time = *info;
+        }
+            break;
+        case RUNLOOP_CTL_GET_WINDOWED_SCALE:
+        {
+            unsigned **scale = (unsigned**)data;
+            if (!scale)
+                return false;
+            *scale       = (unsigned*)&runloop_pending_windowed_scale;
+        }
+            break;
+        case RUNLOOP_CTL_SET_WINDOWED_SCALE:
+        {
+            unsigned *idx = (unsigned*)data;
+            if (!idx)
+                return false;
+            runloop_pending_windowed_scale = *idx;
+        }
+            break;
+        case RUNLOOP_CTL_SET_LIBRETRO_PATH:
+        {
+            const char *fullpath = (const char*)data;
+            if (!fullpath)
+                return false;
+            config_set_active_core_path(fullpath);
+        }
+            break;
+        case RUNLOOP_CTL_CLEAR_CONTENT_PATH:
+            *runloop_fullpath = '\0';
+            break;
+        case RUNLOOP_CTL_GET_CONTENT_PATH:
+        {
+            char **fullpath = (char**)data;
+            if (!fullpath)
+                return false;
+            *fullpath       = (char*)runloop_fullpath;
+        }
+            break;
+        case RUNLOOP_CTL_SET_CONTENT_PATH:
+        {
+            const char *fullpath = (const char*)data;
+            if (!fullpath)
+                return false;
+            strlcpy(runloop_fullpath, fullpath, sizeof(runloop_fullpath));
+        }
+            break;
+        case RUNLOOP_CTL_CLEAR_DEFAULT_SHADER_PRESET:
+            *runloop_default_shader_preset = '\0';
+            break;
+        case RUNLOOP_CTL_GET_DEFAULT_SHADER_PRESET:
+        {
+            char **preset = (char**)data;
+            if (!preset)
+                return false;
+            *preset       = (char*)runloop_default_shader_preset;
+        }
+            break;
+        case RUNLOOP_CTL_SET_DEFAULT_SHADER_PRESET:
+        {
+            const char *preset = (const char*)data;
+            if (!preset)
+                return false;
+            strlcpy(runloop_default_shader_preset, preset,
+                    sizeof(runloop_default_shader_preset));
+        }
+            break;
+        case RUNLOOP_CTL_FRAME_TIME_FREE:
+            memset(&runloop_frame_time, 0, sizeof(struct retro_frame_time_callback));
+            runloop_frame_time_last           = 0;
+            runloop_max_frames                = 0;
+            break;
+        case RUNLOOP_CTL_STATE_FREE:
+            runloop_perfcnt_enable            = false;
+            runloop_idle                      = false;
+            runloop_paused                    = false;
+            runloop_slowmotion                = false;
+            runloop_frame_time_last_enable    = false;
+            runloop_set_frame_limit           = false;
+            runloop_overrides_active          = false;
+            runloop_ctl(RUNLOOP_CTL_FRAME_TIME_FREE, NULL);
+            break;
+        case RUNLOOP_CTL_GLOBAL_FREE:
+        {
+            global_t *global = NULL;
+            //             command_event(CMD_EVENT_TEMPORARY_CONTENT_DEINIT, NULL);
+            //             command_event(CMD_EVENT_SUBSYSTEM_FULLPATHS_DEINIT, NULL);
+            //             command_event(CMD_EVENT_RECORD_DEINIT, NULL);
+            //             command_event(CMD_EVENT_LOG_FILE_DEINIT, NULL);
+
+            //             rarch_ctl(RARCH_CTL_UNSET_BLOCK_CONFIG_READ, NULL);
+            runloop_ctl(RUNLOOP_CTL_CLEAR_CONTENT_PATH,  NULL);
+            runloop_overrides_active   = false;
+
+            core_unset_input_descriptors();
+
+            //             global = global_get_ptr();
+            memset(global, 0, sizeof(struct global));
+            //             retroarch_override_setting_free_state();
+            //             config_free_state();
+        }
+            break;
+        case RUNLOOP_CTL_CLEAR_STATE:
+            //          driver_ctl(RARCH_DRIVER_CTL_DEINIT,  NULL);
+            runloop_ctl(RUNLOOP_CTL_STATE_FREE,  NULL);
+            runloop_ctl(RUNLOOP_CTL_GLOBAL_FREE, NULL);
+            break;
+        case RUNLOOP_CTL_SET_MAX_FRAMES:
+        {
+            unsigned *ptr = (unsigned*)data;
+            if (!ptr)
+                return false;
+            runloop_max_frames = *ptr;
+        }
+            break;
+        case RUNLOOP_CTL_IS_IDLE:
+            return runloop_idle;
+        case RUNLOOP_CTL_SET_IDLE:
+        {
+            bool *ptr = (bool*)data;
+            if (!ptr)
+                return false;
+            runloop_idle = *ptr;
+        }
+            break;
+        case RUNLOOP_CTL_IS_SLOWMOTION:
+            return runloop_slowmotion;
+        case RUNLOOP_CTL_SET_SLOWMOTION:
+        {
+            bool *ptr = (bool*)data;
+            if (!ptr)
+                return false;
+            runloop_slowmotion = *ptr;
+        }
+            break;
+        case RUNLOOP_CTL_SET_PAUSED:
+        {
+            bool *ptr = (bool*)data;
+            if (!ptr)
+                return false;
+            runloop_paused = *ptr;
+        }
+            break;
+        case RUNLOOP_CTL_IS_PAUSED:
+            return runloop_paused;
+        case RUNLOOP_CTL_MSG_QUEUE_PULL:
+            //          runloop_msg_queue_lock();
+            //          {
+            //             const char **ret = (const char**)data;
+            //             if (!ret)
+            //                return false;
+            //             *ret = msg_queue_pull(runloop_msg_queue);
+            //          }
+            //          runloop_msg_queue_unlock();
+            break;
+        case RUNLOOP_CTL_MSG_QUEUE_FREE:
+#ifdef HAVE_THREADS
+            slock_free(_runloop_msg_queue_lock);
+            _runloop_msg_queue_lock = NULL;
+#endif
+            break;
+        case RUNLOOP_CTL_MSG_QUEUE_CLEAR:
+            //          msg_queue_clear(runloop_msg_queue);
+            break;
+        case RUNLOOP_CTL_MSG_QUEUE_DEINIT:
+            //          if (!runloop_msg_queue)
+            //             return true;
+            //
+            //          runloop_msg_queue_lock();
+            //
+            //          msg_queue_free(runloop_msg_queue);
+            //
+            //          runloop_msg_queue_unlock();
+            //          runloop_ctl(RUNLOOP_CTL_MSG_QUEUE_FREE, NULL);
+            //
+            //          runloop_msg_queue = NULL;
+            break;
+        case RUNLOOP_CTL_MSG_QUEUE_INIT:
+            runloop_ctl(RUNLOOP_CTL_MSG_QUEUE_DEINIT, NULL);
+            //          runloop_msg_queue = msg_queue_new(8);
+            //          retro_assert(runloop_msg_queue);
+
+#ifdef HAVE_THREADS
+            _runloop_msg_queue_lock = slock_new();
+            retro_assert(_runloop_msg_queue_lock);
+#endif
+            break;
+        case RUNLOOP_CTL_TASK_INIT:
+        {
+            // #ifdef HAVE_THREADS
+            //             settings_t *settings = config_get_ptr();
+            //             bool threaded_enable = settings->threaded_data_runloop_enable;
+            // #else
+            //             bool threaded_enable = false;
+            // #endif
+            //             task_queue_ctl(TASK_QUEUE_CTL_DEINIT, NULL);
+            //             task_queue_ctl(TASK_QUEUE_CTL_INIT, &threaded_enable);
+        }
+            break;
+        case RUNLOOP_CTL_SET_CORE_SHUTDOWN:
+            runloop_core_shutdown_initiated = true;
+            break;
+        case RUNLOOP_CTL_UNSET_CORE_SHUTDOWN:
+            runloop_core_shutdown_initiated = false;
+            break;
+        case RUNLOOP_CTL_IS_CORE_SHUTDOWN:
+            return runloop_core_shutdown_initiated;
+        case RUNLOOP_CTL_SET_SHUTDOWN:
+            runloop_shutdown_initiated = true;
+            break;
+        case RUNLOOP_CTL_UNSET_SHUTDOWN:
+            runloop_shutdown_initiated = false;
+            break;
+        case RUNLOOP_CTL_IS_SHUTDOWN:
+            return runloop_shutdown_initiated;
+        case RUNLOOP_CTL_SET_EXEC:
+            runloop_exec = true;
+            break;
+        case RUNLOOP_CTL_UNSET_EXEC:
+            runloop_exec = false;
+            break;
+        case RUNLOOP_CTL_IS_EXEC:
+            return runloop_exec;
+        case RUNLOOP_CTL_DATA_DEINIT:
+            //          task_queue_ctl(TASK_QUEUE_CTL_DEINIT, NULL);
+            break;
+            //       case RUNLOOP_CTL_IS_CORE_OPTION_UPDATED:
+            //          if (!runloop_core_options)
+            //             return false;
+            //          return  core_option_manager_updated(runloop_core_options);
+            //       case RUNLOOP_CTL_CORE_OPTION_PREV:
+            //          {
+            //             unsigned *idx = (unsigned*)data;
+            //             if (!idx)
+            //                return false;
+            //             core_option_manager_prev(runloop_core_options, *idx);
+            //             if (ui_companion_is_on_foreground())
+            //                ui_companion_driver_notify_refresh();
+            //          }
+            //          break;
+            //       case RUNLOOP_CTL_CORE_OPTION_NEXT:
+            //          {
+            //             unsigned *idx = (unsigned*)data;
+            //             if (!idx)
+            //                return false;
+            //             core_option_manager_next(runloop_core_options, *idx);
+            //             if (ui_companion_is_on_foreground())
+            //                ui_companion_driver_notify_refresh();
+            //          }
+            //          break;
+            //       case RUNLOOP_CTL_CORE_OPTIONS_GET:
+            //          {
+            //             struct retro_variable *var = (struct retro_variable*)data;
+            //
+            //             if (!runloop_core_options || !var)
+            //                return false;
+            //
+            //             RARCH_LOG("Environ GET_VARIABLE %s:\n", var->key);
+            //             core_option_manager_get(runloop_core_options, var);
+            //             RARCH_LOG("\t%s\n", var->value ? var->value :
+            //                   msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE));
+            //          }
+            //          break;
+        case RUNLOOP_CTL_CORE_OPTIONS_INIT:
+        {
+            //             char *game_options_path           = NULL;
+            //             bool ret                          = false;
+            //             char buf[PATH_MAX_LENGTH]         = {0};
+            //             global_t *global                  = global_get_ptr();
+            //             settings_t *settings              = config_get_ptr();
+            //             const char *options_path          = settings->path.core_options;
+            //             const struct retro_variable *vars =
+            //                (const struct retro_variable*)data;
+
+            //             if (string_is_empty(options_path)
+            //                   && !string_is_empty(global->path.config))
+            //             {
+            //                fill_pathname_resolve_relative(buf, global->path.config,
+            //                      file_path_str(FILE_PATH_CORE_OPTIONS_CONFIG), sizeof(buf));
+            //                options_path = buf;
+            //             }
+            //
+            //
+            //             if (settings->game_specific_options)
+            //                ret = rarch_game_specific_options(&game_options_path);
+            //
+            //             if(ret)
+            //             {
+            //                runloop_ctl(RUNLOOP_CTL_SET_GAME_OPTIONS_ACTIVE, NULL);
+            //                runloop_core_options =
+            //                   core_option_manager_new(game_options_path, vars);
+            //                free(game_options_path);
+            //             }
+            //             else
+            //             {
+            //                runloop_ctl(RUNLOOP_CTL_UNSET_GAME_OPTIONS_ACTIVE, NULL);
+            //                runloop_core_options =
+            //                   core_option_manager_new(options_path, vars);
+            //             }
+
+        }
+            break;
+            //       case RUNLOOP_CTL_CORE_OPTIONS_FREE:
+            //          if (runloop_core_options)
+            //             core_option_manager_free(runloop_core_options);
+            //          runloop_core_options          = NULL;
+            //          break;
+            //       case RUNLOOP_CTL_CORE_OPTIONS_DEINIT:
+            //          {
+            //             global_t *global                  = global_get_ptr();
+            //             if (!runloop_core_options)
+            //                return false;
+            //
+            //             /* check if game options file was just created and flush
+            //                to that file instead */
+            //             if(global && !string_is_empty(global->path.core_options_path))
+            //             {
+            //                core_option_manager_flush_game_specific(runloop_core_options,
+            //                      global->path.core_options_path);
+            //                global->path.core_options_path[0] = '\0';
+            //             }
+            //             else
+            //                core_option_manager_flush(runloop_core_options);
+            //
+            //             if (runloop_ctl(RUNLOOP_CTL_IS_GAME_OPTIONS_ACTIVE, NULL))
+            //                runloop_ctl(RUNLOOP_CTL_UNSET_GAME_OPTIONS_ACTIVE, NULL);
+            //
+            //             runloop_ctl(RUNLOOP_CTL_CORE_OPTIONS_FREE, NULL);
+            //          }
+            //          break;
+        case RUNLOOP_CTL_KEY_EVENT_GET:
+        {
+            retro_keyboard_event_t **key_event =
+            (retro_keyboard_event_t**)data;
+            if (!key_event)
+                return false;
+            *key_event = &runloop_key_event;
+        }
+            break;
+        case RUNLOOP_CTL_FRONTEND_KEY_EVENT_GET:
+        {
+            retro_keyboard_event_t **key_event =
+            (retro_keyboard_event_t**)data;
+            if (!key_event)
+                return false;
+            *key_event = &runloop_frontend_key_event;
+        }
+            break;
+        case RUNLOOP_CTL_HTTPSERVER_INIT:
+#if defined(HAVE_HTTPSERVER) && defined(HAVE_ZLIB)
+            httpserver_init(8888);
+#endif
+            break;
+        case RUNLOOP_CTL_HTTPSERVER_DESTROY:
+#if defined(HAVE_HTTPSERVER) && defined(HAVE_ZLIB)
+            httpserver_destroy();
+#endif
+            break;
+        case RUNLOOP_CTL_NONE:
+        default:
+            break;
+    }
+
+    return true;
+}
+
+
+/**
+ * video_driver_frame:
+ * @data                 : pointer to data of the video frame.
+ * @width                : width of the video frame.
+ * @height               : height of the video frame.
+ * @pitch                : pitch of the video frame.
+ *
+ * Video frame render callback function.
+ **/
+
+extern video_pixel_scaler_t *video_driver_scaler_ptr;
+extern bool video_pixel_frame_scale(const void *data,
+      unsigned width, unsigned height,
+                                    size_t pitch);
+//extern video_driver_state_t video_driver_state;
+void video_driver_frame(const void *data, unsigned width,
+                        unsigned height, size_t pitch)
+{
+    NAssert(@"Shouldn't be here, or need to implement");
+//       static char video_driver_msg[256];
+//       unsigned output_width  = 0;
+//       unsigned output_height = 0;
+//       unsigned  output_pitch = 0;
+//       const char *msg        = NULL;
+//       settings_t *settings   = config_get_ptr();
+//
+//       runloop_ctl(RUNLOOP_CTL_MSG_QUEUE_PULL,   &msg);
+//
+//       if (!video_driver_is_active())
+//          return;
+//
+//       if (video_driver_scaler_ptr &&
+//             video_pixel_frame_scale(data, width, height, pitch))
+//       {
+//          data                = video_driver_scaler_ptr->scaler_out;
+//          pitch               = video_driver_scaler_ptr->scaler->out_stride;
+//       }
+//
+//       video_driver_cached_frame_set(data, width, height, pitch);
+//
+//       /* Slightly messy code,
+//        * but we really need to do processing before blocking on VSync
+//        * for best possible scheduling.
+//        */
+//       if (
+//             (
+//                 !video_driver_state.filter.filter
+//              || !settings->video.post_filter_record
+//              || !data
+//              || video_driver_has_gpu_record()
+//             )
+//          )
+//          recording_dump_frame(data, width, height, pitch);
+//
+//       if (video_driver_frame_filter(data, width, height, pitch,
+//                &output_width, &output_height, &output_pitch))
+//       {
+//          data   = video_driver_state.filter.buffer;
+//          width  = output_width;
+//          height = output_height;
+//          pitch  = output_pitch;
+//       }
+//
+//       video_driver_msg[0] = '\0';
+//       if (msg)
+//          strlcpy(video_driver_msg, msg, sizeof(video_driver_msg));
+//
+//       if (!current_video || !current_video->frame(
+//                video_driver_data, data, width, height,
+//                video_driver_frame_count,
+//                pitch, video_driver_msg))
+//       {
+//          video_driver_unset_active();
+//       }
+//
+//       video_driver_frame_count++;
+}
+
+/**
+ * init_libretro_sym:
+ * @type                        : Type of core to be loaded.
+ *                                If CORE_TYPE_DUMMY, will
+ *                                load dummy symbols.
+ *
+ * Initializes libretro symbols and
+ * setups environment callback functions.
+ **/
+void init_libretro_sym(enum rarch_core_type type, struct retro_core_t *current_core)
+{
+    /* Guarantee that we can do "dirty" casting.
+     * Every OS that this program supports should pass this. */
+    retro_assert(sizeof(void*) == sizeof(void (*)(void)));
+
+    load_symbols(type, current_core);
+}
+
+void retro_set_environment(retro_environment_t cb)
+{
+    GET_CURRENT_OR_RETURN();
+    environ_cb = cb;
+    if (current->core) {
+        current->core->retro_set_environment(cb);
+    }
+}
+
+static void core_log(enum retro_log_level level, const char * fmt, ...) {
+    char buffer[4096] = {0};
+    static const char * levelstr[] = {
+        "dbg",
+        "inf",
+        "wrn",
+        "err"
+    };
+    va_list va;
+
+    va_start(va, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, va);
+    va_end(va);
+
+    if (level == 0)
+        return;
+
+    switch (level) {
+        case 0:
+            DLOG(@"%s", buffer);
+            break;
+        case 1:
+            ILOG(@"%s", buffer);
+            break;
+        case 2:
+            WLOG(@"%s", buffer);
+            break;
+        case 3:
+            ELOG(@"%s", buffer);
+            break;
+        default:
+            break;
+    }
+
+    fprintf(stderr, "[%s] %s", levelstr[level], buffer);
+    fflush(stderr);
+
+//    if (level == RETRO_LOG_ERROR) {
+//        exit(EXIT_FAILURE);
+//    }
+}
+/*
+ TODO:
+ make an obj-c version this calls
+ and make sure to call the subclass and super(this) classses
+ custom core configs are set with keys, search `desmume_advanced_timing`, `desmume_internal_resolution` for example.
+ will need to make a list for each core and type those into core options
+ */
+static bool environment_callback(unsigned cmd, void *data) {
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+
+    switch(cmd) {
+        case RETRO_ENVIRONMENT_SET_ROTATION:
+                                                        /* const unsigned * --
+                                                        * Sets screen rotation of graphics.
+                                                        * Valid values are 0, 1, 2, 3, which rotates screen by 0, 90, 180,
+                                                        * 270 degrees counter-clockwise respectively.
+                                                        */
+            ILOG(@"%i", *(const unsigned*)data);
+            return false;
+        case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
+                                                      /* const struct retro_disk_control_callback * --
+                                                       * Sets an interface which frontend can use to eject and insert
+                                                       * disk images.
+                                                       * This is used for games which consist of multiple images and
+                                                       * must be manually swapped out by the user (e.g. PSX).
+                                                       */
+//            const struct retro_disk_control_callback* cb = (const struct retro_disk_control_callback*)data
+//            ILOG(@"%i", cb->data);
+            return false;
+        case RETRO_ENVIRONMENT_SET_HW_RENDER:
+                                                      /* struct retro_hw_render_callback * --
+                                                       * Sets an interface to let a libretro core render with
+                                                       * hardware acceleration.
+                                                       * Should be called in retro_load_game().
+                                                       * If successful, libretro cores will be able to render to a
+                                                       * frontend-provided framebuffer.
+                                                       * The size of this framebuffer will be at least as large as
+                                                       * max_width/max_height provided in get_av_info().
+                                                       * If HW rendering is used, pass only RETRO_HW_FRAME_BUFFER_VALID or
+                                                       * NULL to retro_video_refresh_t.
+                                                       */
+        {
+            struct retro_hw_render_callback* hw_render_callback = (struct retro_hw_render_callback*)data;
+            if (!hw_render_callback) {
+                ELOG(@"Hardware render callback is NULL");
+                return false;
+            }
+
+            // Store the hardware render callback for the current core
+            GET_CURRENT_OR_RETURN(false);
+
+            // Check if this is a hardware-accelerated core bridge
+            if ([current respondsToSelector:@selector(setHardwareRenderCallback:)]) {
+                BOOL success = [current performSelector:@selector(setHardwareRenderCallback:) withObject:[NSValue valueWithPointer:hw_render_callback]];
+                if (success) {
+                    ILOG(@"Hardware rendering enabled for context type: %d", hw_render_callback->context_type);
+                    return true;
+                } else {
+                    ELOG(@"Failed to set hardware render callback");
+                    return false;
+                }
+            } else {
+                ELOG(@"Current core bridge does not support hardware rendering");
+                return false;
+            }
+        }
+        case RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE: {
+            struct retro_rumble_interface *rumble = (struct retro_rumble_interface *)data;
+            if (!rumble) return false;
+            rumble->set_rumble_state = pv_retro_rumble_callback;
+            DLOG(@"Environ GET_RUMBLE_INTERFACE: provided rumble callback");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_INPUT_DEVICE_CAPABILITIES: {
+                                           /* uint64_t * --
+                                            * Gets a bitmask telling which device type are expected to be
+                                            * handled properly in a call to retro_input_state_t.
+                                            * Devices which are not handled or recognized always return
+                                            * 0 in retro_input_state_t.
+                                            * Example bitmask: caps = (1 << RETRO_DEVICE_JOYPAD) | (1 << RETRO_DEVICE_ANALOG).
+                                            * Should only be called in retro_run().
+                                            */
+            // RETRO_DEVICE_MOUSE RETRO_DEVICE_LIGHTGUN RETRO_DEVICE_POINTER RETRO_DEVICE_KEYBOARD
+            uint64_t features = (1 << RETRO_DEVICE_JOYPAD) | (1 << RETRO_DEVICE_ANALOG);
+            if ([strongCurrent conformsToProtocol:@protocol(KeyboardResponder)]) {
+                features  |= 1 << RETRO_DEVICE_KEYBOARD;
+            }
+            if ([strongCurrent conformsToProtocol:@protocol(MouseResponder)]) {
+                features  |= 1 << RETRO_DEVICE_MOUSE;
+            }
+            // PVLibRetroCoreBridge always supports RETRO_DEVICE_POINTER via
+            // its sendEvent:/handleTouchEvent: path (gated at runtime by the
+            // `touchpadEnabled` instance flag, not by a controller protocol).
+            features  |= 1 << RETRO_DEVICE_POINTER;
+
+            *(uint64_t *)data = features;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE:
+            return false;
+                                           /* struct retro_sensor_interface * --
+                                            * Gets access to the sensor interface.
+                                            * The purpose of this interface is to allow
+                                            * setting state related to sensors such as polling rate,
+                                            * enabling/disable it entirely, etc.
+                                            * Reading sensor state is done via the normal
+                                            * input_state_callback API.
+                                            */
+        case RETRO_ENVIRONMENT_GET_CAMERA_INTERFACE:
+            return false;
+                                           /* struct retro_camera_callback * --
+                                            * Gets an interface to a video camera driver.
+                                            * A libretro core can use this interface to get access to a
+                                            * video camera.
+                                            * New video frames are delivered in a callback in same
+                                            * thread as retro_run().
+                                            *
+                                            * GET_CAMERA_INTERFACE should be called in retro_load_game().
+                                            *
+                                            * Depending on the camera implementation used, camera frames
+                                            * will be delivered as a raw framebuffer,
+                                            * or as an OpenGL texture directly.
+                                            *
+                                            * The core has to tell the frontend here which types of
+                                            * buffers can be handled properly.
+                                            * An OpenGL texture can only be handled when using a
+                                            * libretro GL core (SET_HW_RENDER).
+                                            * It is recommended to use a libretro GL core when
+                                            * using camera interface.
+                                            *
+                                            * The camera is not started automatically. The retrieved start/stop
+                                            * functions must be used to explicitly
+                                            * start and stop the camera driver.
+                                            */
+        case RETRO_ENVIRONMENT_GET_LOCATION_INTERFACE :
+                                           /* struct retro_location_callback * --
+                                            * Gets access to the location interface.
+                                            * The purpose of this interface is to be able to retrieve
+                                            * location-based information from the host device,
+                                            * such as current latitude / longitude.
+                                            */
+            return false;
+        case RETRO_ENVIRONMENT_GET_CAN_DUPE:
+            *(bool *)data = true;
+            return true;
+        case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: {
+            struct retro_log_callback* cb = (struct retro_log_callback*)data;
+            cb->log = core_log;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY : {
+            NSString *BIOSPath = [strongCurrent BIOSPath];
+            CFStringRef cfString = (CFStringRef)CFBridgingRetain(BIOSPath);
+
+            *(const char **)data = CFStringGetCStringPtr(cfString, kCFStringEncodingUTF8); //[BIOSPath UTF8String];
+
+            DLOG(@"Environ SYSTEM_DIRECTORY: \"%@\".\n", BIOSPath);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE: {
+            /// Vulkan cores call this after context_reset to get
+            /// the retro_hw_render_interface_vulkan struct.
+            /// GL cores typically don't need this.
+            ILOG(@"Environ GET_HW_RENDER_INTERFACE requested");
+            if (!data) {
+                WLOG(@"Environ GET_HW_RENDER_INTERFACE: NULL output pointer");
+                return false;
+            }
+
+            if ([strongCurrent respondsToSelector:@selector(getHardwareRenderInterface:)]) {
+                const struct retro_hw_render_interface **renderInterface = (const struct retro_hw_render_interface **)data;
+                BOOL success = [(PVLibRetroGLESCoreBridge *)strongCurrent getHardwareRenderInterface:renderInterface];
+                if (success && renderInterface && *renderInterface) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        case RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS: {
+            DLOG(@"Environ SET_SUPPORT_ACHIEVEMENTS: %d", *(const bool *)data);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE: {
+            /// Retains the core-provided negotiation interface for support queries
+            /// and future frontend-owned Vulkan device negotiation work.
+            const struct retro_hw_render_context_negotiation_interface *iface =
+                (const struct retro_hw_render_context_negotiation_interface *)data;
+
+            if (!iface) {
+                WLOG(@"Environ SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE: NULL interface pointer");
+                return false;
+            }
+
+            ILOG(@"Environ SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE: type=%d, version=%u",
+                 iface->interface_type, iface->interface_version);
+
+            pv_set_context_negotiation_interface(iface);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT: {
+            struct retro_hw_render_context_negotiation_interface *iface =
+                (struct retro_hw_render_context_negotiation_interface *)data;
+
+            if (!iface) {
+                WLOG(@"Environ GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT: NULL interface pointer");
+                return false;
+            }
+
+            if (iface->interface_type == RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN) {
+                iface->interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
+                return true;
+            }
+
+            iface->interface_version = 0;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: {
+            /// Per libretro.h: "The frontend will zero any flags it doesn't
+            /// recognize or support." We don't currently act on any quirks,
+            /// so zero the value to tell the core none are honored.
+            uint64_t *quirks = (uint64_t *)data;
+            ILOG(@"Environ SET_SERIALIZATION_QUIRKS: core sent 0x%llx, masking to 0x0", *quirks);
+            *quirks = 0;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT: {
+            /// Frontend supports shared GL contexts — we do via EAGLContext sharegroups
+            ILOG(@"Environ SET_HW_SHARED_CONTEXT");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY : {
+            NSString *appSupportPath = [strongCurrent saveStatesPath];
+
+            *(const char **)data = [appSupportPath UTF8String];
+            DLOG(@"Environ SAVE_DIRECTORY: \"%@\".\n", appSupportPath);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_CORE_ASSETS_DIRECTORY : {
+            NSString *batterySavesPath = [strongCurrent batterySavesPath];
+
+            *(const char **)data = [batterySavesPath UTF8String];
+            DLOG(@"Environ CONTENT_DIRECTORY: \"%@\".\n", batterySavesPath);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
+            enum retro_pixel_format pix_fmt =
+               *(const enum retro_pixel_format*)data;
+
+            switch (pix_fmt)
+            {
+               case RETRO_PIXEL_FORMAT_0RGB1555:
+                    DLOG(@"Environ SET_PIXEL_FORMAT: 0RGB1555.\n");
+                  break;
+
+               case RETRO_PIXEL_FORMAT_RGB565:
+                    DLOG(@"Environ SET_PIXEL_FORMAT: RGB565.\n");
+                  break;
+               case RETRO_PIXEL_FORMAT_XRGB8888:
+                    DLOG(@"Environ SET_PIXEL_FORMAT: XRGB8888.\n");
+                  break;
+               default:
+                    ELOG(@"Environ SET_PIXEL_FORMAT: UNKNOWN.\n");
+                  return false;
+            }
+
+            strongCurrent->pix_fmt = pix_fmt;
+            break;
+         }
+        case RETRO_ENVIRONMENT_SET_VARIABLES:
+        {
+            // We could potentionally ask the user what options they want
+            const struct retro_variable* envs = (const struct retro_variable*)data;
+            int i=0;
+            const struct retro_variable *currentEnv;
+            do {
+                currentEnv = &envs[i];
+                ILOG(@"Environ SET_VARIABLES: {\"%s\",\"%s\"}.\n", currentEnv->key, currentEnv->value);
+                i++;
+            } while(currentEnv->key != NULL && currentEnv->value != NULL);
+
+            break;
+
+        }
+        case RETRO_ENVIRONMENT_GET_GAME_INFO_EXT:
+        {
+            const struct retro_game_info_ext **game_info_ext =
+                    (const struct retro_game_info_ext **)data;
+
+            if (!game_info_ext) {
+                ELOG(@"`game_info_ext` is nil.")
+                return false;
+            }
+
+            ////            struct retro_game_info_ext *game_info = (struct retro_game_info_ext*)data;
+            //            // TODO: Is there a way to pass `retro_game_info_ext` before callbacks?
+            struct retro_game_info_ext *game_info = malloc(sizeof(struct retro_game_info_ext));
+            game_info->persistent_data = true;
+
+            //            void *buffer = malloc(romData.length);
+            //            [romData getBytes:buffer length:romData.length];
+            //
+            //            game_info->data = buffer;
+            NSData *romData = [NSData dataWithContentsOfFile:strongCurrent.romPath];
+            CFDataRef cfData = (CFDataRef)CFBridgingRetain(romData);
+            game_info->data = CFDataGetBytePtr(cfData);
+            game_info->size = romData.length;
+
+            const char *c_full_path = [strongCurrent.romPath cStringUsingEncoding:NSUTF8StringEncoding];
+            game_info->full_path = c_full_path;
+
+            const char *c_dir = [[strongCurrent.romPath stringByDeletingLastPathComponent] cStringUsingEncoding:NSUTF8StringEncoding];
+            game_info->dir = c_dir;
+
+            const char *c_rom_name = [[strongCurrent.romPath.lastPathComponent stringByDeletingPathExtension] cStringUsingEncoding:NSUTF8StringEncoding];
+            game_info->name = c_rom_name;
+
+            const char *c_extension = [[strongCurrent.romPath.lastPathComponent pathExtension] cStringUsingEncoding:NSUTF8StringEncoding];
+            game_info->ext = c_extension;
+
+            *game_info_ext = game_info;
+//            *game_info_ext = &game_info;
+            return true;
+            break;
+        }
+        case RETRO_ENVIRONMENT_GET_VARIABLE:
+        {
+            struct retro_variable *var = (struct retro_variable*)data;
+
+           void *value = [strongCurrent getVariable:var->key];
+            if(value) {
+                var->value = value;
+                return true;
+            } else {
+                return false;
+            }
+            break;
+        }
+        case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY:
+            return true;
+        case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+            return false;
+        case RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION:
+        {
+            *((unsigned*)data) = 1;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_MESSAGE:
+        case RETRO_ENVIRONMENT_SET_MESSAGE_EXT:
+        {
+            const char* msg = ((struct retro_message*)data)->msg;
+            ILOG(@"%s", msg);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+        {
+            struct retro_system_av_info info = *(const struct retro_system_av_info*)data;
+            strongCurrent->av_info = info;
+            ILOG(@"Environ SET_SYSTEM_AV_INFO: %ux%u (base %ux%u) aspect=%.4f fps=%.2f sample_rate=%.1f",
+                 info.geometry.max_width, info.geometry.max_height,
+                 info.geometry.base_width, info.geometry.base_height,
+                 info.geometry.aspect_ratio, info.timing.fps, info.timing.sample_rate);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_GEOMETRY: {
+            /// Softer variant of SET_SYSTEM_AV_INFO that only updates geometry
+            const struct retro_game_geometry *geom = (const struct retro_game_geometry *)data;
+            if (!geom) return false;
+            strongCurrent->av_info.geometry = *geom;
+            ILOG(@"Environ SET_GEOMETRY: %ux%u (base %ux%u) aspect=%.4f",
+                 geom->max_width, geom->max_height,
+                 geom->base_width, geom->base_height,
+                 geom->aspect_ratio);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_FRAME_TIME_CALLBACK: {
+            /// Frame time callbacks are not currently supported in this frontend.
+            /// Return false so cores do not rely on an unimplemented timing path.
+            ILOG(@"Environ SET_FRAME_TIME_CALLBACK: unsupported");
+            return false;
+        }
+        case RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK: {
+            /// Async audio interface for cores with decoupled audio/video.
+            /// Not currently supported: report false so cores don't rely on it.
+            ILOG(@"Environ SET_AUDIO_CALLBACK (unsupported async audio, returning false)");
+            return false;
+        }
+        case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER: {
+            /// Tell the core which HW context type we prefer.
+            /// On iOS/tvOS prefer Vulkan (MoltenVK) when HAVE_VULKAN is compiled in;
+            /// this lets Vulkan-capable cores (e.g. Beetle PSX HW) use the optimal
+            /// hardware path. Cores that only support GLES will call SET_HW_RENDER
+            /// with a GLES context type regardless of this hint.
+            /// On macOS/Catalyst prefer the desktop OpenGL Core profile.
+            unsigned *preferred = (unsigned *)data;
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+#if HAVE_VULKAN
+            *preferred = RETRO_HW_CONTEXT_VULKAN;
+            ILOG(@"Environ GET_PREFERRED_HW_RENDER: VULKAN (MoltenVK)");
+#else
+            *preferred = RETRO_HW_CONTEXT_OPENGLES3;
+            ILOG(@"Environ GET_PREFERRED_HW_RENDER: OPENGLES3");
+#endif
+#else
+            *preferred = RETRO_HW_CONTEXT_OPENGL_CORE;
+            ILOG(@"Environ GET_PREFERRED_HW_RENDER: OPENGL_CORE");
+#endif
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS: {
+            if (data) {
+                *(bool *)data = false;
+            }
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: {
+            DLOG(@"Environ SET_CONTROLLER_INFO");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: {
+            DLOG(@"Environ SET_MEMORY_MAPS");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_SUBSYSTEM_INFO: {
+            DLOG(@"Environ SET_SUBSYSTEM_INFO");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_USERNAME: {
+            // Resolve username with fallback chain:
+            // 1. PVSettings playerUsername (user-configured)
+            // 2. OS username
+            // 3. "Provenance" fallback
+            static NSString *s_usernameString = nil;
+            if (!s_usernameString) {
+                NSString *configured = PVSettingsWrapper.playerUsername;
+                if (configured.length > 0) {
+                    s_usernameString = configured;
+                } else {
+                    s_usernameString = NSUserName() ?: @"Provenance";
+                }
+            }
+            if (data) *(const char **)data = s_usernameString.UTF8String;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_LANGUAGE: {
+            *(unsigned *)data = 0; // RETRO_LANGUAGE_ENGLISH
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME: {
+            DLOG(@"Environ SET_SUPPORT_NO_GAME: %d", data ? *(const bool *)data : false);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_LIBRETRO_PATH: {
+            *(const char **)data = NULL;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: {
+            DLOG(@"Environ SET_INPUT_DESCRIPTORS");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL: {
+            DLOG(@"Environ SET_PERFORMANCE_LEVEL: %u", *(const unsigned *)data);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_OVERSCAN: {
+            *(bool *)data = false;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_PERF_INTERFACE: {
+            struct retro_perf_callback *cb = (struct retro_perf_callback *)data;
+            if (!cb) return false;
+            cb->get_time_usec    = pv_legacy_perf_get_time_usec;
+            cb->get_cpu_features = pv_legacy_perf_get_cpu_features;
+            cb->get_perf_counter = pv_legacy_perf_get_counter;
+            cb->perf_register    = pv_legacy_perf_register;
+            cb->perf_start       = pv_legacy_perf_start;
+            cb->perf_stop        = pv_legacy_perf_stop;
+            cb->perf_log         = pv_legacy_perf_log;
+            DLOG(@"Environ GET_PERF_INTERFACE — wired up");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: {
+            *(unsigned *)data = 2;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL: {
+            DLOG(@"Environ SET_CORE_OPTIONS (variant %u)", cmd);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY: {
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK: {
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_VARIABLE: {
+            DLOG(@"Environ SET_VARIABLE");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: {
+            /// Bit 0 = video, Bit 1 = audio
+            *(int *)data = 1 | 2;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: {
+            DLOG(@"Environ SET_AUDIO_BUFFER_STATUS_CALLBACK");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION: {
+            *(unsigned *)data = 1;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE: {
+            DLOG(@"Environ SET_DISK_CONTROL_EXT_INTERFACE");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS: {
+            *(unsigned *)data = 4;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE: {
+            DLOG(@"Environ SET_CONTENT_INFO_OVERRIDE");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE: {
+            DLOG(@"Environ SET_FASTFORWARDING_OVERRIDE");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE: {
+            *(float *)data = 60.0f;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_FASTFORWARDING: {
+            *(bool *)data = false;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_THROTTLE_STATE: {
+            DLOG(@"Environ GET_THROTTLE_STATE");
+            return false;
+        }
+        case RETRO_ENVIRONMENT_SHUTDOWN: {
+            /// Dispatch async: SHUTDOWN can be called from the emu thread inside
+            /// retro_run, and stopEmulation blocks on coreWaitForExitSemaphore
+            /// which is signaled when the emu thread exits — synchronous call deadlocks.
+            ILOG(@"Environ SHUTDOWN requested — dispatching async");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [strongCurrent stopEmulation];
+            });
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK: {
+            DLOG(@"Environ SET_KEYBOARD_CALLBACK");
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK: {
+            DLOG(@"Environ SET_PROC_ADDRESS_CALLBACK");
+            return true;
+        }
+
+        // MARK: - VFS (Virtual File System) — env 45
+        case RETRO_ENVIRONMENT_GET_VFS_INTERFACE: {
+            /// Cores that request the VFS interface want an abstracted I/O API.
+            /// We return false here so that cores fall back to their default
+            /// POSIX I/O path, which works fine for our app-sandbox layout.
+            /// A full VFS implementation can be added here in the future if
+            /// a core requires it — the libretro.h structs for `retro_vfs_interface`
+            /// and `retro_vfs_interface_info` define the complete API.
+            DLOG(@"Environ GET_VFS_INTERFACE — not implemented, core will use POSIX I/O");
+            return false;
+        }
+
+        // MARK: - LED Interface — env 46
+        case RETRO_ENVIRONMENT_GET_LED_INTERFACE: {
+            /// Used by arcade-style cores that want to control physical LEDs.
+            /// Not relevant on iOS/tvOS — return false so the core skips it.
+            DLOG(@"Environ GET_LED_INTERFACE — not supported on this platform");
+            return false;
+        }
+
+        // MARK: - Current Software Framebuffer — env 40
+        case RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER: {
+            /// Cores can request a pointer to the current software framebuffer
+            /// so they can render directly into it without extra copies.
+            /// We don't support zero-copy direct rendering at this level —
+            /// cores should use their own buffers and pass them via video_refresh.
+            DLOG(@"Environ GET_CURRENT_SOFTWARE_FRAMEBUFFER — not supported");
+            return false;
+        }
+
+        // MARK: - MIDI Interface — env 48
+        case RETRO_ENVIRONMENT_GET_MIDI_INTERFACE: {
+            /// Wire the CoreMIDI-backed interface defined in PVThinLibretroFrontend.mm.
+            /// Unlocks MIDI for cores like DOSBox-Pure, Hatari, and NP2Kai.
+#if TARGET_OS_TV
+            // CoreMIDI is unavailable on tvOS — return false so cores don't enable MIDI
+            // and then hit stub no-ops at runtime.
+            DLOG(@"Environ GET_MIDI_INTERFACE — CoreMIDI unavailable on tvOS");
+            return false;
+#else
+            struct retro_midi_interface **midiPtr = (struct retro_midi_interface **)data;
+            if (!midiPtr) return false;
+            struct retro_midi_interface *iface = pv_libretro_midi_interface();
+            if (!iface) {
+                DLOG(@"Environ GET_MIDI_INTERFACE — CoreMIDI interface unavailable");
+                return false;
+            }
+            *midiPtr = iface;
+            ILOG(@"Environ GET_MIDI_INTERFACE: provided CoreMIDI-backed interface");
+            return true;
+#endif
+        }
+
+        // MARK: - Microphone Interface — env 75 | EXPERIMENTAL
+        case RETRO_ENVIRONMENT_GET_MICROPHONE_INTERFACE: {
+            // Microphone support not wired in legacy libretro frontend.
+            DLOG(@"Environ GET_MICROPHONE_INTERFACE — not supported");
+            return false;
+        }
+
+        // MARK: - Savestate context — env 72 | EXPERIMENTAL
+        case RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT: {
+            // Report normal savestate context (no runahead / netplay rollback).
+            enum retro_savestate_context *ctx = (enum retro_savestate_context *)data;
+            if (ctx) *ctx = RETRO_SAVESTATE_CONTEXT_NORMAL;
+            return true;
+        }
+
+        // MARK: - JIT capable — env 74
+        case RETRO_ENVIRONMENT_GET_JIT_CAPABLE: {
+            // Query the JIT manager for the real runtime acquisition state.
+            // Falls back to false if JIT has not been acquired (e.g. no debugger,
+            // no TrollStore, no iOS-26+ entitlement).
+            bool capable = pvjit_acquired();
+            if (data) *(bool *)data = capable;
+            return true;
+        }
+
+        // MARK: - Device power — env 77 | EXPERIMENTAL
+        case RETRO_ENVIRONMENT_GET_DEVICE_POWER: {
+            // Return true even for NULL data — cores use a NULL probe to check support.
+            struct retro_device_power *pwr = (struct retro_device_power *)data;
+            if (!pwr) return true;
+            // Exclude tvOS explicitly: TARGET_OS_IOS is 0 on tvOS in modern SDKs,
+            // but the extra guard makes platform intent unambiguous.
+#if (TARGET_OS_IOS && !TARGET_OS_TV) || TARGET_OS_MACCATALYST
+            UIDevice *dev = UIDevice.currentDevice;
+            // batteryMonitoringEnabled is enabled once at init; no need to re-enable here.
+            float level = dev.batteryLevel;
+            UIDeviceBatteryState state = dev.batteryState;
+            pwr->percent = (level >= 0.0f) ? (int8_t)(level * 100.0f) : -1;
+            pwr->seconds = RETRO_POWERSTATE_NO_ESTIMATE;
+            switch (state) {
+                case UIDeviceBatteryStateCharging:  pwr->state = RETRO_POWERSTATE_CHARGING;  break;
+                case UIDeviceBatteryStateFull:       pwr->state = RETRO_POWERSTATE_CHARGED;   break;
+                case UIDeviceBatteryStateUnplugged:  pwr->state = RETRO_POWERSTATE_DISCHARGING; break;
+                default:                             pwr->state = RETRO_POWERSTATE_UNKNOWN;   break;
+            }
+#else
+            // tvOS — no battery, always plugged in with unknown percentage.
+            pwr->state   = RETRO_POWERSTATE_PLUGGED_IN;
+            pwr->percent = -1;
+            pwr->seconds = RETRO_POWERSTATE_NO_ESTIMATE;
+#endif
+            return true;
+        }
+
+        // MARK: - Netpacket interface — env 78
+        case RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE: {
+            const struct retro_netpacket_callback *cb =
+                (const struct retro_netpacket_callback *)data;
+            if (cb && cb->start && cb->receive) {
+                if (s_netpacketCallback) {
+                    free(s_netpacketCallback);
+                }
+                s_netpacketCallback = (struct retro_netpacket_callback *)malloc(sizeof(*s_netpacketCallback));
+                memcpy(s_netpacketCallback, cb, sizeof(*s_netpacketCallback));
+                s_netpacketIncomingQueue = [NSMutableArray new];
+                s_netpacketIncomingClientIDs = [NSMutableArray new];
+                s_netpacketQueueLock = OS_UNFAIR_LOCK_INIT;
+                ILOG(@"Environ SET_NETPACKET_INTERFACE: registered (protocol_version=%s)",
+                     cb->protocol_version ?: "(none)");
+                return true;
+            }
+            WLOG(@"Environ SET_NETPACKET_INTERFACE: rejected (missing start/receive)");
+            return false;
+        }
+
+        default : {
+            DLOG(@"Environ UNSUPPORTED (#%u).\n", cmd);
+            return false;
+        }
+    }
+
+    strongCurrent = nil;
+
+    return true;
+}
+
+@import Darwin.POSIX;
+
+static void load_dynamic_core(void)
+{
+    const char* corepath = config_get_active_core_path();
+
+    ILOG(@"Loading dynamic libretro core from: \"%s\"\n",
+         corepath);
+    lib_handle = dylib_load(corepath);
+
+    //    function_t sym       = dylib_proc(lib_handle, "retro_init");
+
+    //    if (sym)
+    //    {
+    //        /* Try to verify that -lretro was not linked in from other modules
+    //         * since loading it dynamically and with -l will fail hard. */
+    //        ELOG(@"Serious problem. RetroArch wants to load libretro cores"
+    //             "dyamically, but it is already linked.\n");
+    //        ELOG(@"This could happen if other modules RetroArch depends on "
+    //             "link against libretro directly.\n");
+    //        ELOG(@"Proceeding could cause a crash. Aborting ...\n");
+    //        retroarch_fail(1, "init_libretro_sym()");
+    //    }
+    //
+    //    if (string_is_empty(config_get_active_core_path()))
+    //    {
+    //        ELOG(@"RetroArch is built for dynamic libretro cores, but "
+    //             "libretro_path is not set. Cannot continue.\n");
+    //        retroarch_fail(1, "init_libretro_sym()");
+    //    }
+    //
+    /* Need to use absolute path for this setting. It can be
+     * saved to content history, and a relative path would
+     * break in that scenario. */
+    //   path_resolve_realpath(
+    //         config_get_active_core_path_ptr(),
+    //         config_get_active_core_path_size());
+    //
+    //   ILOG(@"Loading dynamic libretro core from: \"%s\"\n",
+    //         config_get_active_core_path());
+    //   lib_handle = dylib_load(config_get_active_core_path());
+    if (!lib_handle)
+    {
+        ELOG(@"Failed to open libretro core: \"%s\"\n",
+             config_get_active_core_path());
+        ELOG(@"Error(s): %s\n", dylib_error());
+        retroarch_fail(1, "load_dynamic()");
+    }
+}
+
+/**
+ * load_symbols:
+ * @type                        : Type of core to be loaded.
+ *                                If CORE_TYPE_DUMMY, will
+ *                                load dummy symbols.
+ *
+ * Setup libretro callback symbols.
+ **/
+static void load_symbols(enum rarch_core_type type, struct retro_core_t *current_core)
+{
+
+    switch (type)
+    {
+        case CORE_TYPE_PLAIN:
+#ifdef HAVE_DYNAMIC
+            ILOG(@"Loading dynamic core");
+            load_dynamic_core();
+#endif
+            ILOG(@"type:%x, current_core: %x, lib_handle: %x", type, current_core, lib_handle);
+
+            SYMBOL(retro_init);
+            SYMBOL(retro_deinit);
+
+            SYMBOL(retro_api_version);
+            SYMBOL(retro_get_system_info);
+            SYMBOL(retro_get_system_av_info);
+
+            SYMBOL(retro_set_environment);
+            SYMBOL(retro_set_video_refresh);
+            SYMBOL(retro_set_audio_sample);
+            SYMBOL(retro_set_audio_sample_batch);
+            SYMBOL(retro_set_input_poll);
+            SYMBOL(retro_set_input_state);
+
+            SYMBOL(retro_set_controller_port_device);
+
+            SYMBOL(retro_reset);
+            SYMBOL(retro_run);
+
+            SYMBOL(retro_serialize_size);
+            SYMBOL(retro_serialize);
+            SYMBOL(retro_unserialize);
+
+            SYMBOL(retro_cheat_reset);
+            SYMBOL(retro_cheat_set);
+
+            SYMBOL(retro_load_game);
+            SYMBOL(retro_load_game_special);
+
+            SYMBOL(retro_unload_game);
+            SYMBOL(retro_get_region);
+            SYMBOL(retro_get_memory_data);
+            SYMBOL(retro_get_memory_size);
+            break;
+        case CORE_TYPE_DUMMY:
+            SYMBOL_DUMMY(retro_init);
+            SYMBOL_DUMMY(retro_deinit);
+
+            SYMBOL_DUMMY(retro_api_version);
+            SYMBOL_DUMMY(retro_get_system_info);
+            SYMBOL_DUMMY(retro_get_system_av_info);
+
+            SYMBOL_DUMMY(retro_set_environment);
+            SYMBOL_DUMMY(retro_set_video_refresh);
+            SYMBOL_DUMMY(retro_set_audio_sample);
+            SYMBOL_DUMMY(retro_set_audio_sample_batch);
+            SYMBOL_DUMMY(retro_set_input_poll);
+            SYMBOL_DUMMY(retro_set_input_state);
+
+            SYMBOL_DUMMY(retro_set_controller_port_device);
+
+            SYMBOL_DUMMY(retro_reset);
+            SYMBOL_DUMMY(retro_run);
+
+            SYMBOL_DUMMY(retro_serialize_size);
+            SYMBOL_DUMMY(retro_serialize);
+            SYMBOL_DUMMY(retro_unserialize);
+
+            SYMBOL_DUMMY(retro_cheat_reset);
+            SYMBOL_DUMMY(retro_cheat_set);
+
+            SYMBOL_DUMMY(retro_load_game);
+            SYMBOL_DUMMY(retro_load_game_special);
+
+            SYMBOL_DUMMY(retro_unload_game);
+            SYMBOL_DUMMY(retro_get_region);
+            SYMBOL_DUMMY(retro_get_memory_data);
+            SYMBOL_DUMMY(retro_get_memory_size);
+            break;
+        case CORE_TYPE_FFMPEG:
+#ifdef HAVE_FFMPEG
+            SYMBOL_FFMPEG(retro_init);
+            SYMBOL_FFMPEG(retro_deinit);
+
+            SYMBOL_FFMPEG(retro_api_version);
+            SYMBOL_FFMPEG(retro_get_system_info);
+            SYMBOL_FFMPEG(retro_get_system_av_info);
+
+            SYMBOL_FFMPEG(retro_set_environment);
+            SYMBOL_FFMPEG(retro_set_video_refresh);
+            SYMBOL_FFMPEG(retro_set_audio_sample);
+            SYMBOL_FFMPEG(retro_set_audio_sample_batch);
+            SYMBOL_FFMPEG(retro_set_input_poll);
+            SYMBOL_FFMPEG(retro_set_input_state);
+
+            SYMBOL_FFMPEG(retro_set_controller_port_device);
+
+            SYMBOL_FFMPEG(retro_reset);
+            SYMBOL_FFMPEG(retro_run);
+
+            SYMBOL_FFMPEG(retro_serialize_size);
+            SYMBOL_FFMPEG(retro_serialize);
+            SYMBOL_FFMPEG(retro_unserialize);
+
+            SYMBOL_FFMPEG(retro_cheat_reset);
+            SYMBOL_FFMPEG(retro_cheat_set);
+
+            SYMBOL_FFMPEG(retro_load_game);
+            SYMBOL_FFMPEG(retro_load_game_special);
+
+            SYMBOL_FFMPEG(retro_unload_game);
+            SYMBOL_FFMPEG(retro_get_region);
+            SYMBOL_FFMPEG(retro_get_memory_data);
+            SYMBOL_FFMPEG(retro_get_memory_size);
+#endif
+            break;
+        case CORE_TYPE_IMAGEVIEWER:
+#ifdef HAVE_IMAGEVIEWER
+            SYMBOL_IMAGEVIEWER(retro_init);
+            SYMBOL_IMAGEVIEWER(retro_deinit);
+
+            SYMBOL_IMAGEVIEWER(retro_api_version);
+            SYMBOL_IMAGEVIEWER(retro_get_system_info);
+            SYMBOL_IMAGEVIEWER(retro_get_system_av_info);
+
+            SYMBOL_IMAGEVIEWER(retro_set_environment);
+            SYMBOL_IMAGEVIEWER(retro_set_video_refresh);
+            SYMBOL_IMAGEVIEWER(retro_set_audio_sample);
+            SYMBOL_IMAGEVIEWER(retro_set_audio_sample_batch);
+            SYMBOL_IMAGEVIEWER(retro_set_input_poll);
+            SYMBOL_IMAGEVIEWER(retro_set_input_state);
+
+            SYMBOL_IMAGEVIEWER(retro_set_controller_port_device);
+
+            SYMBOL_IMAGEVIEWER(retro_reset);
+            SYMBOL_IMAGEVIEWER(retro_run);
+
+            SYMBOL_IMAGEVIEWER(retro_serialize_size);
+            SYMBOL_IMAGEVIEWER(retro_serialize);
+            SYMBOL_IMAGEVIEWER(retro_unserialize);
+
+            SYMBOL_IMAGEVIEWER(retro_cheat_reset);
+            SYMBOL_IMAGEVIEWER(retro_cheat_set);
+
+            SYMBOL_IMAGEVIEWER(retro_load_game);
+            SYMBOL_IMAGEVIEWER(retro_load_game_special);
+
+            SYMBOL_IMAGEVIEWER(retro_unload_game);
+            SYMBOL_IMAGEVIEWER(retro_get_region);
+            SYMBOL_IMAGEVIEWER(retro_get_memory_data);
+            SYMBOL_IMAGEVIEWER(retro_get_memory_size);
+#endif
+            break;
+        case CORE_TYPE_NETRETROPAD:
+#if defined(HAVE_NETWORKGAMEPAD) && defined(HAVE_NETPLAY)
+            SYMBOL_NETRETROPAD(retro_init);
+            SYMBOL_NETRETROPAD(retro_deinit);
+
+            SYMBOL_NETRETROPAD(retro_api_version);
+            SYMBOL_NETRETROPAD(retro_get_system_info);
+            SYMBOL_NETRETROPAD(retro_get_system_av_info);
+
+            SYMBOL_NETRETROPAD(retro_set_environment);
+            SYMBOL_NETRETROPAD(retro_set_video_refresh);
+            SYMBOL_NETRETROPAD(retro_set_audio_sample);
+            SYMBOL_NETRETROPAD(retro_set_audio_sample_batch);
+            SYMBOL_NETRETROPAD(retro_set_input_poll);
+            SYMBOL_NETRETROPAD(retro_set_input_state);
+
+            SYMBOL_NETRETROPAD(retro_set_controller_port_device);
+
+            SYMBOL_NETRETROPAD(retro_reset);
+            SYMBOL_NETRETROPAD(retro_run);
+
+            SYMBOL_NETRETROPAD(retro_serialize_size);
+            SYMBOL_NETRETROPAD(retro_serialize);
+            SYMBOL_NETRETROPAD(retro_unserialize);
+
+            SYMBOL_NETRETROPAD(retro_cheat_reset);
+            SYMBOL_NETRETROPAD(retro_cheat_set);
+
+            SYMBOL_NETRETROPAD(retro_load_game);
+            SYMBOL_NETRETROPAD(retro_load_game_special);
+
+            SYMBOL_NETRETROPAD(retro_unload_game);
+            SYMBOL_NETRETROPAD(retro_get_region);
+            SYMBOL_NETRETROPAD(retro_get_memory_data);
+            SYMBOL_NETRETROPAD(retro_get_memory_size);
+#endif
+            break;
+        case CORE_TYPE_VIDEO_PROCESSOR:
+#if defined(HAVE_VIDEO_PROCESSOR)
+            SYMBOL_VIDEOPROCESSOR(retro_init);
+            SYMBOL_VIDEOPROCESSOR(retro_deinit);
+
+            SYMBOL_VIDEOPROCESSOR(retro_api_version);
+            SYMBOL_VIDEOPROCESSOR(retro_get_system_info);
+            SYMBOL_VIDEOPROCESSOR(retro_get_system_av_info);
+
+            SYMBOL_VIDEOPROCESSOR(retro_set_environment);
+            SYMBOL_VIDEOPROCESSOR(retro_set_video_refresh);
+            SYMBOL_VIDEOPROCESSOR(retro_set_audio_sample);
+            SYMBOL_VIDEOPROCESSOR(retro_set_audio_sample_batch);
+            SYMBOL_VIDEOPROCESSOR(retro_set_input_poll);
+            SYMBOL_VIDEOPROCESSOR(retro_set_input_state);
+
+            SYMBOL_VIDEOPROCESSOR(retro_set_controller_port_device);
+
+            SYMBOL_VIDEOPROCESSOR(retro_reset);
+            SYMBOL_VIDEOPROCESSOR(retro_run);
+
+            SYMBOL_VIDEOPROCESSOR(retro_serialize_size);
+            SYMBOL_VIDEOPROCESSOR(retro_serialize);
+            SYMBOL_VIDEOPROCESSOR(retro_unserialize);
+
+            SYMBOL_VIDEOPROCESSOR(retro_cheat_reset);
+            SYMBOL_VIDEOPROCESSOR(retro_cheat_set);
+
+            SYMBOL_VIDEOPROCESSOR(retro_load_game);
+            SYMBOL_VIDEOPROCESSOR(retro_load_game_special);
+
+            SYMBOL_VIDEOPROCESSOR(retro_unload_game);
+            SYMBOL_VIDEOPROCESSOR(retro_get_region);
+            SYMBOL_VIDEOPROCESSOR(retro_get_memory_data);
+            SYMBOL_VIDEOPROCESSOR(retro_get_memory_size);
+#endif
+            break;
+    }
+}
+#define PITCH_SHIFT 2
+
+@implementation PVLibRetroCoreBridge
+
+static void RETRO_CALLCONV audio_callback(int16_t left, int16_t right)
+{
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+
+    [[strongCurrent ringBufferAtIndex:0] write:&left size:2];
+    [[strongCurrent ringBufferAtIndex:0] write:&right size:2];
+
+    strongCurrent = nil;
+}
+
+static size_t RETRO_CALLCONV audio_batch_callback(const int16_t *data, size_t frames)
+{
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+
+    [[strongCurrent ringBufferAtIndex:0] write:data size:frames << 2];
+
+    strongCurrent = nil;
+
+    return frames;
+}
+
+static void RETRO_CALLCONV video_callback(const void *data, unsigned width, unsigned height, size_t pitch)
+{
+    // NULL means "duplicate the previous frame"; RETRO_HW_FRAME_BUFFER_VALID
+    // (-1 cast to pointer) means a hardware-rendered frame is ready in the
+    // framebuffer.  In both cases keep videoBuffer unchanged and return.
+    if (!data || data == (const void *)(uintptr_t)-1) return;
+
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+    if (!strongCurrent) return;
+
+    static dispatch_queue_t concurrentQueue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_queue_attr_t queueAttributes = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INTERACTIVE, 0);
+        concurrentQueue = dispatch_queue_create("com.provenance.video", queueAttributes);
+    });
+
+    const enum retro_pixel_format fmt = strongCurrent->pix_fmt;
+
+    // Use max_width as the destination row stride so that videoBuffer row layout
+    // matches what -bufferSize reports (max_width × max_height).  When a core
+    // renders at a resolution narrower than max_width the remaining pixels in
+    // each row are left unchanged; the renderer clips to base_width/base_height.
+    const size_t dstStride = strongCurrent->av_info.geometry.max_width;
+
+    if (fmt == RETRO_PIXEL_FORMAT_XRGB8888) {
+        // Source: 32-bit XRGB little-endian [B][G][R][X].
+        // Force alpha=0xFF so the texture is fully opaque (X byte is unused).
+        dispatch_apply(height, concurrentQueue, ^(size_t y) {
+            const uint32_t *src_row = (const uint32_t *)((const uint8_t *)data + y * pitch);
+            uint32_t *dst = strongCurrent->videoBuffer + y * dstStride;
+            for (size_t x = 0; x < width; x++) {
+                dst[x] = src_row[x] | 0xFF000000u;
+            }
+        });
+    } else if (fmt == RETRO_PIXEL_FORMAT_RGB565) {
+        // Source: 16-bit RGB565 — RRRRRGGGGGGBBBBB.
+        // Expand each pixel to 32-bit RGBA8 for uniform GL_RGBA upload.
+        dispatch_apply(height, concurrentQueue, ^(size_t y) {
+            const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + y * pitch);
+            uint32_t *dst = strongCurrent->videoBuffer + y * dstStride;
+            for (size_t x = 0; x < width; x++) {
+                uint16_t px = src_row[x];
+                uint8_t r5 = (px >> 11) & 0x1F;
+                uint8_t g6 = (px >> 5)  & 0x3F;
+                uint8_t b5 =  px        & 0x1F;
+                // Scale to 8-bit using bit-replication for full range.
+                uint8_t r8 = (r5 << 3) | (r5 >> 2);
+                uint8_t g8 = (g6 << 2) | (g6 >> 4);
+                uint8_t b8 = (b5 << 3) | (b5 >> 2);
+                // RGBA in memory: [r8][g8][b8][FF] as little-endian uint32.
+                dst[x] = ((uint32_t)0xFF << 24) | ((uint32_t)b8 << 16) | ((uint32_t)g8 << 8) | r8;
+            }
+        });
+    } else {
+        // RETRO_PIXEL_FORMAT_0RGB1555: X[1] R[5] G[5] B[5].
+        // Expand each pixel to 32-bit RGBA8 for uniform GL_RGBA upload.
+        dispatch_apply(height, concurrentQueue, ^(size_t y) {
+            const uint16_t *src_row = (const uint16_t *)((const uint8_t *)data + y * pitch);
+            uint32_t *dst = strongCurrent->videoBuffer + y * dstStride;
+            for (size_t x = 0; x < width; x++) {
+                uint16_t px = src_row[x];
+                uint8_t r5 = (px >> 10) & 0x1F;
+                uint8_t g5 = (px >> 5)  & 0x1F;
+                uint8_t b5 =  px        & 0x1F;
+                uint8_t r8 = (r5 << 3) | (r5 >> 2);
+                uint8_t g8 = (g5 << 3) | (g5 >> 2);
+                uint8_t b8 = (b5 << 3) | (b5 >> 2);
+                dst[x] = ((uint32_t)0xFF << 24) | ((uint32_t)b8 << 16) | ((uint32_t)g8 << 8) | r8;
+            }
+        });
+    }
+
+    strongCurrent = nil;
+}
+
+static void RETRO_CALLCONV input_poll_callback(void)
+{
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+    [strongCurrent pollControllers];
+    //DLOG(@"poll callback");
+}
+
+static int16_t RETRO_CALLCONV input_state_callback(unsigned port, unsigned device, unsigned index, unsigned _id)
+{
+    //DLOG(@"polled input: port: %d device: %d id: %d", port, device, id);
+
+    __strong PVLibRetroCoreBridge *strongCurrent = _current;
+    int16_t value = 0;
+
+    if (port == 0 & device == RETRO_DEVICE_JOYPAD)
+    {
+        if (strongCurrent.controller1)
+        {
+            value = [strongCurrent controllerValueForButtonID:_id forPlayer:port];
+        }
+
+        if (value == 0)
+        {
+            value = strongCurrent->_pad[0][_id];
+        }
+    }
+    else if(port == 1 & device == RETRO_DEVICE_JOYPAD)
+    {
+        if (strongCurrent.controller2)
+        {
+            value = [strongCurrent controllerValueForButtonID:_id forPlayer:port];
+        }
+
+        if (value == 0)
+        {
+            value = strongCurrent->_pad[1][_id];
+        }
+    }
+    else if (device == RETRO_DEVICE_POINTER || device == RETRO_DEVICE_MOUSE)
+    {
+        // Handle touch and mouse input
+        value = [strongCurrent getPointerState:port device:device index:index id:_id];
+    }
+
+    strongCurrent = nil;
+
+    return value;
+}
+
+- (instancetype)init {
+    if((self = [super init])) {
+        pitch_shift = PITCH_SHIFT;
+        _current = self;
+        _touchpadEnabled = YES;
+#if (TARGET_OS_IOS && !TARGET_OS_TV) || TARGET_OS_MACCATALYST
+        // Enable battery monitoring once so env 77 (GET_DEVICE_POWER) can read
+        // the current level without toggling the flag on every callback invocation.
+        UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+#endif
+        NSBundle *myBundle = [NSBundle bundleForClass:[self class]];
+        NSAssert(myBundle, @"myBundle was nil");
+        const char* path = [myBundle.bundlePath fileSystemRepresentation];
+        config_set_active_core_path(path);
+//        load_dynamic_core();
+        core = malloc(sizeof(retro_core_t));
+        init_libretro_sym(CORE_TYPE_PLAIN, core);
+        retro_set_environment(environment_callback);
+
+        memset(_pad, 0, sizeof(int16_t) * 24);
+
+//        core_get_info(&info);
+//        std::cout << "Loaded core " << info.library_name << " version " << info.library_version << std::endl;
+//        std::cout << "Core needs fullpath " << info.need_fullpath << std::endl;
+//        std::cout << "Running for " << maxframes << " frames with frame timeout of ";
+//        std::cout << frametimeout << " seconds" << std::endl;
+
+//        struct retro_system_info info;
+//        bool load_no_info;
+//        libretro_get_system_info("", &info, &load_no_info);
+
+        videoBufferA = (uint32_t *)malloc(2560 * 2560 * sizeof(uint32_t));
+        videoBufferB = (uint32_t *)malloc(2560 * 2560 * sizeof(uint32_t));
+        videoBuffer = videoBufferA;
+    }
+
+    return self;
+}
+
+- (void)dealloc {
+    // Clean up netpacket state
+    if (s_netpacketCallback) {
+        if (s_netpacketSessionActive && s_netpacketCallback->stop) {
+            s_netpacketCallback->stop();
+        }
+        free(s_netpacketCallback);
+        s_netpacketCallback = NULL;
+    }
+    s_netpacketSessionActive = NO;
+    s_netpacketSendBlock = nil;
+    s_netpacketIncomingQueue = nil;
+    s_netpacketIncomingClientIDs = nil;
+
+    core_unload();
+}
+
+// MARK: - Netpacket ObjC interface
+
+- (BOOL)hasNetpacketInterface {
+    return s_netpacketCallback != NULL;
+}
+
+- (nullable NSString *)netpacketProtocolVersion {
+    if (!s_netpacketCallback || !s_netpacketCallback->protocol_version) return nil;
+    return [NSString stringWithUTF8String:s_netpacketCallback->protocol_version];
+}
+
+- (void (^)(int, const void *, size_t, uint16_t))netpacketSendBlock {
+    return s_netpacketSendBlock;
+}
+
+- (void)setNetpacketSendBlock:(void (^)(int, const void *, size_t, uint16_t))block {
+    s_netpacketSendBlock = [block copy];
+}
+
+- (void)startNetpacketSessionWithClientID:(uint16_t)clientID {
+    if (!s_netpacketCallback || !s_netpacketCallback->start) {
+        WLOG(@"PVLibRetroCore: startNetpacketSession called without registered callback");
+        return;
+    }
+    s_netpacketSessionActive = YES;
+    ILOG(@"PVLibRetroCore: starting netpacket session (clientID=%u)", clientID);
+    s_netpacketCallback->start(clientID, legacy_netpacket_send, legacy_netpacket_poll_receive);
+}
+
+- (void)stopNetpacketSession {
+    if (!s_netpacketSessionActive) return;
+    s_netpacketSessionActive = NO;
+    if (s_netpacketCallback && s_netpacketCallback->stop) {
+        s_netpacketCallback->stop();
+    }
+    os_unfair_lock_lock(&s_netpacketQueueLock);
+    [s_netpacketIncomingQueue removeAllObjects];
+    [s_netpacketIncomingClientIDs removeAllObjects];
+    os_unfair_lock_unlock(&s_netpacketQueueLock);
+    ILOG(@"PVLibRetroCore: netpacket session stopped");
+}
+
+- (void)enqueueNetpacketData:(NSData *)data fromClient:(uint16_t)clientID {
+    os_unfair_lock_lock(&s_netpacketQueueLock);
+    [s_netpacketIncomingQueue addObject:data];
+    [s_netpacketIncomingClientIDs addObject:@(clientID)];
+    os_unfair_lock_unlock(&s_netpacketQueueLock);
+}
+
+- (void)netpacketPeerConnected:(uint16_t)clientID {
+    if (!s_netpacketCallback || !s_netpacketCallback->connected) return;
+    s_netpacketCallback->connected(clientID);
+}
+
+- (void)netpacketPeerDisconnected:(uint16_t)clientID {
+    if (!s_netpacketCallback || !s_netpacketCallback->disconnected) return;
+    s_netpacketCallback->disconnected(clientID);
+}
+
+-(void)coreInit {
+    GET_CURRENT_OR_RETURN();
+
+    current->core->retro_init();
+
+    current->core->retro_set_audio_sample(audio_callback);
+    current->core->retro_set_audio_sample_batch(audio_batch_callback);
+
+    // DEBUG: Confirm video callback registration
+    NSLog(@"🎬 REGISTERING video_callback function: %p", video_callback);
+    current->core->retro_set_video_refresh(video_callback);
+    NSLog(@"🎬 VIDEO CALLBACK REGISTERED SUCCESSFULLY");
+
+    current->core->retro_set_input_poll(input_poll_callback);
+    current->core->retro_set_input_state(input_state_callback);
+}
+
+- (BOOL)loadFileAtPath:(NSString *)path error:(NSError**)error {
+    self.romPath = path;
+    NSURL *batterySavesDirectory = [NSURL fileURLWithPath:[self batterySavesPath]];
+    NSError *localError;
+    BOOL status = [[NSFileManager defaultManager] createDirectoryAtURL:batterySavesDirectory
+                             withIntermediateDirectories:YES
+                                              attributes:nil
+                                                   error:&localError];
+    if(!status) {
+        *error = localError;
+        return NO;
+    }
+
+    [self coreInit];
+
+    // Load ROM data and retain it
+    NSData *romData = [NSData dataWithContentsOfFile:path];
+    if (!romData) {
+        if (error) {
+            *error = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+                                         code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+                                   userInfo:@{NSLocalizedDescriptionKey: @"Could not load ROM data"}];
+        }
+        return NO;
+    }
+
+    // Keep a strong reference to prevent deallocation
+    self.currentRomData = romData;
+
+    struct retro_game_info info;
+    info.path = [path fileSystemRepresentation];
+    info.data = romData.bytes;
+    info.size = romData.length;
+    info.meta = NULL;
+
+    BOOL loaded = core->retro_load_game(&info);
+
+    if (loaded) {
+        core->retro_get_system_av_info(&self->av_info);
+    }
+
+    if (!loaded) {
+        struct retro_ctx_load_content_info info2;
+        info2.info = &info;
+        info2.content = nil;
+        info2.special = nil;
+
+        loaded = core_load_game(&info2);
+    }
+
+    self->loaded = loaded;
+
+    if(!loaded) {
+        NSString *coreName = [self coreIdentifier];
+        NSString *errorMessage = FORMAT(@"%@ failed to load ROM for unknown reasons.", coreName);
+        NSDictionary *userInfo = @{
+                                   NSLocalizedDescriptionKey: @"Failed to load ROM.",
+                                   NSLocalizedFailureReasonErrorKey:errorMessage,
+                                   NSLocalizedRecoverySuggestionErrorKey: @"Try a different ROM and check required BIOSes."
+                                   };
+
+        if (error) {
+            *error = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                         code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+                                   userInfo:userInfo];
+        }
+    }
+
+    return loaded;
+}
+
+- (void)executeFrame {
+    [self executeFrameSkippingFrame:NO];
+}
+
+- (void)executeFrameSkippingFrame:(BOOL)skip {
+    switch (core_poll_type)
+    {
+        case POLL_TYPE_EARLY:
+            input_poll();
+            break;
+        case POLL_TYPE_LATE:
+            core_input_polled = false;
+            break;
+    }
+    if (core->retro_run)
+        core->retro_run();
+    if (core_poll_type == POLL_TYPE_LATE && !core_input_polled)
+        input_poll();
+    //	return true;
+    //    retro_run();
+    //    for (unsigned y = 0; y < HEIGHT; y++)
+    //        for (unsigned x = 0; x < WIDTH; x++, pXBuf++)
+    //            videoBuffer[y * WIDTH + x] = palette[*pXBuf];
+    //
+    //    for (int i = 0; i < soundSize; i++)
+    //        soundBuffer[i] = (soundBuffer[i] << 16) | (soundBuffer[i] & 0xffff);
+    //
+    //    [[self ringBufferAtIndex:0] write:soundBuffer maxLength:soundSize << 2];
+
+}
+
+- (void)resetEmulation {
+    core->retro_reset();
+}
+
+- (void)stopEmulation {
+    [super stopEmulation];
+
+    core->retro_unload_game();
+
+//    if (self->loaded) {
+//        core->retro_reset();
+//    }
+//    core->retro_deinit();
+}
+
+// frameInterval, swapBuffers, videoWidth, videoHeight, screenRect, aspectSize, bufferSize
+// are implemented in PVLibRetroCore+Video.m (PVLibRetroCoreBridge (Video) category).
+// audioSampleRate / channelCount live in PVLibRetroCore+Audio.m.
+
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+- (UIView *)pointerReferenceView {
+    id renderDelegate = self.renderDelegate;
+    if (renderDelegate) {
+        NSArray<NSString *> *selectorNames = @[@"mtlview", @"mtlView"];
+        for (NSString *selectorName in selectorNames) {
+            SEL selector = NSSelectorFromString(selectorName);
+            if ([renderDelegate respondsToSelector:selector]) {
+                IMP imp = [renderDelegate methodForSelector:selector];
+                UIView *(*getter)(id, SEL) = (UIView *(*)(id, SEL))imp;
+                UIView *renderView = getter(renderDelegate, selector);
+                if ([renderView isKindOfClass:[UIView class]]) {
+                    return renderView;
+                }
+            }
+        }
+    }
+
+    if (self.touchViewController && self.touchViewController.view) {
+        return self.touchViewController.view;
+    }
+
+    return nil;
+}
+
+- (BOOL)touch:(UITouch *)touch isInsideReferenceView:(UIView *)referenceView tolerance:(CGFloat)tolerance {
+    if (!referenceView) {
+        return YES;
+    }
+
+    CGPoint location = [touch locationInView:referenceView];
+    CGRect bounds = CGRectInset(referenceView.bounds, -tolerance, -tolerance);
+    return CGRectContainsPoint(bounds, location);
+}
+
+- (UITouch *)preferredStylusTouchFromTouches:(NSSet<UITouch *> *)touches referenceView:(UIView *)referenceView {
+    if (touches.count == 0) {
+        return nil;
+    }
+
+    if (self.activeStylusTouch && [touches containsObject:self.activeStylusTouch]) {
+        return self.activeStylusTouch;
+    }
+
+    if (!referenceView) {
+        UITouch *fallback = touches.anyObject;
+        self.activeStylusTouch = fallback;
+        return fallback;
+    }
+
+    for (UITouch *touch in touches) {
+        if ([self touch:touch isInsideReferenceView:referenceView tolerance:0.0]) {
+            self.activeStylusTouch = touch;
+            return touch;
+        }
+    }
+
+    return nil;
+}
+#endif
+
+- (void *)getVariable:(const char *)variable {
+    ELOG(@"This should be done in sub class: %s", variable);
+    return NULL;
+}
+
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+- (void)sendEvent:(UIEvent *)event {
+    [super sendEvent:event];
+    if (!self.touchpadEnabled || event == nil) {
+        return;
+    }
+
+    if (event.type == UIEventTypeTouches) {
+        [self handleTouchEvent:event];
+    }
+}
+#endif
+
+@end
+
+unsigned retro_api_version(void)
+{
+    return RETRO_API_VERSION;
+}
+
+#pragma mark - Touch and Mouse Input Support
+
+@implementation PVLibRetroCoreBridge (TouchMouseInput)
+
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+- (void)handleTouchEvent:(UIEvent *_Nonnull)event {
+    if (!self.touchpadEnabled || event == nil) {
+        return;
+    }
+
+    NSSet<UITouch *> *touches = [event allTouches];
+    if (touches.count == 0) {
+        touchPressed = NO;
+        self.activeStylusTouch = nil;
+        return;
+    }
+
+    UIView *referenceView = [self pointerReferenceView];
+    if (!referenceView) {
+        referenceView = touches.anyObject.view;
+    }
+
+    UITouch *touch = [self preferredStylusTouchFromTouches:touches referenceView:referenceView];
+    if (!touch || !referenceView) {
+        touchPressed = NO;
+        self.activeStylusTouch = nil;
+        return;
+    }
+
+    CGSize viewSize = referenceView.bounds.size;
+    if (viewSize.width <= 0.0 || viewSize.height <= 0.0) {
+        return;
+    }
+
+    CGPoint location = [touch locationInView:referenceView];
+    CGFloat normalizedX = location.x / viewSize.width;
+    CGFloat normalizedY = location.y / viewSize.height;
+
+    @synchronized(self) {
+        currentTouchPosition.x = MAX(0.0, MIN(1.0, normalizedX));
+        currentTouchPosition.y = MAX(0.0, MIN(1.0, normalizedY));
+        switch (touch.phase) {
+            case UITouchPhaseBegan:
+            case UITouchPhaseMoved:
+            case UITouchPhaseStationary:
+                touchPressed = YES;
+                break;
+            case UITouchPhaseEnded:
+            case UITouchPhaseCancelled:
+                touchPressed = NO;
+                // Reset last mouse position so the next touch doesn't generate a
+                // spurious large delta from the previous session's final position.
+                lastMousePositionValid = NO;
+                break;
+            default:
+                break;
+        }
+    }
+    if (touch.phase == UITouchPhaseCancelled || touch.phase == UITouchPhaseEnded) {
+        self.activeStylusTouch = nil;
+    }
+}
+#else
+- (void)handleMouseEvent:(NSEvent *_Nonnull)event {
+    if (!event) {
+        return;
+    }
+
+    // Get mouse location relative to the view
+    NSPoint location = [event locationInWindow];
+    NSView *view = [[event window] contentView];
+
+    if (view) {
+        // Convert to view coordinates
+        location = [view convertPoint:location fromView:nil];
+
+        // Normalize coordinates to 0.0-1.0 range
+        NSSize viewSize = view.bounds.size;
+        if (viewSize.width > 0 && viewSize.height > 0) {
+            float nx = (float)MAX(0.0, MIN(1.0, location.x / viewSize.width));
+            float ny = (float)MAX(0.0, MIN(1.0, location.y / viewSize.height));
+            @synchronized(self) {
+                currentMousePosition.x = nx;
+                currentMousePosition.y = ny;
+                // Accumulate relative delta for RETRO_DEVICE_MOUSE X/Y queries,
+                // mirroring the iOS/touch path in setMousePosition:.
+                if (lastMousePositionValid) {
+                    mouseDeltaX += (nx - lastMousePosition.x) * 1000.0f;
+                    mouseDeltaY += (ny - lastMousePosition.y) * 1000.0f;
+                }
+                lastMousePosition = CGPointMake(nx, ny);
+                lastMousePositionValid = YES;
+            }
+        }
+    }
+
+    // Update mouse button state based on event type.
+    // Guard under @synchronized so getPointerState: (emulator thread) sees
+    // a consistent view of all button flags alongside position/delta.
+    @synchronized(self) {
+        switch ([event type]) {
+            case NSEventTypeLeftMouseDown:
+                leftMousePressed = YES;
+                mousePressed = YES;
+                break;
+            case NSEventTypeLeftMouseUp:
+                leftMousePressed = NO;
+                mousePressed = rightMousePressed;
+                // Reset last position so the next drag doesn't generate a spurious delta.
+                lastMousePositionValid = NO;
+                break;
+            case NSEventTypeRightMouseDown:
+                rightMousePressed = YES;
+                mousePressed = YES;
+                break;
+            case NSEventTypeRightMouseUp:
+                rightMousePressed = NO;
+                mousePressed = leftMousePressed;
+                break;
+            case NSEventTypeMouseMoved:
+            case NSEventTypeLeftMouseDragged:
+            case NSEventTypeRightMouseDragged:
+                // Position and deltas already updated above.
+                break;
+            default:
+                break;
+        }
+    }
+
+    DLOG(@"Mouse event: position (%.3f, %.3f), left: %d, right: %d",
+         currentMousePosition.x, currentMousePosition.y, leftMousePressed, rightMousePressed);
+}
+#endif
+
+- (int16_t)getPointerState:(unsigned)port device:(unsigned)device index:(unsigned)index id:(unsigned)id {
+    // Only handle port 0 for now
+    if (port != 0) {
+        return 0;
+    }
+
+    switch (device) {
+        case RETRO_DEVICE_POINTER: {
+            switch (id) {
+                case RETRO_DEVICE_ID_POINTER_X: {
+                    // Guard with @synchronized: setMousePosition: (UI thread) writes
+                    // currentTouchPosition/currentMousePosition while this runs on the
+                    // libretro polling thread, so reads must be protected to avoid tears.
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+                    float px;
+                    @synchronized(self) { px = currentTouchPosition.x; }
+                    // Convert 0.0-1.0 range to libretro's -32768 to 32767 range
+                    return (int16_t)((px * 2.0 - 1.0) * 32767);
+#else
+                    float px;
+                    @synchronized(self) { px = currentMousePosition.x; }
+                    return (int16_t)((px * 2.0 - 1.0) * 32767);
+#endif
+                }
+
+                case RETRO_DEVICE_ID_POINTER_Y: {
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+                    float py;
+                    @synchronized(self) { py = currentTouchPosition.y; }
+                    // Convert 0.0-1.0 range to libretro's -32768 to 32767 range
+                    // Note: libretro uses inverted Y (top = -32768, bottom = 32767)
+                    return (int16_t)((py * 2.0 - 1.0) * 32767);
+#else
+                    float py;
+                    @synchronized(self) { py = currentMousePosition.y; }
+                    return (int16_t)((py * 2.0 - 1.0) * 32767);
+#endif
+                }
+
+                case RETRO_DEVICE_ID_POINTER_PRESSED: {
+                    BOOL pressed;
+                    @synchronized(self) {
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+                        pressed = touchPressed;
+#else
+                        pressed = mousePressed;
+#endif
+                    }
+                    return pressed ? 1 : 0;
+                }
+
+                default:
+                    return 0;
+            }
+        }
+
+        case RETRO_DEVICE_MOUSE: {
+            switch (id) {
+                case RETRO_DEVICE_ID_MOUSE_X: {
+                    // RETRO_DEVICE_ID_MOUSE_X/Y report relative movement since
+                    // the last poll (delta pixels), not an absolute position.
+                    // Consume the accumulated delta under @synchronized so no
+                    // deltas are lost if setMousePosition: fires concurrently.
+                    int16_t dx;
+                    @synchronized(self) {
+                        dx = (int16_t)MAX((float)INT16_MIN, MIN((float)INT16_MAX, mouseDeltaX));
+                        mouseDeltaX = 0;
+                    }
+                    return dx;
+                }
+
+                case RETRO_DEVICE_ID_MOUSE_Y: {
+                    int16_t dy;
+                    @synchronized(self) {
+                        dy = (int16_t)MAX((float)INT16_MIN, MIN((float)INT16_MAX, mouseDeltaY));
+                        mouseDeltaY = 0;
+                    }
+                    return dy;
+                }
+
+                case RETRO_DEVICE_ID_MOUSE_LEFT: {
+                    BOOL pressed;
+                    @synchronized(self) {
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+                        pressed = touchPressed;
+#else
+                        pressed = leftMousePressed;
+#endif
+                    }
+                    return pressed ? 1 : 0;
+                }
+
+                case RETRO_DEVICE_ID_MOUSE_RIGHT: {
+                    BOOL pressed;
+                    @synchronized(self) { pressed = rightMousePressed; }
+                    return pressed ? 1 : 0;
+                }
+
+                default:
+                    return 0;
+            }
+        }
+
+        default:
+            return 0;
+    }
+}
+
+#pragma mark - Keyboard Event Forwarding
+
+// ---------------------------------------------------------------------------
+// Pending key-event queue
+//
+// Virtual-keyboard (or any UI) events may arrive before the libretro core has
+// registered its keyboard callback via RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK.
+// Rather than silently dropping them we buffer up to PV_KEY_QUEUE_CAPACITY
+// events and replay them the next time sendKeyboardEvent:hidCode:character: is
+// called with a live callback.  If the queue overflows the excess event is
+// dropped with an error log.
+//
+// Thread safety: sPendingKeyLock (os_unfair_lock) guards sPendingKey*.
+// The callback itself is invoked outside the lock to avoid potential re-entry
+// deadlocks.
+//
+// NOTE: sPendingKeyLock guards reads of runloop_key_event but not writes — the
+// RetroArch environment callback (RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK)
+// assigns it without acquiring this lock.  This is a pre-existing race in the
+// RetroArch integration, not introduced here.  The window is narrow (core init
+// only) and will be addressed in a dedicated hardening pass.
+// ---------------------------------------------------------------------------
+
+#define PV_KEY_QUEUE_CAPACITY 64
+
+typedef struct {
+    BOOL     down;
+    unsigned hidCode;
+    uint32_t character;
+} PVPendingKeyEvent;
+
+static PVPendingKeyEvent sPendingKeyEvents[PV_KEY_QUEUE_CAPACITY];
+static NSUInteger        sPendingKeyCount = 0;
+static os_unfair_lock    sPendingKeyLock  = OS_UNFAIR_LOCK_INIT;
+
+// Sends a keyboard event to the libretro core via the registered keyboard callback.
+// hidCode corresponds to GCKeyCode.rawValue on iOS 14+ (HID USB usage page key codes).
+// If the core callback is not yet registered, the event is queued and replayed
+// on the next call once the callback becomes available.
+- (void)sendKeyboardEvent:(BOOL)down hidCode:(unsigned)hidCode character:(uint32_t)character {
+    // Initialise the Apple HID → RETRO_KEY lookup table exactly once.
+    // dispatch_once is process-scoped and therefore survives core reload/restart
+    // because rarch_key_map_apple_hid is a fixed compile-time table that never
+    // changes between invocations.
+    static dispatch_once_t keymapOnce;
+    dispatch_once(&keymapOnce, ^{
+        input_keymaps_init_keyboard_lut(rarch_key_map_apple_hid);
+    });
+
+    os_unfair_lock_lock(&sPendingKeyLock);
+    retro_keyboard_event_t cb = runloop_key_event; // snapshot under lock
+
+    if (!cb) {
+        // The core has not yet registered a keyboard callback via
+        // RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK.  Queue the event so it
+        // is replayed once the callback becomes available.
+        WLOG(@"[PVLibRetro] sendKeyboardEvent: runloop_key_event is NULL — "
+              "queuing event (down=%d hidCode=0x%02X) [%lu/%d queued]",
+              (int)down, hidCode, (unsigned long)(sPendingKeyCount + 1),
+              PV_KEY_QUEUE_CAPACITY);
+        if (sPendingKeyCount < PV_KEY_QUEUE_CAPACITY) {
+            sPendingKeyEvents[sPendingKeyCount++] =
+                (PVPendingKeyEvent){ .down = down, .hidCode = hidCode, .character = character };
+        } else {
+            ELOG(@"[PVLibRetro] sendKeyboardEvent: pending key queue full "
+                  "(%d events); dropping event (down=%d hidCode=0x%02X).",
+                  PV_KEY_QUEUE_CAPACITY, (int)down, hidCode);
+        }
+        os_unfair_lock_unlock(&sPendingKeyLock);
+        return;
+    }
+
+    // Snapshot and drain any events queued before the callback was ready.
+    NSUInteger pendingCount = sPendingKeyCount;
+    PVPendingKeyEvent pendingCopy[PV_KEY_QUEUE_CAPACITY];
+    if (pendingCount > 0) {
+        memcpy(pendingCopy, sPendingKeyEvents, pendingCount * sizeof(PVPendingKeyEvent));
+        sPendingKeyCount = 0;
+    }
+    os_unfair_lock_unlock(&sPendingKeyLock);
+
+    // Replay queued events (lock released to avoid re-entry deadlock).
+    for (NSUInteger i = 0; i < pendingCount; i++) {
+        enum retro_key rk = input_keymaps_translate_keysym_to_rk(pendingCopy[i].hidCode);
+        cb((bool)pendingCopy[i].down, rk, pendingCopy[i].character, 0);
+    }
+
+    // Deliver the current event.
+    enum retro_key rk = input_keymaps_translate_keysym_to_rk(hidCode);
+    cb((bool)down, rk, character, 0);
+}
+
+#pragma mark - Mouse State Management
+
+- (void)setMousePosition:(CGPoint)normalizedPoint {
+    float nx, ny;
+    @synchronized(self) {
+        nx = MAX(0.0f, MIN(1.0f, (float)normalizedPoint.x));
+        ny = MAX(0.0f, MIN(1.0f, (float)normalizedPoint.y));
+        // Update absolute position for RETRO_DEVICE_POINTER queries.
+        currentTouchPosition.x = nx;
+        currentTouchPosition.y = ny;
+        // Accumulate relative delta for RETRO_DEVICE_MOUSE X/Y queries.
+        // Scale factor: 1000 units per normalized unit gives responsive
+        // movement at typical DOS/retro resolutions.
+        if (lastMousePositionValid) {
+            mouseDeltaX += (nx - lastMousePosition.x) * 1000.0f;
+            mouseDeltaY += (ny - lastMousePosition.y) * 1000.0f;
+        }
+        lastMousePosition = CGPointMake(nx, ny);
+        lastMousePositionValid = YES;
+    }
+    // Notify the cursor overlay on the main thread (fire-and-forget, non-blocking).
+    CGPoint clampedPoint = CGPointMake(nx, ny);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"PVMousePositionDidChange"
+            object:nil
+            userInfo:@{ @"PVMousePositionKey": [NSValue valueWithCGPoint:clampedPoint] }];
+    });
+}
+
+- (void)setLeftMouseButtonPressed:(BOOL)pressed {
+    // Update both: touchPressed drives RETRO_DEVICE_POINTER press state,
+    // leftMousePressed drives RETRO_DEVICE_ID_MOUSE_LEFT specifically.
+    @synchronized(self) {
+        touchPressed = pressed;
+        leftMousePressed = pressed;
+        if (!pressed) {
+            // Reset delta baseline so the next press doesn't generate a
+            // spurious large delta from the previous touch session's position.
+            lastMousePositionValid = NO;
+        }
+    }
+    if (pressed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"PVMouseButtonDidPress"
+                object:nil];
+        });
+    }
+}
+
+- (void)setRightMouseButtonPressed:(BOOL)pressed {
+    @synchronized(self) {
+        rightMousePressed = pressed;
+        if (!pressed) {
+            lastMousePositionValid = NO;
+        }
+    }
+}
+
+- (BOOL)pv_setControllerPortDevice:(unsigned)device forPort:(unsigned)port {
+    @synchronized(self) {
+        retro_ctx_controller_info_t pad;
+        pad.port   = port;
+        pad.device = device;
+        // core_set_controller_port_device returns false when the libretro core
+        // is not yet initialised (_current is nil) or pad is nil. Log and return
+        // NO so callers know to retry after the core finishes loading.
+        if (!core_set_controller_port_device(&pad)) {
+            ILOG(@"pv_setControllerPortDevice: core not ready, skipping device=%u port=%u", device, port);
+            return NO;
+        }
+        return YES;
+    }
+}
+
+// MARK: - MIDI injection
+
+- (void)injectMIDIByte:(uint8_t)byte {
+    pv_libretro_midi_inject_byte(byte);
+}
+
+@end
+
+#pragma clang diagnostic pop

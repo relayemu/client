@@ -1,0 +1,270 @@
+//
+//  PVGame+Spotlight.swift
+//  Provenance
+//
+//  Created by Joseph Mattiello on 3/11/18.
+//  Copyright © 2018 James Addyman. All rights reserved.
+//
+
+import Foundation
+import RealmSwift
+
+#if canImport(CoreSpotlight)
+import CoreSpotlight
+#endif
+
+import PVMediaCache
+import PVPrimitives
+import UniformTypeIdentifiers
+
+#if canImport(UIKit)
+import UIKit
+#else
+import AppKit
+typealias UIImage = NSImage
+#endif
+// import UIKit
+
+/// Encoding parameters for the inline artwork thumbnail attached to Spotlight items.
+private enum SpotlightArtworkThumbnail {
+    /// Longest edge, in pixels. Spotlight results render far smaller than this.
+    static let maxPixelSize = 300
+    static let jpegCompressionQuality: CGFloat = 0.9
+}
+
+/// HTTPS base paths for ``NSUserActivity/webpageURL`` (custom URL schemes are rejected). Must match `applinks:provenance-emu.com` and the host’s `apple-app-site-association`.
+private enum ProvenanceUserActivityWebLink {
+    /// Public game page by ROM MD5 — keep in sync with provenance-emu.com routing and AASA `paths`.
+    static let gameByMD5Prefix = "https://provenance-emu.com/game/"
+}
+
+public extension PVGame {
+    
+    fileprivate enum Consts {
+        static let spotlightActivityType = "org.provenance-emu.game-search"
+    }
+    
+    var url: URL? { get {
+        return file?.url
+    }}
+
+#if os(iOS) || os(macOS) || targetEnvironment(macCatalyst)
+    var spotlightContentSet: CSSearchableItemAttributeSet {
+        guard !isInvalidated else {
+            return CSSearchableItemAttributeSet()
+        }
+
+        /// Create a content set using the registered Provenance ROM UTI so the OS can surface
+        /// it in Spotlight/Siri with the right content classification.
+        /// com.provenance.rom is exported in the app's Info.plist (UTExportedTypeDeclarations)
+        /// and conforms to public.data, so Spotlight will index it correctly.
+        let contentSet = CSSearchableItemAttributeSet(contentType: .rom)
+
+        // Primary metadata — set both title and displayName so Spotlight and Siri both match
+        contentSet.title = title
+        contentSet.displayName = title
+        contentSet.relatedUniqueIdentifier = md5Hash
+
+        // System information
+        let systemName = self.systemName
+
+        // Create a rich, structured description
+        var descriptionComponents: [String] = []
+
+        // System name as first line
+        if let systemName = systemName {
+            descriptionComponents.append("\(systemName)")
+        }
+
+        // Second line with optional metadata
+        var secondLineComponents: [String] = []
+        if isFavorite {
+            secondLineComponents.append("⭐ Favorite")
+        }
+        if let developer = developer, !developer.isEmpty {
+            secondLineComponents.append(developer)
+        }
+        if let publishDate = publishDate {
+            secondLineComponents.append("(\(publishDate))")
+        }
+        if let regionName = regionName, !regionName.isEmpty {
+            secondLineComponents.append("Region: \(regionName)")
+        }
+
+        if !secondLineComponents.isEmpty {
+            descriptionComponents.append(secondLineComponents.joined(separator: " | "))
+        }
+
+        // Genres as third line
+        if let g = genres, !g.isEmpty {
+            let genresWithSpaces = g.components(separatedBy: ",").joined(separator: ", ")
+            descriptionComponents.append("Genres: \(genresWithSpaces)")
+        }
+
+        // Combine all description components
+        contentSet.contentDescription = descriptionComponents.joined(separator: "\n")
+
+        // Rating (for favorited games)
+        contentSet.rating = NSNumber(value: isFavorite ? 5 : 0)
+
+        // Images
+        let cachedImageURL = pathOfCachedImage
+        contentSet.thumbnailURL = cachedImageURL
+
+        // Embed inline thumbnail data only when we have a local file.
+        // When pathOfCachedImage returns a remote URL (fallback for uncached artwork),
+        // .path gives the URL path component (e.g. "/art.jpg"), NOT a filesystem path,
+        // so decoding would fail. Spotlight will use thumbnailURL instead.
+        // jpegData(compressionQuality:) is UIKit-only; on macOS (AppKit) we skip
+        // inline thumbnail data and rely on thumbnailURL.
+        //
+        // This decodes *directly* at the thumbnail size. The previous form
+        // decoded the full-resolution cover and then resized it, which paid the
+        // whole decode cost — the exact thing that inflates resident image
+        // memory while indexing an entire library.
+        #if canImport(UIKit)
+        if let cachedImageURL = cachedImageURL, cachedImageURL.isFileURL {
+            contentSet.thumbnailData = autoreleasepool {
+                ArtworkDownsampler
+                    .image(atPath: cachedImageURL.path, maxPixelSize: SpotlightArtworkThumbnail.maxPixelSize)?
+                    .jpegData(compressionQuality: SpotlightArtworkThumbnail.jpegCompressionQuality)
+            }
+        }
+        #endif
+
+        // Comprehensive keywords for better search
+        var keywords: [String] = ["rom", "game", "emulator", "provenance"]
+
+        // Add system name and manufacturer
+        if let systemName = systemName {
+            keywords.append(systemName)
+            // Add variations of the system name for better matching
+            if systemName.contains(" ") {
+                keywords.append(contentsOf: systemName.components(separatedBy: " "))
+            }
+        }
+
+        if let manufacturer = system?.manufacturer {
+            keywords.append(manufacturer)
+        }
+
+        // Add all genres
+        if let genres = genres, !genres.isEmpty {
+            keywords.append(contentsOf: genres.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        }
+
+        // Add developer
+        if let developer = developer, !developer.isEmpty {
+            keywords.append(developer)
+        }
+
+        // Add region
+        if let regionName = regionName, !regionName.isEmpty {
+            keywords.append(regionName)
+        }
+
+        // Add variations of the title for better matching
+        keywords.append(title)
+        if title.contains(" ") {
+            let titleWords = title.components(separatedBy: " ")
+            keywords.append(contentsOf: titleWords.filter { $0.count > 2 }) // Only add words longer than 2 characters
+        }
+
+        // Convert to NSArray for CoreSpotlight
+        contentSet.keywords = keywords
+
+        // Additional metadata
+        if let system = system {
+            // Convert publishDate (String) to NSDate if available
+            if let publishDate = publishDate {
+                // Use a date formatter to convert the string to a date
+                let dateFormatter = DateFormatter()
+                dateFormatter.dateFormat = "yyyy" // Assuming the publish date is just a year
+                if let date = dateFormatter.date(from: publishDate) {
+                    contentSet.contentCreationDate = date
+                }
+            }
+            contentSet.subject = "\(system.manufacturer) \(system.name)"
+        }
+
+        // Make the item displayable in Spotlight
+        contentSet.supportsNavigation = true
+
+        // Deep-link URL so tapping opens the game directly in Provenance
+        contentSet.url = URL(string: "provenance://game/\(md5Hash)")
+
+        // Last-played date helps Siri surface recently used games higher in results
+        if let played = lastPlayed {
+            contentSet.lastUsedDate = played
+        }
+
+        // Play count gives Siri a usage-frequency signal
+        if playCount > 0 {
+            contentSet.userCurated = true
+        }
+
+        // Developer / publisher as "artist" so Siri can answer "games by Nintendo"
+        if let developer = developer, !developer.isEmpty {
+            contentSet.artist = developer
+        }
+
+        return contentSet
+    }
+
+    var pathOfCachedImage: URL? {
+        let artworkKey = customArtworkURL.isEmpty ? originalArtworkURL : customArtworkURL
+        guard !artworkKey.isEmpty else { return nil }
+
+        // Check local cache first
+        if PVMediaCache.fileExists(forKey: artworkKey) {
+            return PVMediaCache.filePath(forKey: artworkKey)
+        }
+
+        // Fallback: if artworkKey is a remote URL, return it directly so
+        // CoreSpotlight can fetch the thumbnail on its own
+        if artworkKey.hasPrefix("http://") || artworkKey.hasPrefix("https://"),
+           let url = URL(string: artworkKey) {
+            return url
+        }
+
+        return nil
+    }
+
+    var spotlightUniqueIdentifier: String {
+        guard !self.isInvalidated else { return "invalid" }
+        return "org.provenance-emu.game.\(md5Hash)"
+    }
+#endif
+
+    var spotlightActivity: NSUserActivity {
+        guard !self.isInvalidated else { return NSUserActivity() }
+        let activity = NSUserActivity(activityType: Consts.spotlightActivityType)
+        activity.title = title
+        activity.userInfo = ["md5": md5Hash]
+
+        activity.requiredUserInfoKeys = ["md5"]
+        activity.isEligibleForSearch = true
+        activity.isEligibleForHandoff = true
+        #if !os(tvOS)
+        activity.isEligibleForPrediction = true
+        #endif
+
+        #if os(iOS)
+        activity.persistentIdentifier = spotlightUniqueIdentifier
+        activity.contentAttributeSet = spotlightContentSet
+        #endif
+
+        // Universal link / Handoff: https only (`provenance://` is not allowed here).
+        if let pageURL = URL(string: "\(ProvenanceUserActivityWebLink.gameByMD5Prefix)\(md5Hash)") {
+            activity.webpageURL = pageURL
+        }
+
+        return activity
+    }
+
+    // Don't want to have to import GameLibraryConfiguration in Spotlight
+    // extension so copying this required code to map id to short name
+    private var systemName: String? {
+        return system?.name
+    }
+}

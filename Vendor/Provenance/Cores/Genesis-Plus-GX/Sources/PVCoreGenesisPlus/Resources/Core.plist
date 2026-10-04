@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PVCoreIdentifier</key>
+	<string>com.provenance.core.genplusgx</string>
+	<key>PVPrincipleClass</key>
+	<string>PVGenesis.PVCoreGenesisPlus</string>
+	<key>PVSupportedSystems</key>
+	<array>
+		<string>com.provenance.genesis</string>
+		<string>com.provenance.gamegear</string>
+		<string>com.provenance.mastersystem</string>
+		<string>com.provenance.sg1000</string>
+		<string>com.provenance.segacd</string>
+	</array>
+	<key>PVProjectName</key>
+	<string>Genesis Plus GX</string>
+	<key>PVProjectURL</key>
+	<string>https://github.com/ekeeke/Genesis-Plus-GX</string>
+	<key>PVProjectVersion</key>
+	<string>v1.7.4</string>
+	<key>PVSupportedCheatTypes</key>
+	<array>
+		<string>Game Genie</string>
+		<string>Pro Action Replay</string>
+	</array>
+	<key>PVCapabilities</key>
+	<array>
+		<string>highAccuracy</string>
+		<string>rumble</string>
+		<string>cdAudio</string>
+	</array>
+	<key>PVLicenseName</key>
+	<string>LicenseRef-Genesis-Plus-GX</string>
+	<key>PVLicenseURL</key>
+	<string>https://github.com/ekeeke/Genesis-Plus-GX/blob/HEAD/LICENSE.txt</string>
+	<key>PVCopyright</key>
+	<string>Copyright © 1998-2022 Charles MacDonald, 2007-2024 Eke-Eke</string>
+</dict>
+</plist>

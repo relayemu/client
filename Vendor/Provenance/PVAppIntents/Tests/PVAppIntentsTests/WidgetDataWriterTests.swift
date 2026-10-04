@@ -1,0 +1,243 @@
+//
+//  WidgetDataWriterTests.swift
+//  PVAppIntentsTests
+//
+//  Created by Joseph Mattiello on 3/19/26.
+//  Copyright © 2026 Provenance Emu. All rights reserved.
+//
+
+import XCTest
+@testable import PVAppIntents
+
+final class WidgetDataWriterTests: XCTestCase {
+
+    // MARK: - WidgetGameData
+
+    func testWidgetGameDataRoundTripsJSON() throws {
+        let game = WidgetGameData(
+            id: "abc123",
+            title: "Super Mario World",
+            systemName: "Super Nintendo",
+            systemIdentifier: "com.provenance.snes",
+            artworkPath: "artwork/snes/smw.jpg",
+            lastPlayedDate: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(game)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(WidgetGameData.self, from: data)
+
+        XCTAssertEqual(decoded.id, game.id)
+        XCTAssertEqual(decoded.title, game.title)
+        XCTAssertEqual(decoded.systemName, game.systemName)
+        XCTAssertEqual(decoded.systemIdentifier, game.systemIdentifier)
+        XCTAssertEqual(decoded.artworkPath, game.artworkPath)
+        XCTAssertNotNil(decoded.lastPlayedDate)
+    }
+
+    func testWidgetGameDataWithNilOptionals() throws {
+        let game = WidgetGameData(id: "minimal", title: "Tetris", systemName: "Game Boy")
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(game)
+        let decoded = try JSONDecoder().decode(WidgetGameData.self, from: data)
+        XCTAssertNil(decoded.artworkPath)
+        XCTAssertNil(decoded.lastPlayedDate)
+        XCTAssertNil(decoded.systemIdentifier)
+    }
+
+    // MARK: - WidgetPlayActivityTimestamp
+
+    func testWidgetPlayActivityTimestampPrefersLatestOfRecentAndGame() {
+        let recent = Date(timeIntervalSince1970: 1_700_000_000)
+        let gamePlayed = Date(timeIntervalSince1970: 1_800_000_000)
+        let importDate = Date(timeIntervalSince1970: 1_000_000_000)
+        let resolved = WidgetPlayActivityTimestamp.best(
+            recentLastPlayed: recent,
+            gameLastPlayed: gamePlayed,
+            importDate: importDate
+        )
+        XCTAssertEqual(resolved, gamePlayed)
+    }
+
+    func testWidgetPlayActivityTimestampFallsBackToImportWhenNoPlayDates() {
+        let importDate = Date(timeIntervalSince1970: 1_650_000_000)
+        XCTAssertEqual(
+            WidgetPlayActivityTimestamp.best(recentLastPlayed: nil, gameLastPlayed: nil, importDate: importDate),
+            importDate
+        )
+    }
+
+    func testWidgetPlayActivityTimestampUsesGameWhenRecentNil() {
+        let gamePlayed = Date(timeIntervalSince1970: 1_750_000_000)
+        let importDate = Date(timeIntervalSince1970: 1_000_000_000)
+        XCTAssertEqual(
+            WidgetPlayActivityTimestamp.best(recentLastPlayed: nil, gameLastPlayed: gamePlayed, importDate: importDate),
+            gamePlayed
+        )
+    }
+
+    func testWidgetPlayActivityTimestampPrefersRecentWhenNewer() {
+        let recent = Date(timeIntervalSince1970: 1_900_000_000)
+        let gamePlayed = Date(timeIntervalSince1970: 1_800_000_000)
+        let importDate = Date(timeIntervalSince1970: 1_000_000_000)
+        XCTAssertEqual(
+            WidgetPlayActivityTimestamp.best(recentLastPlayed: recent, gameLastPlayed: gamePlayed, importDate: importDate),
+            recent,
+            "Should return recentLastPlayed when it is later than gameLastPlayed"
+        )
+    }
+
+    func testWidgetPlayActivityTimestampUsesRecentWhenGameNil() {
+        let recent = Date(timeIntervalSince1970: 1_750_000_000)
+        let importDate = Date(timeIntervalSince1970: 1_000_000_000)
+        XCTAssertEqual(
+            WidgetPlayActivityTimestamp.best(recentLastPlayed: recent, gameLastPlayed: nil, importDate: importDate),
+            recent,
+            "Should return recentLastPlayed when gameLastPlayed is nil"
+        )
+    }
+
+    func testWidgetPlayActivityTimestampIgnoresImportWhenPlayDatesExist() {
+        let recent = Date(timeIntervalSince1970: 1_100_000_000)
+        let gamePlayed = Date(timeIntervalSince1970: 1_200_000_000)
+        let importDate = Date(timeIntervalSince1970: 1_500_000_000)
+        let result = WidgetPlayActivityTimestamp.best(
+            recentLastPlayed: recent,
+            gameLastPlayed: gamePlayed,
+            importDate: importDate
+        )
+        XCTAssertEqual(result, gamePlayed,
+                       "Should return the later play date even when importDate is newer")
+    }
+
+    // MARK: - WidgetNowPlayingData
+
+    func testWidgetNowPlayingDataRoundTripsJSON() throws {
+        let nowPlaying = WidgetNowPlayingData(
+            trackTitle: "Dire Dire Docks",
+            artistName: "Koji Kondo",
+            albumTitle: "Super Mario 64",
+            albumArtPath: "art/sm64.jpg"
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(nowPlaying)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(WidgetNowPlayingData.self, from: data)
+
+        XCTAssertEqual(decoded.trackTitle, "Dire Dire Docks")
+        XCTAssertEqual(decoded.artistName, "Koji Kondo")
+        XCTAssertEqual(decoded.albumTitle, "Super Mario 64")
+        XCTAssertEqual(decoded.albumArtPath, "art/sm64.jpg")
+        XCTAssertNotNil(decoded.timestamp)
+    }
+
+    func testWidgetNowPlayingDataMinimal() throws {
+        let nowPlaying = WidgetNowPlayingData(trackTitle: "Unknown Track")
+        XCTAssertEqual(nowPlaying.trackTitle, "Unknown Track")
+        XCTAssertNil(nowPlaying.artistName)
+        XCTAssertNil(nowPlaying.albumTitle)
+        XCTAssertNil(nowPlaying.albumArtPath)
+    }
+
+    // MARK: - WidgetDataWriter (App Group not available in test sandbox — test write logic only)
+
+    func testWriterDoesNotCrashWithoutAppGroup() {
+        // In CI / test sandbox the App Group container is not available.
+        // Verify the writer handles this gracefully without throwing.
+        let games = [
+            WidgetGameData(id: "g1", title: "Game 1", systemName: "NES"),
+            WidgetGameData(id: "g2", title: "Game 2", systemName: "SNES")
+        ]
+        // Should not crash; UserDefaults(suiteName:) returns nil in test context.
+        WidgetDataWriter.shared.writeGameData(
+            recentGames: games,
+            galleryGames: games,
+            totalCount: 2
+        )
+    }
+
+    func testWriterAcceptsNilNowPlaying() {
+        // Clear now-playing should not throw or crash.
+        WidgetDataWriter.shared.writeNowPlaying(nil)
+    }
+
+    func testWriterCapsGamesToTwelve() {
+        // Supplying more than 12 games should not crash;
+        // internals enforce the 12-game cap via prefix(12).
+        let games = (0..<20).map { index in
+            WidgetGameData(id: "game-\(index)", title: "Game \(index)", systemName: "NES")
+        }
+        WidgetDataWriter.shared.writeGameData(
+            recentGames: games,
+            galleryGames: games,
+            totalCount: games.count
+        )
+    }
+
+    func testWriterAcceptsAllStatsParameters() {
+        let games = [
+            WidgetGameData(id: "g1", title: "Game 1", systemName: "NES",
+                           lastPlayedDate: Date())
+        ]
+        let favorites = [
+            WidgetGameData(id: "g2", title: "Fav Game", systemName: "SNES")
+        ]
+        WidgetDataWriter.shared.writeGameData(
+            recentGames: games,
+            galleryGames: games,
+            favoriteGames: favorites,
+            totalCount: 42,
+            systemCount: 5,
+            totalPlayTimeSeconds: 7200,
+            favoritesCount: 3
+        )
+    }
+
+    func testWriterCapsFavoritesToSixteen() {
+        let favorites = (0..<25).map { i in
+            WidgetGameData(id: "fav-\(i)", title: "Fav \(i)", systemName: "SNES")
+        }
+        WidgetDataWriter.shared.writeGameData(
+            recentGames: [],
+            galleryGames: [],
+            favoriteGames: favorites,
+            totalCount: 25
+        )
+    }
+
+    func testWriterHandlesEmptyArrays() {
+        WidgetDataWriter.shared.writeGameData(
+            recentGames: [],
+            galleryGames: [],
+            favoriteGames: [],
+            totalCount: 0,
+            systemCount: 0,
+            totalPlayTimeSeconds: 0,
+            favoritesCount: 0
+        )
+    }
+
+    func testWidgetGameDataLastPlayedDatePreservesISOPrecision() throws {
+        let now = Date()
+        let game = WidgetGameData(id: "t1", title: "Timing Test", systemName: "NES",
+                                  lastPlayedDate: now)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(game)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(WidgetGameData.self, from: data)
+
+        let decodedDate = try XCTUnwrap(decoded.lastPlayedDate)
+        let delta = abs(decodedDate.timeIntervalSince(now))
+        XCTAssertLessThan(delta, 1.0,
+                          "ISO 8601 round-trip should preserve date within 1 second")
+    }
+}

@@ -1,0 +1,11 @@
+{
+  "upstream": "https://github.com/SourMesen/Mesen2",
+  "commit": "b9fa69ddc6d0a331fb103fdb5eef6904305703c2",
+  "committedAt": "2026-06-04T09:31:24Z",
+  "archive": "https://github.com/SourMesen/Mesen2/archive/b9fa69ddc6d0a331fb103fdb5eef6904305703c2.tar.gz",
+  "archiveSHA256": "5e6a54951b5715100665fdf127d9339aa8600c97fb4d7e9c9618c7f75ea479e0",
+  "retrievedOn": "2026-09-04",
+  "license": "GPL-3.0",
+  "mechanism": "vendored-archive",
+  "note": "Exact upstream tree, unmodified. Relay-specific code is limited to Package.swift, RELAY_VENDOR.json and RelayBridge/ in this directory, plus Packages/RelayEmulation/Sources/RelayMesenAdapter."
+}

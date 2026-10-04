@@ -1,0 +1,1241 @@
+//  Converted to Swift 4 by Swiftify v4.1.6613 - https://objectivec2swift.com/
+//
+//  PVSettingsModel.swift
+//  Provenance
+//
+//  Created by James Addyman on 21/08/2013.
+//  Copyright (c) 2013 James Addyman. All rights reserved.
+//
+
+import Foundation
+@_exported import Defaults
+#if canImport(UIKit)
+import UIKit
+#endif
+
+//public typealias Defaults = _Defaults
+//public typealias Default = _Default
+
+fileprivate var IsAppStore: Bool {
+    Bundle.main.infoDictionary?["ALTDeviceID"] != nil
+}
+
+// Video
+public
+extension Defaults.Keys {
+    /// Primary scaling mode that controls how game video is sized to fit the display.
+    /// This supersedes the legacy `nativeScaleEnabled` and `integerScaleEnabled` booleans.
+    /// On first launch the value is migrated from any previously stored boolean flags.
+    static let scalingMode: Key<ScalingMode> = {
+        migrateScalingModeIfNeeded()
+        return Key<ScalingMode>("scalingMode", default: .aspectFit)
+    }()
+
+    /// Legacy: use `scalingMode` instead.
+    /// Kept for backwards-compatibility; the renderers read `scalingMode` directly.
+    @available(*, deprecated, renamed: "scalingMode", message: "Use Defaults[.scalingMode] == .nativeResolution")
+    static let nativeScaleEnabled = Key<Bool>("nativeScaleEnabled", default: false)
+
+    static let imageSmoothing = Key<Bool>("imageSmoothing", default: false)
+
+    /// Legacy: use `scalingMode` instead.
+    /// Kept for backwards-compatibility; the renderers read `scalingMode` directly.
+    @available(*, deprecated, renamed: "scalingMode", message: "Use Defaults[.scalingMode] == .integerScale")
+    static let integerScaleEnabled = Key<Bool>("integerScaleEnabled", default: false)
+
+    /// Whether the user has explicitly chosen a value for `scalingMode` in
+    /// settings UI. Used to gate per-system default substitution: when this
+    /// is `false` (the user has never touched the picker), the renderer is
+    /// free to substitute a system-appropriate default (e.g. `.stretch` for
+    /// dual-screen DS so it fills the screen instead of letterboxing the
+    /// portrait framebuffer). Once the user picks any value, this flips to
+    /// `true` and the explicit choice is honored everywhere.
+    static let userExplicitlySetScalingMode = Key<Bool>("userExplicitlySetScalingMode", default: false)
+
+    /// How the game is presented when an external display (HDMI / USB-C / AirPlay) is connected.
+    /// Defaults to `.systemMirror` so that the device behaves identically to previous versions
+    /// unless the user opts into dedicated mode.
+    static let externalDisplayMode = Key<ExternalDisplayMode>("externalDisplayMode", default: .systemMirror)
+
+    static let showRecentSaveStates = Key<Bool>("showRecentSaveStates", default: true)
+
+    /// When false (default), the Recent Saves carousel collapses timed autosaves: only the
+    /// most recent autosave per game is shown. When true, every autosave is listed.
+    static let showAutoSavesInRecents = Key<Bool>("showAutoSavesInRecents", default: false)
+
+    static let showGameBadges = Key<Bool>("showGameBadges", default: true)
+
+    static let showRecentGames = Key<Bool>("showRecentGames", default: true)
+
+    static let showSearchbar = Key<Bool>("showSearchbar", default: true)
+
+    static let showFPSCount = Key<Bool>("showFPSCount", default: false)
+
+    /// Show JIT status indicator in the emulator HUD
+    static let showJITStatusIndicator = Key<Bool>("showJITStatusIndicator", default: false)
+
+    /// Show persistent HUD status indicator dots (JIT, netplay, etc.) in the emulator overlay
+    static let showStatusIndicators = Key<Bool>("showStatusIndicators", default: true)
+
+    static let vsyncEnabled = Key<Bool>("vsyncEnabled", default: true)
+}
+
+public
+extension Defaults.Keys {
+    static let autoSave = Key<Bool>("autoSave", default: true)
+    static let timedAutoSaves = Key<Bool>("timedAutoSaves", default: false) // Default off: timed saves at default interval flood iCloud sync.
+    static let timedAutoSaveInterval = Key<TimeInterval>("timedAutoSaveInterval", default: minutes(10))
+
+    static let askToAutoLoad = Key<Bool>("askToAutoLoad", default: true)
+    static let autoLoadSaves = Key<Bool>("autoLoadSaves", default: false)
+
+    /// Automatically save screenshots to the device Photo Library when capturing in-game.
+    static let saveScreenshotsToPhotoLibrary = Key<Bool>("saveScreenshotsToPhotoLibrary", default: true)
+
+#if os(tvOS)
+    static let disableAutoLock = Key<Bool>("disableAutoLock", default: true)
+#else
+    static let disableAutoLock = Key<Bool>("disableAutoLock", default: false)
+#endif
+
+    static let buttonVibration = Key<Bool>("buttonVibration", default: true)
+
+    static let showGameTitles = Key<Bool>("showGameTitles", default: true)
+
+    /// When true, long game titles in the library scroll horizontally; when false, they stay on one line with tail truncation.
+    static let scrollLongGameTitles = Key<Bool>("scrollLongGameTitles", default: true)
+
+    static let gameLibraryScale = Key<Float>("gameLibraryScale", default: 4.0)
+
+    static let buttonTints = Key<Bool>("buttonTints", default: true)
+    static let use8BitdoM30 = Key<Bool>("use8BitdoM30", default: false)
+
+#if os(tvOS)
+    static let missingButtonsAlwaysOn = Key<Bool>("missingButtonsAlwaysOn", default: true)
+#else
+    static let missingButtonsAlwaysOn = Key<Bool>("missingButtonsAlwaysOn", default: false)
+#endif
+
+    static let sort = Key<SortOptions>("sort", default: SortOptions.title)
+
+    /// If true, automatically triggers a metadata re-lookup when the user renames an unmatched game.
+    /// Only applies to games that have never been successfully matched (matchSource == .none).
+    /// Defaults to false — the user must opt in.
+    static let autoApplyMetadataOnRename = Key<Bool>("autoApplyMetadataOnRename", default: false)
+
+    static let haveWarnedAboutDebug = Key<Bool>("haveWarnedAboutDebug", default: false)
+    static let collapsedSystems = Key<Set<String>>("collapsedSystems", default: [])
+
+    static let collapsedSections = Key<Set<String>>("collapsedSections", default: Set<String>())
+
+#if os(tvOS) || targetEnvironment(macCatalyst)
+    static let largeGameArt = Key<Bool>("largeGameArt", default: true)
+#endif
+}
+
+// MARK: Virtual Keyboard
+public extension Defaults.Keys {
+    /// Preferred virtual keyboard layout variant, stored as the raw string value of `KeyboardVariant`.
+    static let preferredKeyboardVariant = Key<String>("preferredKeyboardVariant", default: "full")
+}
+
+// MARK: Controls
+public extension Defaults.Keys {
+#if canImport(UIKit)
+    static let myiCadeControllerSetting = Key<iCadeControllerSetting>("myiCadeControllerSetting", default: .disabled)
+    static let allRightShoulders = Key<Bool>("allRightShoulders", default: false)
+#endif
+    static let controllerOpacity = Key<Double>("controllerOpacity", default: 0.8)
+
+    static let pauseButtonIsMenuButton = Key<Bool>("pauseButtonIsMenuButton", default: false)
+    static let hapticFeedback = Key<Bool>("hapticFeedback", default: true)
+
+    /// Master on/off for all game rumble output from emulator cores.
+    /// When `false`, neither controller motors nor the device Taptic Engine will fire
+    /// in response to in-game rumble events. UI tap feedback (`hapticFeedback`) is unaffected.
+    static let rumbleEnabled = Key<Bool>("rumbleEnabled", default: true)
+
+    /// Controls whether the device Taptic Engine fires for in-game rumble events.
+    /// Independent of `rumbleControllerEnabled`. Requires `rumbleEnabled` to be `true`.
+    static let rumbleDeviceEnabled = Key<Bool>("rumbleDeviceEnabled", default: true)
+
+    /// Controls whether external controller motors (DualSense, Xbox, Switch Pro, etc.)
+    /// fire for in-game rumble events. Independent of `rumbleDeviceEnabled`.
+    /// Requires `rumbleEnabled` to be `true`.
+    static let rumbleControllerEnabled = Key<Bool>("rumbleControllerEnabled", default: true)
+
+    /// Enable DualSense adaptive trigger resistance profiles.
+    /// When `true`, CoreHaptics adaptive trigger effects are enabled for supported
+    /// PlayStation-family systems; other systems currently use no adaptive trigger resistance.
+    static let dualSenseAdaptiveTriggersEnabled = Key<Bool>("dualSenseAdaptiveTriggersEnabled", default: true)
+
+    // MARK: Controller Light Bar
+
+    /// Master toggle for controller light bar color output.
+    /// When `true`, `ControllerLightBarManager` applies per-system colors to DualSense/DS4.
+    static let controllerLightBarEnabled = Key<Bool>("controllerLightBarEnabled", default: true)
+
+    /// Per-system light bar color overrides.
+    /// Key = Provenance system identifier (e.g. "com.provenance.psx").
+    /// Value = hex color string in the format "#RRGGBB".
+    static let controllerLightBarSystemColors = Key<[String: String]>("controllerLightBarSystemColors", default: [:])
+
+    // MARK: DualSense Extras
+
+    /// Action to perform when the DualSense microphone button is pressed during gameplay.
+    /// Supported values: "muteAudio", "none".
+    static let dualSenseMicButtonAction = Key<String>("dualSenseMicButtonAction", default: "muteAudio")
+
+    /// Intensity multiplier for external controller rumble motors via GCDeviceHaptics.
+    /// Range 0.0 (silent) – 1.0 (full intensity). Default 1.0.
+    static let controllerHapticIntensity = Key<Double>("controllerHapticIntensity", default: 1.0)
+
+    // MARK: Rumble Profile Customization
+
+    /// Strongly-typed identifier for controller categories used by
+    /// `Defaults.Keys.rumbleControllerOverrides`.
+    ///
+    /// This is a lightweight `String` wrapper so we can share well-known keys across
+    /// settings and UI code without constraining the stored format in `UserDefaults`.
+    public struct RumbleControllerTypeKey: RawRepresentable, Hashable, Codable, Sendable {
+        public let rawValue: String
+
+        @inlinable
+        public init(rawValue: String) {
+            self.rawValue = rawValue
+        }
+
+        // Common controller families used by the UI.
+        public static let dualSense = RumbleControllerTypeKey(rawValue: "dualSense")
+        public static let xbox = RumbleControllerTypeKey(rawValue: "xbox")
+        public static let switchPro = RumbleControllerTypeKey(rawValue: "switchPro")
+    }
+
+    /// Per-system rumble profile overrides.
+    /// Key = Provenance system identifier (e.g. "com.provenance.n64").
+    /// Value = UUID string of the custom preset that overrides the system default, or
+    ///         the special string "builtin:<presetName>" for a named built-in.
+    static let rumbleSystemOverrides = Key<[String: String]>("rumbleSystemOverrides", default: [:])
+
+    /// Per-controller-type rumble profile overrides.
+    /// Key = `RumbleControllerTypeKey.rawValue`, e.g. "dualSense", "xbox", "switchPro".
+    /// Value = UUID string of the custom preset to apply for that controller type, or
+    ///         the special string "builtin:<presetName>" for a named built-in.
+    static let rumbleControllerOverrides = Key<[String: String]>("rumbleControllerOverrides", default: [:])
+
+    /// User-created custom rumble presets, stored as JSON-encoded `RumblePreset` blobs.
+    /// Each element is the result of `JSONEncoder().encode(preset)`.
+    /// Using `[Data]` keeps PVSettings free of a PVPrimitives dependency.
+    static let rumbleCustomPresets = Key<[Data]>("rumbleCustomPresets", default: [])
+
+    static let buttonPressEffect = Key<ButtonPressEffect>("buttonPressEffect", default: .glow)
+    static let buttonSound = Key<ButtonSound>("buttonSound", default: .none)
+
+    /// When enabled, double-tapping a button toggles "sticky" mode: the button stays
+    /// held down until tapped again. Useful for auto-run in platformers.
+    static let stickyButtonsEnabled = Key<Bool>("stickyButtonsEnabled", default: false)
+
+    /// When enabled, on-screen touch controls (both legacy OSD and DeltaSkin overlays)
+    /// are automatically hidden when a physical game controller (MFi, DualShock, etc.)
+    /// is connected, and shown again when all controllers disconnect.
+    static let hideOnScreenControlsWithController = Key<Bool>("hideOnScreenControlsWithController", default: true)
+
+#if os(tvOS)
+    /// Multiplier applied to Siri Remote touch-surface pan deltas when driving mouse input.
+    /// Range 0.1 – 5.0; default is 1.0 (1:1 pixel mapping).
+    static let tvOSSiriRemoteMouseSensitivity = Key<Double>("tvOSSiriRemoteMouseSensitivity", default: 1.0)
+#endif
+
+    /// Sensitivity multiplier for physical USB/Bluetooth mice used as light gun input.
+    /// Applied by GCMouseLightGunDriver when accumulating HID delta events.
+    /// Range 0.1 – 5.0; default 1.0 (calibrated for a ~800 DPI mouse).
+    static let lightGunMouseSensitivity = Key<Double>("lightGunMouseSensitivity", default: 1.0)
+
+    // MARK: - Mouse Input Settings
+
+    /// Which physical input source delivers mouse / pointer events to the emulated core.
+    /// Defaults to `.auto` so the engine picks the best available device at runtime.
+    ///
+    /// NOTE: As of this version, this key is **not yet read by the runtime mouse input
+    /// pipeline**, and changing it will not affect emulator behavior. It is reserved for
+    /// future use so that the input system can route mouse events based on this value.
+    static let mouseInputSource = Key<MouseInputSource>("mouseInputSource", default: .auto)
+
+    /// Global sensitivity multiplier intended to be applied to all mouse delta events
+    /// (touch, controller touchpad, and physical mouse). Range 0.1 – 5.0; default 1.0.
+    ///
+    /// NOTE: This value is currently **not applied by the runtime mouse input pipeline**.
+    /// It is stored and exposed in the UI for future use, but modifying it will not yet
+    /// change pointer sensitivity in-game.
+    static let mouseSensitivity = Key<Double>("mouseSensitivity", default: 1.0)
+
+    // MARK: Gyro Mouse
+
+    /// Master toggle for gyroscope-driven virtual mouse cursor.
+    /// When `true` and the active core conforms to `MouseResponder`, rotation-rate
+    /// input from the connected GCController (or device IMU on iPhone/iPad) is
+    /// translated into `mouseMoved(atPoint:)` calls.
+    ///
+    /// NOTE: This key is currently **not consumed by the gyro mouse runtime /
+    /// GyroMouseAdapter**. It is stored and exposed in the UI for future wiring, but
+    /// toggling it will not yet enable or disable gyro-based cursor translation in-game.
+    static let gyroMouseEnabled = Key<Bool>("gyroMouseEnabled", default: false)
+
+    /// Sensitivity multiplier intended to be applied only to gyroscope-driven mouse input.
+    /// Kept separate so gyro feel can be tuned independently of touch/mouse.
+    /// Range 0.1 – 5.0; default 1.0.
+    ///
+    /// NOTE: This value is currently **not consumed by any gyro mouse handler**. It is
+    /// reserved for future wiring so that gyro-based pointing can be scaled using this
+    /// setting without requiring a migration.
+    static let gyroMouseSensitivity = Key<Double>("gyroMouseSensitivity", default: 1.0)
+
+    /// Gyroscope dead zone in rad/s. Rotations below this threshold are intended to be
+    /// ignored to prevent drift from a stationary device. Range 0.0 – 0.5; default 0.05.
+    ///
+    /// NOTE: This key is currently **not read by the gyro mouse input path**, so adjusting
+    /// it will not change behavior yet. It exists to support a future dead-zone
+    /// implementation without breaking stored preferences.
+    static let gyroMouseDeadZone = Key<Double>("gyroMouseDeadZone", default: 0.05)
+
+    /// Enable turbo/autofire: when a button has turbo active, it rapidly toggles press/release.
+    static let turboEnabled = Key<Bool>("turboEnabled", default: true)
+
+    /// Turbo fire rate in Hz (presses per second). Range 2-30, default 10.
+    static let turboRateHz = Key<Double>("turboRateHz", default: 10.0)
+
+    /// Universal analog-stick deadzone applied by the shared input path.
+    /// Range 0.0 (no deadzone) – 0.5 (50 % of axis range).  Default 0.0.
+    /// This value is applied additively on top of any hardware-level deadzoning
+    /// provided by the GameController framework.
+    static let analogDeadzone = Key<Float>("analogDeadzone", default: 0.0)
+
+    /// Controls when the universal analog-stick deadzone is applied versus
+    /// when responsibility is deferred to a core-managed deadzone setting.
+    ///
+    /// Raw Int maps to `CoreDeadzoneMode` in PVCoreBridge:
+    ///   0 = auto (skip universal only when the active core/bridge conforms
+    ///       to `CoreDeadzoneCapable`)
+    ///   1 = universal (always apply)
+    ///   2 = coreManaged (never apply universal; trust each core)
+    static let coreDeadzoneMode = Key<Int>("coreDeadzoneMode", default: 0)
+
+    /// Language used by emulator cores (RetroArch `user_language` and native core equivalents).
+    /// Defaults to `.systemLocale` so cores follow the device's preferred language.
+    static let coreLanguage = Key<CoreLanguageSetting>("coreLanguage", default: .systemLocale)
+
+    /// Player display name reported to emulator cores via `RETRO_ENVIRONMENT_GET_USERNAME`
+    /// and used by native cores (Dolphin netplay, PPSSPP, etc.).
+    /// Empty string means "use system username fallback".
+    static let playerUsername = Key<String>("playerUsername", default: "")
+}
+
+public enum ButtonPressEffect: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    case bubble = "bubble"
+    case ring = "ring"
+    case glow = "glow"
+
+    public var description: String {
+        switch self {
+        case .bubble:
+            return "Bubble + Ring"
+        case .ring:
+            return "Ring Only"
+        case .glow:
+            return "Radial Glow"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .bubble:
+            return "Shows both a gradient bubble and ring outline"
+        case .ring:
+            return "Shows only the ring outline effect"
+        case .glow:
+            return "Shows a soft radial glow effect"
+        }
+    }
+}
+
+public enum ButtonSound: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    case none = "none"
+    case generated = "generated"
+    case click = "click"
+    case tap = "tap"
+    case pop = "pop"
+    case click2 = "click2"
+    case tap2 = "tap2"
+    case click3 = "click3"
+    case `switch` = "switch"
+
+    public var description: String {
+        switch self {
+        case .none:
+            return "No Sound"
+        case .generated:
+            return "Generated"
+        case .click:
+            return "Click"
+        case .tap:
+            return "Tap"
+        case .pop:
+            return "Pop"
+        case .click2:
+            return "Click 2"
+        case .tap2:
+            return "Tap 2"
+        case .click3:
+            return "Click 3"
+        case .switch:
+            return "Switch"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .none:
+            return "Disable button press sounds"
+        case .generated:
+            return "Classic synthesized tone"
+        case .click:
+            return "Mechanical click sound"
+        case .tap:
+            return "Soft tap sound"
+        case .pop:
+            return "Bubble pop sound"
+        case .click2:
+            return "Mechanical click sound"
+        case .tap2:
+            return "Sharp tap sound"
+        case .click3:
+            return "Thudding click sound"
+        case .switch:
+            return "Mechaniacal switch sound"
+        }
+    }
+
+    /// The sound file name in the bundle
+    public var filename: String {
+        switch self {
+        case .none, .generated:
+            return ""
+        case .click:
+            return "button-click"
+        case .tap:
+            return "button-tap"
+        case .pop:
+            return "button-pop"
+        case .click2:
+            return "button-click2"
+        case .click3:
+            return "button-click3"
+        case .tap2:
+            return "button-tap2"
+        case .switch:
+            return "button-switch"
+        }
+    }
+
+    public var hasReleaseSample: Bool {
+        switch self {
+        case .click, .pop, .switch: return true
+        default: return false
+        }
+    }
+}
+
+/// iCloud sync mode for Provenance
+public enum iCloudSyncMode: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    #if !os(tvOS)
+    /// Use iCloud Drive for syncing
+    case iCloudDrive = "iCloudDrive"
+    #endif
+    /// Use CloudKit for syncing
+    case cloudKit = "cloudKit"
+
+    public var description: String {
+        switch self {
+#if !os(tvOS)
+        case .iCloudDrive:
+            return "iCloud Drive"
+#endif
+        case .cloudKit:
+            return "CloudKit"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+#if !os(tvOS)
+        case .iCloudDrive:
+            return "Use iCloud Drive for file syncing (legacy) Not supported on tvOS."
+#endif
+        case .cloudKit:
+            return "Use CloudKit for database and file syncing (recommended). Supports all platforms."
+        }
+    }
+
+    /// Check if CloudKit sync is enabled
+    public var isCloudKit: Bool {
+        return self == .cloudKit
+    }
+#if !os(tvOS)
+    /// Check if iCloud Drive sync is enabled
+    public var isICloudDrive: Bool {
+        return self == .iCloudDrive
+    }
+#else
+    public var isICloudDrive: Bool { false }
+#endif
+}
+
+/// Network conditions for CloudKit sync
+public enum CloudKitSyncNetworkMode: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    /// Sync on WiFi and cellular
+    case wifiAndCellular = "wifiAndCellular"
+    /// Sync only on WiFi
+    case wifiOnly = "wifiOnly"
+    /// Sync only on cellular
+    case cellularOnly = "cellularOnly"
+
+    public var description: String {
+        switch self {
+        case .wifiAndCellular:
+            return "Wi-Fi & Cellular"
+        case .wifiOnly:
+            return "Wi-Fi Only"
+        case .cellularOnly:
+            return "Cellular Only"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .wifiAndCellular:
+            return "Sync on both Wi-Fi and cellular connections"
+        case .wifiOnly:
+            return "Sync only when connected to Wi-Fi (recommended for large files)"
+        case .cellularOnly:
+            return "Sync only on cellular connections"
+        }
+    }
+}
+
+/// CloudKit sync frequency options
+public enum CloudKitSyncFrequency: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    /// Sync immediately when changes occur
+    case immediate = "immediate"
+    /// Sync every 5 minutes
+    case fiveMinutes = "fiveMinutes"
+    /// Sync every 15 minutes
+    case fifteenMinutes = "fifteenMinutes"
+    /// Sync every hour
+    case hourly = "hourly"
+    /// Sync manually only
+    case manual = "manual"
+
+    public var description: String {
+        switch self {
+        case .immediate:
+            return "Immediate"
+        case .fiveMinutes:
+            return "Every 5 Minutes"
+        case .fifteenMinutes:
+            return "Every 15 Minutes"
+        case .hourly:
+            return "Hourly"
+        case .manual:
+            return "Manual Only"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .immediate:
+            return "Sync changes as soon as they occur (uses more battery)"
+        case .fiveMinutes:
+            return "Check for changes every 5 minutes"
+        case .fifteenMinutes:
+            return "Check for changes every 15 minutes (recommended)"
+        case .hourly:
+            return "Check for changes every hour (battery efficient)"
+        case .manual:
+            return "Only sync when manually triggered"
+        }
+    }
+
+    /// Time interval in seconds for the sync frequency
+    public var timeInterval: TimeInterval? {
+        switch self {
+        case .immediate:
+            return nil // No delay for immediate
+        case .fiveMinutes:
+            return 300
+        case .fifteenMinutes:
+            return 900
+        case .hourly:
+            return 3600
+        case .manual:
+            return nil // No automatic sync
+        }
+    }
+}
+
+/// CloudKit sync content types
+public enum CloudKitSyncContentType: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable {
+    /// Sync everything
+    case all = "all"
+    /// Sync only save states and settings
+    case saveStatesOnly = "saveStatesOnly"
+    /// Sync only ROMs and games
+    case romsOnly = "romsOnly"
+    /// Sync only metadata (no files)
+    case metadataOnly = "metadataOnly"
+
+    public var description: String {
+        switch self {
+        case .all:
+            return "Everything"
+        case .saveStatesOnly:
+            return "Save States Only"
+        case .romsOnly:
+            return "ROMs Only"
+        case .metadataOnly:
+            return "Metadata Only"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .all:
+            return "Sync ROMs, save states, BIOS files, and metadata"
+        case .saveStatesOnly:
+            return "Sync only save states and game progress"
+        case .romsOnly:
+            return "Sync only ROM files and game library"
+        case .metadataOnly:
+            return "Sync game metadata, artwork, and save states (skips large ROM and BIOS files)"
+        }
+    }
+}
+
+// MARK: CloudKit Sync Settings
+public extension Defaults.Keys {
+    /// Network mode for CloudKit sync
+    static let cloudKitSyncNetworkMode = Key<CloudKitSyncNetworkMode>("cloudKitSyncNetworkMode", default: .wifiAndCellular)
+
+    /// Don't sync when device is in low power mode
+    static let cloudKitRespectLowPowerMode = Key<Bool>("cloudKitRespectLowPowerMode", default: true)
+
+    /// Sync frequency
+    static let cloudKitSyncFrequency = Key<CloudKitSyncFrequency>("cloudKitSyncFrequency", default: .fifteenMinutes)
+
+    /// Content types to sync
+    /// tvOS defaults to metadataOnly — limited storage means ROMs download on-demand when launched.
+    /// Users can change this in settings if they prefer automatic downloads.
+    #if os(tvOS)
+    static let cloudKitSyncContentType = Key<CloudKitSyncContentType>("cloudKitSyncContentType", default: .metadataOnly)
+    #else
+    static let cloudKitSyncContentType = Key<CloudKitSyncContentType>("cloudKitSyncContentType", default: .all)
+    #endif
+
+    /// Pause sync when device is charging only
+    static let cloudKitSyncOnlyWhenCharging = Key<Bool>("cloudKitSyncOnlyWhenCharging", default: false)
+
+    /// Maximum file size to sync over cellular (in bytes)
+    static let cloudKitMaxCellularFileSize = Key<Int>("cloudKitMaxCellularFileSize", default: 50 * 1024 * 1024)
+
+    /// Enable background sync
+    static let cloudKitBackgroundSync = Key<Bool>("cloudKitBackgroundSync", default: true)
+
+    /// Automatically resolve conflicts (prefer cloud version)
+    static let cloudKitAutoResolveConflicts = Key<Bool>("cloudKitAutoResolveConflicts", default: true)
+
+    /// Show sync notifications
+    static let cloudKitShowSyncNotifications = Key<Bool>("cloudKitShowSyncNotifications", default: false)
+
+    /// Compress files before upload
+    static let cloudKitCompressFiles = Key<Bool>("cloudKitCompressFiles", default: true)
+
+    /// Delete local files after successful upload (for storage management)
+    static let cloudKitDeleteLocalAfterUpload = Key<Bool>("cloudKitDeleteLocalAfterUpload", default: false)
+
+    /// Maximum number of concurrent uploads
+    static let cloudKitMaxConcurrentUploads = Key<Int>("cloudKitMaxConcurrentUploads", default: 3)
+
+    /// Retry failed uploads automatically
+    static let cloudKitRetryFailedUploads = Key<Bool>("cloudKitRetryFailedUploads", default: true)
+
+    /// Maximum retry attempts for failed operations
+    static let cloudKitMaxRetryAttempts = Key<Int>("cloudKitMaxRetryAttempts", default: 3)
+}
+
+// MARK: File syste
+public extension Defaults.Keys {
+    static let useAppGroups = Key<Bool>("useAppGroups", default: false)
+}
+
+// MARK: Web Server
+public extension Defaults.Keys {
+    /// Opt-in to the native Swift Hummingbird web server instead of the bundled
+    /// GCDWebServer implementation. The legacy GCDWebUploader UI ships as the
+    /// default because the modern UI is still reaching feature parity (Epic #2758).
+    /// Surfaced in Settings > Advanced.
+    static let useModernWebServer = Key<Bool>("useModernWebServer", default: false)
+
+    /// When `true`, libretro cores on iOS use the legacy full-RetroArch
+    /// in-process wrapper instead of the lightweight thin libretro frontend.
+    /// The thin wrapper is now the default on all platforms — it has correct
+    /// ScalingMode integration, lighter memory footprint, and feature parity
+    /// for the vast majority of cores. This toggle exists as an escape hatch
+    /// for users who hit a thin-wrapper-specific regression.
+    /// tvOS always uses the thin wrapper regardless of this setting.
+    static let useLegacyRetroArchWrapper = Key<Bool>("useLegacyRetroArchWrapper", default: false)
+
+    /// One-shot flag for the iOS local-network permission onboarding sheet.
+    /// `true` once the user has acknowledged the explainer (regardless of whether
+    /// they ultimately allowed local network access in the system alert).
+    /// tvOS and macOS skip the sheet entirely.
+    static let localNetworkOnboardingShown = Key<Bool>("localNetworkOnboardingShown", default: false)
+}
+
+// MARK: ROM Import Options
+public extension Defaults.Keys {
+    /// Automatically strip ROM annotation tags and normalize titles when importing.
+    /// When enabled, filenames like "Bomberman (USA) [!].nes" become "Bomberman"
+    /// in the library. When disabled, the raw filename (sans extension) is used.
+    ///
+    /// Defaults to `false` — opt-in to avoid surprising existing users whose library
+    /// already uses annotated filenames as titles. Enable in Library Management settings.
+    /// Previously-imported titles are unaffected (use "Normalize Existing Library" to bulk-update them).
+    static let autoNormalizeROMTitles = Key<Bool>("autoNormalizeROMTitles", default: true)
+}
+
+// MARK: Audio Options
+public extension Defaults.Keys {
+
+    static let volume = Key<Float>("volume", default: 1.0)
+    static let volumeHUD = Key<Bool>("volumeHUD", default: true)
+    static let audioVisulaizer = Key<Bool>("audioVisulaizer", default: true)
+
+    static let monoAudio = Key<Bool>("monoAudio", default: false)
+
+    static let audioLatency = Key<TimeInterval>("audioLatency", default: 10.0)
+
+    static let respectMuteSwitch = Key<Bool>("respectMuteSwitch", default: true)
+
+    /// Auto-pause emulation when AirPods or Bluetooth headphones disconnect.
+    static let pauseOnHeadphonesDisconnect = Key<Bool>("pauseOnHeadphonesDisconnect", default: true)
+}
+
+public enum MainUIMode: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable, CustomStringConvertible, Identifiable {
+    #if !os(tvOS)
+    case paged = "Paged"
+    #endif
+    case singlePage = "Single Page"
+    #if os(tvOS)
+    case tvosMedia = "TV Media"
+    #endif
+    case uikit = "UIKit"
+
+    public var id: String {
+        rawValue
+    }
+
+    public var description: String {
+        switch self {
+#if !os(tvOS)
+        case .paged:
+            return "Paged (Default)"
+        case .singlePage:
+            return "Single Page (RetroWave)"
+        #if os(tvOS)
+        case .tvosMedia:
+            return "TV Media (Drawer)"
+        #endif
+        case .uikit:
+            return "UIKit (Legacy)"
+#else
+        case .singlePage:
+            return "Single Page (RetroWave)"
+        case .tvosMedia:
+            return "TV Media (Drawer)"
+        case .uikit:
+            return "UIKit (Default)"
+#endif
+
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+#if !os(tvOS)
+        case .paged:
+            return "The default paged mode."
+        case .singlePage:
+            return "All consoles in a single page, reduced features."
+        #if os(tvOS)
+        case .tvosMedia:
+            return "A tvOS-first media style UI with an overlay drawer sidebar."
+        #endif
+        case .uikit:
+            return "Original UIKit mode from 1.X/2.X (Legacy)."
+#else
+        case .singlePage:
+            return "New SwiftUI single page mode."
+        case .tvosMedia:
+            return "Media-style shelves with an overlay drawer sidebar."
+        case .uikit:
+            return "Original UIKit mode."
+#endif
+        }
+    }
+}
+
+public enum SkinMode: String, Codable, Equatable, UserDefaultsRepresentable, Defaults.Serializable, CaseIterable, CustomStringConvertible, Identifiable {
+    case off = "Off"
+    case selectedOnly = "Selected Only"
+    case always = "Always"
+
+    public var id: String {
+        rawValue
+    }
+
+    public var description: String {
+        switch self {
+        case .off:
+            return "Off (Classic)"
+        case .selectedOnly:
+            return "Selected systems only"
+        case .always:
+            return "Always use"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .off:
+            return "Always use the classic on-screen controller"
+        case .selectedOnly:
+            return "Use skins for selected systems, use classic controller as default"
+        case .always:
+            return "Always use skins including the default generated skins"
+        }
+    }
+}
+
+/// Canonical storage key for controller skin mode preferences.
+internal let canonicalSkinModeDefaultsKey = "skinMode"
+
+/// Legacy storage key preserved for migrating existing installs.
+internal let legacySkinModeDefaultsKey = "skinMOde"
+
+/// Canonical storage key for the RetroAchievements master toggle.
+internal let canonicalRetroAchievementsEnabledDefaultsKey = "retroAchievementsEnabled"
+
+/// Legacy storage key used by the RetroArch bridge before app-wide Defaults integration.
+internal let legacyRetroAchievementsEnabledDefaultsKey = "ra_cheevos_enabled"
+
+/// Canonical storage key for the RetroAchievements hardcore toggle.
+internal let canonicalRetroAchievementsHardcoreDefaultsKey = "retroAchievementsHardcoreEnabled"
+
+/// Legacy storage key used by the RetroArch bridge before app-wide Defaults integration.
+internal let legacyRetroAchievementsHardcoreDefaultsKey = "ra_cheevos_hardcore_mode"
+
+/// Migrates the original typoed skin-mode key to the canonical storage key.
+internal func migrateLegacySkinModeIfNeeded(userDefaults: UserDefaults = .standard) {
+    guard userDefaults.object(forKey: canonicalSkinModeDefaultsKey) == nil else {
+        return
+    }
+
+    guard let legacyRawValue = userDefaults.string(forKey: legacySkinModeDefaultsKey),
+          let legacyMode = SkinMode(rawValue: legacyRawValue) else {
+        return
+    }
+
+    userDefaults.set(legacyMode.rawValue, forKey: canonicalSkinModeDefaultsKey)
+}
+
+/// Builds the shared Defaults key after ensuring older persisted values are migrated forward.
+internal func makeSkinModeKey(defaultValue: SkinMode) -> Defaults.Key<SkinMode> {
+    migrateLegacySkinModeIfNeeded()
+    return Defaults.Key<SkinMode>(canonicalSkinModeDefaultsKey, default: defaultValue)
+}
+
+/// Migrates a legacy boolean preference into its canonical Defaults key the first time it is accessed.
+internal func migrateLegacyBoolPreferenceIfNeeded(primaryKey: String, legacyKey: String, userDefaults: UserDefaults = .standard) {
+    guard userDefaults.object(forKey: primaryKey) == nil else {
+        return
+    }
+
+    guard userDefaults.object(forKey: legacyKey) != nil else {
+        return
+    }
+
+    userDefaults.set(userDefaults.bool(forKey: legacyKey), forKey: primaryKey)
+}
+
+/// Builds a shared boolean Defaults key after migrating any legacy storage key.
+internal func makeMigratingBoolKey(_ primaryKey: String, legacyKey: String, defaultValue: Bool) -> Defaults.Key<Bool> {
+    migrateLegacyBoolPreferenceIfNeeded(primaryKey: primaryKey, legacyKey: legacyKey)
+    return Defaults.Key<Bool>(primaryKey, default: defaultValue)
+}
+
+// MARK: ScalingMode Migration
+
+/// Migrates the legacy `nativeScaleEnabled` / `integerScaleEnabled` boolean flags to
+/// the unified `scalingMode` key on first access, but only when the user has never
+/// chosen a scaling mode.
+/// - `integerScaleEnabled = true` maps to `.integerScale` (takes precedence).
+/// - `nativeScaleEnabled = true` maps to `.nativeResolution`.
+/// - Both false (or not set) maps to the default `.aspectFit`.
+///
+/// - Parameters:
+///   - userDefaults: Store to migrate.
+///   - domainName: When non-nil, "has the user chosen a mode?" is answered against that
+///     PERSISTENT domain instead of `object(forKey:)`. Tests pass their suite name.
+///
+/// Why the parameter exists: `object(forKey:)` also resolves the process-wide
+/// registration domain, into which `Defaults` registers every declared Key's default
+/// value. In production that is harmless — the only caller runs inside the lazy
+/// initialiser of `Defaults.Keys.scalingMode`, i.e. BEFORE that key registers anything,
+/// so the lookup correctly sees nil. But a test calling this directly, after any other
+/// test has touched `Defaults[.scalingMode]`, always sees the registered default and the
+/// migration is skipped. Passing a domain name makes the check independent of that.
+///
+/// The default (nil) preserves the original production behaviour exactly: deriving a
+/// domain name from `Bundle.main.bundleIdentifier` risked querying the wrong (or empty)
+/// domain, which would report "user has not chosen" and let the migration overwrite a
+/// real preference.
+internal func migrateScalingModeIfNeeded(userDefaults: UserDefaults = .standard,
+                                         domainName: String? = nil) {
+    let scalingKey = "scalingMode"
+    let explicitlySetByUser: Bool = {
+        if let domainName {
+            return userDefaults.persistentDomain(forName: domainName)?[scalingKey] != nil
+        }
+        return userDefaults.object(forKey: scalingKey) != nil
+    }()
+    guard !explicitlySetByUser else { return }
+
+    let integerScale = userDefaults.bool(forKey: "integerScaleEnabled")
+    let nativeScale  = userDefaults.bool(forKey: "nativeScaleEnabled")
+    let mode = ScalingMode.fromLegacy(nativeScale: nativeScale, integerScale: integerScale)
+    if mode != .aspectFit {
+        userDefaults.set(mode.rawValue, forKey: scalingKey)
+    }
+}
+
+// MARK: Beta Options
+public extension Defaults.Keys {
+#if os(macOS) || targetEnvironment(macCatalyst) || os(visionOS)
+    static let useMetal = Key<Bool>("useMetal", default: true)
+#else
+    static let useMetal = Key<Bool>("useMetal", default: true)
+#endif
+    static let autoJIT = Key<Bool>("autoJIT", default: false)
+#if os(tvOS)
+    static let mainUIMode = Key<MainUIMode>("mainUIMode", default: .tvosMedia)
+#elseif os(macOS) || targetEnvironment(macCatalyst) || APP_STORE
+    static let mainUIMode = Key<MainUIMode>("mainUIMode", default: .paged)
+#elseif os(visionOS)
+    static let mainUIMode = Key<MainUIMode>("mainUIMode", default: .singlePage)
+#else
+    static let mainUIMode = Key<MainUIMode>("mainUIMode", default: .paged)
+#endif
+    /// When enabled, a connected hardware keyboard activates the controller-style
+    /// (TV-media) navigation UI on iOS/macOS-Designed-for-iPad, even with no gamepad attached.
+    static let controllerStyleNavigation = Key<Bool>("controllerStyleNavigation", default: false)
+    /// Keyboard→virtual-controller bindings, action rawValue → GCKeyCode rawValues.
+    /// Empty dict means "use the built-in standard map".
+    static let keyboardControllerBindings = Key<[String: [Int]]>("keyboardControllerBindings", default: [:])
+    static let iCloudSyncMode = Key<iCloudSyncMode>("iCloudSyncMode", default: .cloudKit)
+    static let unsupportedCores = Key<Bool>("unsupportedCores", default: false)
+
+    // MARK: - Promoted from FeatureFlags
+    // These were previously gated by PVFeatureFlags entries; promoted to
+    // first-class user toggles so they're discoverable in Advanced Settings
+    // and don't depend on the FeatureFlags JSON / remote-config plumbing.
+
+    /// Explicit SRAM/battery save import/export buttons in the game context menu.
+    /// Defaults to true (matches the previous FeatureFlag default).
+    static let sramImportExport = Key<Bool>("sramImportExport", default: true)
+
+    /// Auto-loads phone-case companion DeltaSkins when a known case
+    /// controller (Backbone, Kishi, PocketTaco, etc.) is connected. Defaults
+    /// false; user must opt in via Advanced Settings.
+    static let caseCompanionSkins = Key<Bool>("caseCompanionSkins", default: false)
+
+    /// ReplayKit live broadcast / cast button in the pause menu.
+    /// Early support — broadcast quality + reconnect handling iterating.
+    static let liveBroadcast = Key<Bool>("liveBroadcast", default: false)
+
+    /// Native SwiftUI netplay lobby, host/join UI, and per-core netplay
+    /// callbacks. Works fully against RetroArch cores + mGBA link-cable;
+    /// native cores other than mGBA have stub conformances.
+    static let netplayEnabled = Key<Bool>("netplayEnabled", default: false)
+
+    /// Mupen64Plus Transfer Pak slot UI — assign a Game Boy ROM to a
+    /// controller port for Pokémon Stadium / Mario Golf integration.
+    /// Works on native PVMupen + thin libretro wrapper; ~20-game registry.
+    static let mupenTransferPak = Key<Bool>("mupenTransferPak", default: false)
+
+    // MARK: - Promoted from FeatureFlags (2026-05-31)
+    // Second wave of promotions. Each was an internal PVFeature enum case with
+    // no user-visible toggle; surfaced in Advanced Settings (off by default) so
+    // they can ship "available but disabled" for this release. The PVFeature
+    // enum cases remain for the Feature Flags debug/remote-config path; the
+    // consumers now read these Defaults keys instead.
+
+    /// Tap-to-remap controller UI (in-development button remap flow).
+    static let tapToRemapUI = Key<Bool>("tapToRemapUI", default: false)
+
+    /// Companion-controller overlay (trackball / numpad / DSU peripherals) in
+    /// the pause menu. DSU integration still incomplete.
+    static let companionController = Key<Bool>("companionController", default: false)
+
+    /// Light-gun crosshair overlay for lightgun-capable cores. Style is
+    /// configured separately via `lightGunCrosshairStyle`.
+    static let lightGunCrosshair = Key<Bool>("lightGunCrosshair", default: false)
+
+    /// Drag-to-reposition on-screen skin buttons (layout editor). iOS only.
+    static let skinButtonReposition = Key<Bool>("skinButtonReposition", default: false)
+
+    /// AirPlay audio route-picker button in the pause menu. Audio only —
+    /// video AirPlay not yet implemented.
+    static let airPlayMenu = Key<Bool>("airPlayMenu", default: false)
+
+    /// Preferred console region for region-aware thin-wrapper cores (currently
+    /// Sega Saturn / Beetle Saturn via `beetle_saturn_region`). `.auto` lets the
+    /// core auto-detect from the disc; explicit values force a region so
+    /// multi-region games don't default to Japan.
+    static let systemRegion = Key<SystemRegionPreference>("systemRegion", default: .auto)
+
+#if os(tvOS)
+    static let iCloudSync = Key<Bool>("iCloudSync", default: true)
+    static let tvOSThemes = Key<Bool>("tvOSThemes", default: false)
+    /// One-time flag to avoid repeatedly forcing users into the new tvOS UI
+    static let tvOSMainUIMigrationShown = Key<Bool>("tvOSMainUIMigrationShown", default: false)
+#else
+    static let iCloudSync = Key<Bool>("iCloudSync", default: false)
+#endif
+#if os(macOS) || targetEnvironment(macCatalyst)
+    static let movableButtons = Key<Bool>("movableButtons", default: true)
+    static let onscreenJoypad = Key<Bool>("onscreenJoypad", default: false)
+    static let onscreenJoypadWithKeyboard = Key<Bool>("onscreenJoypadWithKeyboard", default: false)
+#elseif os(iOS)
+    static let movableButtons = Key<Bool>("movableButtons", default: true)
+    static let onscreenJoypad = Key<Bool>("onscreenJoypad", default: true)
+    static let onscreenJoypadWithKeyboard = Key<Bool>("onscreenJoypadWithKeyboard", default: true)
+#endif
+
+    #if os(tvOS) || os(macOS) || targetEnvironment(macCatalyst)
+    static let skinMode = makeSkinModeKey(defaultValue: .off)
+    #else
+    static let skinMode = makeSkinModeKey(defaultValue: .selectedOnly)
+    #endif
+}
+
+// MARK: Physical Case Controllers
+public extension Defaults.Keys {
+    #if os(iOS) || targetEnvironment(macCatalyst)
+    /// Automatically apply a compatible skin when a physical controller case is
+    /// detected — either by `GCController.vendorName` for smart (Bluetooth/MFi)
+    /// cases, or by skin identifier when the user selects a skin published for a
+    /// known passive case (e.g. Buppin) on deltastyles.com or similar sites.
+    ///
+    /// Physical iPhone cases are only relevant on iOS and Mac Catalyst.
+    static let autoLoadCaseSkin = Key<Bool>("autoLoadCaseSkin", default: true)
+    #endif
+}
+
+// MARK: Video Options
+public extension Defaults.Keys {
+    static let multiThreadedGL = Key<Bool>("multiThreadedGL", default: true)
+    static let multiSampling = Key<Bool>("multiSampling", default: true)
+}
+
+// MARK: Objective-C Helper
+
+@objc
+@objcMembers
+public final class PVSettingsWrapper: NSObject {
+
+    @objc
+    public static var use8BitdoM30: Bool {
+        get { Defaults[.use8BitdoM30] }
+        set { Defaults[.use8BitdoM30] = newValue }}
+
+    @objc
+    public static var nativeScaleEnabled: Bool {
+        get { Defaults[.nativeScaleEnabled] }
+        set { Defaults[.nativeScaleEnabled] = newValue }}
+
+    @objc
+    public static var integerScaleEnabled: Bool {
+        get { Defaults[.integerScaleEnabled] }
+        set { Defaults[.integerScaleEnabled] = newValue }}
+
+    /// True when the user's selected scaling mode applies integer snapping.
+    /// ObjC bridges (Mupen64Plus, RetroArch wrapper) gate integer-multiple
+    /// framebuffer sizing on this so the new ScalingMode picker actually
+    /// reaches cores whose framebuffer geometry is decided in ObjC.
+    @objc
+    public static var useIntegerScale: Bool {
+        Defaults[.scalingMode] == .integerScale
+    }
+
+    /// True when the user's selected scaling mode is native-resolution
+    /// (1:1 pixels). ObjC bridges read this to drop legacy upscale paths.
+    @objc
+    public static var useNativeResolution: Bool {
+        Defaults[.scalingMode] == .nativeResolution
+    }
+
+    @objc
+    public static var vsyncEnabled: Bool {
+        get { Defaults[.vsyncEnabled] }
+        set { Defaults[.vsyncEnabled] = newValue }}
+
+    @objc
+    public static var imageSmoothing: Bool {
+        get { Defaults[.imageSmoothing] }
+        set { Defaults[.imageSmoothing] = newValue }}
+
+    @objc
+    public static var volume: Float {
+        get { Defaults[.volume] }
+        set { Defaults[.volume] = newValue }}
+
+    @objc
+    public static var showFPS: Bool {
+        get { Defaults[.showFPSCount] }
+        set { Defaults[.showFPSCount] = newValue }}
+
+    /// Player display name for emulator cores. Empty string means "use fallback".
+    @objc
+    public static var playerUsername: String {
+        get { Defaults[.playerUsername] }
+        set { Defaults[.playerUsername] = newValue }}
+
+    /// Resolved player username with fallback chain:
+    /// 1. User-configured `playerUsername` (if non-empty)
+    /// 2. OS username (`NSUserName()` on macOS, device name on iOS)
+    /// 3. Platform-specific hardcoded fallback
+    @objc
+    public static var resolvedPlayerUsername: String {
+        let configured = playerUsername
+        if !configured.isEmpty { return configured }
+        #if os(tvOS)
+        return "Provenance TV"
+        #elseif canImport(UIKit)
+        return UIDevice.current.name
+        #else
+        let user = NSUserName()
+        return user.isEmpty ? "Provenance" : user
+        #endif
+    }
+
+    /// The raw `CoreLanguageSetting` integer for the user's language override.
+    /// -1 means "system locale" (caller resolves via `CoreLocaleMapper`).
+    @objc
+    public static var coreLanguageRawValue: Int {
+        Defaults[.coreLanguage].rawValue
+    }
+}
+
+// MARK: - RetroAchievements Settings
+
+public extension Defaults.Keys {
+    /// Master toggle for RetroAchievements in all cores (native + LibRetro).
+    static let retroAchievementsEnabled = makeMigratingBoolKey(
+        canonicalRetroAchievementsEnabledDefaultsKey,
+        legacyKey: legacyRetroAchievementsEnabledDefaultsKey,
+        defaultValue: false
+    )
+
+    /// When `true`, save-state loads are blocked during active achievement sessions.
+    static let retroAchievementsHardcoreEnabled = makeMigratingBoolKey(
+        canonicalRetroAchievementsHardcoreDefaultsKey,
+        legacyKey: legacyRetroAchievementsHardcoreDefaultsKey,
+        defaultValue: false
+    )
+
+    /// Show the in-game overlay toast when an achievement unlocks, progresses,
+    /// or a challenge indicator appears.
+    static let retroAchievementsToastsEnabled = Key<Bool>(
+        "retroAchievementsToastsEnabled",
+        default: true
+    )
+
+    /// Play the achievement-unlock sound effect when an achievement unlocks.
+    static let retroAchievementsSoundEnabled = Key<Bool>(
+        "retroAchievementsSoundEnabled",
+        default: true
+    )
+
+    /// Emit app-level toasts for RetroAchievements login/logout/mode-change/error
+    /// events (mirrors RetroArch's own OSD banner style).
+    static let retroAchievementsSystemToastsEnabled = Key<Bool>(
+        "retroAchievementsSystemToastsEnabled",
+        default: true
+    )
+}
+
+public extension Defaults.Keys {
+    static let showFavorites = Key<Bool>("showFavorites", default: true)
+
+    /// Obfuscate game artwork with a blur for screenshots.
+    static let obfuscateArtwork = Key<Bool>("obfuscateArtwork", default: false)
+
+    /// Total number of game launches since installation
+    static let gameLaunchCount = Key<Int>("gameLaunchCount", default: 0)
+
+    /// Last time the support nag screen was shown (to prevent spam)
+    static let lastSupportNagShown = Key<Date?>("lastSupportNagShown", default: nil)
+
+    /// Number of times the user has dismissed the support nag screen
+    static let nagDismissCount = Key<Int>("nagDismissCount", default: 0)
+}
+
+// MARK: - JIT Onboarding Settings
+public extension Defaults.Keys {
+    /// Set of core category identifiers for which the JIT onboarding has been dismissed ("Don't show again")
+    static let jitOnboardingDismissedCategories = Key<Set<String>>("jitOnboardingDismissedCategories", default: [])
+}
+
+// MARK: - Optional BIOS On-Demand Download
+public extension Defaults.Keys {
+    /// System identifiers whose optional BIOS files the user agreed to fetch
+    /// from iCloud on demand.
+    ///
+    /// Optional BIOS are skipped by the required-BIOS preflight because they must
+    /// never gate a launch. Asking about them on every boot of the same system
+    /// would nag, so the answer is remembered per system. Two sets rather than one
+    /// dictionary so that "never asked" stays distinguishable from "asked and
+    /// declined" — a system in neither set is one we have not prompted for yet.
+    static let optionalBIOSAutoDownloadSystems = Key<Set<String>>("optionalBIOSAutoDownloadSystems", default: [])
+
+    /// System identifiers whose optional BIOS the user declined. See
+    /// ``optionalBIOSAutoDownloadSystems``.
+    static let optionalBIOSDeclinedSystems = Key<Set<String>>("optionalBIOSDeclinedSystems", default: [])
+}
+
+// MARK: - MIDI Settings
+public extension Defaults.Keys {
+    /// CoreMIDI unique ID of the last selected MIDI input source.
+    /// Persisted so the device picker restores the user's choice between sessions.
+    /// `nil` means "no preference" (connect all available input sources).
+    static let midiSourceUniqueID = Key<Int?>("midiSourceUniqueID", default: nil)
+
+    /// CoreMIDI unique ID of the last selected MIDI output destination.
+    /// `nil` means "no preference" (no active output connection).
+    static let midiDestinationUniqueID = Key<Int?>("midiDestinationUniqueID", default: nil)
+
+    /// Whether the RetroArch MIDI driver (CoreMIDI) is enabled for RetroArch-path cores.
+    /// When `true`, `midi_input` and `midi_output` in retroarch.cfg are set to "coremidi".
+    /// When `false`, both are set to "Off", disabling MIDI routing for all RA cores.
+    /// Applied to the user's retroarch.cfg on every core startup via `applyMIDIPreferenceToUserCfg:`.
+    static let retroArchMIDIEnabled = Key<Bool>("retroArchMIDIEnabled", default: true)
+}

@@ -1,0 +1,486 @@
+#import "PVMupenBridge.h"
+#import "PVMupenBridge+Controls.h"
+#import "PVMupen64PlusBridge/PVMupen64PlusBridge-Swift.h"
+#import "api/config.h"
+#import "api/m64p_common.h"
+#import "api/m64p_config.h"
+#import "api/m64p_frontend.h"
+#import "api/m64p_vidext.h"
+#import "api/callbacks.h"
+#import "osal/dynamiclib.h"
+#import "../Plugins/Core/Core/src/main/version.h"
+#import "../Plugins/Core/Core/src/plugin/plugin.h"
+//#import "rom.h"
+//#import "savestates.h"
+//#import "memory.h"
+//#import "mupen64plus-core/src/main/main.h"
+@import Dispatch;
+@import PVSupport;
+@import PVCoreBridge;
+@import PVCoreObjCBridge;
+@import PVLoggingObjC;
+
+#if TARGET_OS_MACCATALYST || TARGET_OS_OSX
+@import OpenGL.GL3;
+@import GLUT;
+#else
+@import OpenGLES.ES3;
+@import GLKit;
+#endif
+
+#import <dlfcn.h>
+
+unsigned char DataCRC( unsigned char *Data, int iLenght )
+{
+    unsigned char Remainder = Data[0];
+
+    int iByte = 1;
+    unsigned char bBit = 0;
+
+    while( iByte <= iLenght ) {
+        int HighBit = ((Remainder & 0x80) != 0);
+        Remainder = Remainder << 1;
+
+        Remainder += ( iByte < iLenght && Data[iByte] & (0x80 >> bBit )) ? 1 : 0;
+
+        Remainder ^= (HighBit) ? 0x85 : 0;
+
+        bBit++;
+        iByte += bBit/8;
+        bBit %= 8;
+    }
+
+    return Remainder;
+}
+
+
+void MupenGetKeys(int Control, BUTTONS *Keys) {
+    GET_CURRENT_AND_RETURN();
+    
+    if (Control == 0) {
+        [current pollControllers];
+    }
+
+    Keys->U_DPAD = current->padData[Control][PVN64ButtonDPadUp];
+    Keys->D_DPAD = current->padData[Control][PVN64ButtonDPadDown];
+    Keys->L_DPAD = current->padData[Control][PVN64ButtonDPadLeft];
+    Keys->R_DPAD = current->padData[Control][PVN64ButtonDPadRight];
+    
+    Keys->START_BUTTON = current->padData[Control][PVN64ButtonStart];
+    
+    Keys->Z_TRIG = current->padData[Control][PVN64ButtonZ];
+    
+    Keys->B_BUTTON = current->padData[Control][PVN64ButtonB];
+    Keys->A_BUTTON = current->padData[Control][PVN64ButtonA];
+    
+    Keys->L_CBUTTON = current->padData[Control][PVN64ButtonCLeft];
+    Keys->R_CBUTTON = current->padData[Control][PVN64ButtonCRight];
+    Keys->D_CBUTTON = current->padData[Control][PVN64ButtonCDown];
+    Keys->U_CBUTTON = current->padData[Control][PVN64ButtonCUp];
+  
+    Keys->L_TRIG = current->padData[Control][PVN64ButtonL];
+    Keys->R_TRIG = current->padData[Control][PVN64ButtonR];
+
+    Keys->X_AXIS = current->xAxis[Control];
+    Keys->Y_AXIS = current->yAxis[Control];
+}
+
+void MupenInitiateControllers (CONTROL_INFO ControlInfo) {
+    GET_CURRENT_OR_RETURN();
+
+    bool p2Present = current.controller2 != nil || current.dualJoystick;
+
+    ControlInfo.Controls[0].Present = 1;
+    ControlInfo.Controls[0].Plugin = current->controllerMode[0];
+    ControlInfo.Controls[1].Present = p2Present;
+    ControlInfo.Controls[1].Plugin = current->controllerMode[1];
+    ControlInfo.Controls[2].Present = current.controller3 != nil;
+    ControlInfo.Controls[2].Plugin = current->controllerMode[2];
+    ControlInfo.Controls[3].Present = current.controller4 != nil || (current.controller3 != nil && current.dualJoystick);
+    ControlInfo.Controls[3].Plugin = current->controllerMode[3];
+}
+
+/******************************************************************
+ Function: ControllerCommand
+ Purpose:  To process the raw data that has just been sent to a
+ specific controller.
+ input:    - Controller Number (0 to 3) and -1 signalling end of
+ processing the pif ram.
+ - Pointer of data to be processed.
+ output:   none
+ note:     This function is only needed if the DLL is allowing raw
+ data, or the plugin is set to raw
+ the data that is being processed looks like this:
+ initilize controller: 01 03 00 FF FF FF
+ read controller:      01 04 01 FF FF FF FF
+ *******************************************************************/
+void MupenControllerCommand(int Control, unsigned char *Command) {
+        // Some stuff from n-rage plugin
+#define RD_GETSTATUS        0x00        // get status
+#define RD_READKEYS         0x01        // read button values
+#define RD_READPAK          0x02        // read from controllerpack
+#define RD_WRITEPAK         0x03        // write to controllerpack
+#define RD_RESETCONTROLLER  0xff        // reset controller
+#define RD_READEEPROM       0x04        // read eeprom
+#define RD_WRITEEPROM       0x05        // write eeprom
+
+#define PAK_IO_RUMBLE       0xC000      // the address where rumble-commands are sent to
+
+    GET_CURRENT_OR_RETURN();
+
+    unsigned char *Data = &Command[5];
+
+    if (Control == -1)
+    return;
+
+    switch (Command[2])
+    {
+        case RD_GETSTATUS:
+        break;
+        case RD_READKEYS:
+        break;
+        case RD_READPAK: {
+            // This handler is called only in PLUGIN_RAW mode (virtual combo pak).
+            // For PLUGIN_MEMPAK the core's native mempak.c handles I/O directly.
+            unsigned int dwAddress = (Command[3] << 8) + (Command[4] & 0xE0);
+
+            if (dwAddress >= 0x8000 && dwAddress < 0x9000) {
+                // Pak-present probe: return 0x80 (any pak type responds here)
+                memset(Data, 0x80, 32);
+            } else if (dwAddress < 0x8000 && Control >= 0 && Control < 4) {
+                // Memory pak data read: serve from in-memory buffer
+                memcpy(Data, &current->mempakBuffer[Control][dwAddress], 32);
+            } else {
+                memset(Data, 0x00, 32);
+            }
+
+            Data[32] = DataCRC(Data, 32);
+            break;
+        }
+        case RD_WRITEPAK: {
+            // This handler is called in two situations:
+            //   1. PLUGIN_RAW mode: all pak bus writes come here directly.
+            //   2. PLUGIN_RUMBLE_PAK mode: rumblepak.c constructs a synthetic
+            //      0xC000 command and calls input.controllerCommand() to trigger
+            //      haptics — see input_plugin_compat.c:input_plugin_rumble_exec().
+            unsigned int dwAddress = (Command[3] << 8) + (Command[4] & 0xE0);
+
+            if (dwAddress == PAK_IO_RUMBLE) {
+                // Rumble register: 0x01 = start, 0x00 = stop
+#if TARGET_OS_IOS && !TARGET_OS_MACCATALYST
+                if (@available(iOS 14.0, *)) {
+                    if (*Data) {
+                        [current rumbleForPlayer:Control];
+                    } else {
+                        [current stopRumbleForPlayer:Control];
+                    }
+                }
+#else
+                if (*Data) {
+                    [current rumbleForPlayer:Control];
+                } else {
+                    [current stopRumbleForPlayer:Control];
+                }
+#endif
+            } else if (dwAddress < 0x8000 && Control >= 0 && Control < 4) {
+                // Memory pak data write: store in buffer and mark dirty for flush
+                memcpy(&current->mempakBuffer[Control][dwAddress], Data, 32);
+                current->mempakDirty[Control] = YES;
+                // Flush to disk after each write so saves survive crashes/force-quit
+                [current saveMempakForPort:Control];
+            }
+
+            break;
+        }
+        case RD_RESETCONTROLLER:
+        break;
+        case RD_READEEPROM:
+        break;
+        case RD_WRITEEPROM:
+        break;
+    }
+}
+
+
+//NSString *MupenControlNames[] = {
+//    @"N64_DPadU", @"N64_DPadD", @"N64_DPadL", @"N64_DPadR",
+//    @"N64_CU", @"N64_CD", @"N64_CL", @"N64_CR",
+//    @"N64_B", @"N64_A", @"N64_R", @"N64_L", @"N64_Z", @"N64_Start"
+//}; // FIXME: missing: joypad X, joypad Y, mempak switch, rumble switch
+
+#define N64_ANALOG_MAX 80
+
+@implementation PVMupenBridge (Controls)
+
+- (void)setMode:(NSInteger)mode forController:(NSInteger)controller {
+    NSAssert(controller < 4, @"Controller index out of range (0-3)");
+    if (controller >= 0 && controller < 4) {
+        self->controllerMode[controller] = (int)mode;
+    }
+}
+
+/// Sets (or clears) the GB/GBC cart ROM + save paths for a Transfer Pak slot.
+/// Pass nil for both to remove the cart.  Rebuilds the C-string cache immediately
+/// so the next m64p_media_loader callback sees the updated paths.
+- (void)setGBCartROMPath:(nullable NSString *)romPath
+               savePath:(nullable NSString *)savePath
+                forPort:(NSInteger)port {
+    NSAssert(port >= 0 && port < 4, @"Transfer Pak port index out of range (0-3)");
+    if (port < 0 || port >= 4) return;
+
+    @synchronized (self) {
+        // Release previous C-string copies.
+        if (self->_gbCartROMCStr[port]) {
+            free(self->_gbCartROMCStr[port]);
+            self->_gbCartROMCStr[port] = NULL;
+        }
+        if (self->_gbCartSaveCStr[port]) {
+            free(self->_gbCartSaveCStr[port]);
+            self->_gbCartSaveCStr[port] = NULL;
+        }
+
+        self->gbCartROMPath[port]  = romPath;
+        self->gbCartSavePath[port] = savePath;
+
+        if (romPath.length > 0) {
+            self->_gbCartROMCStr[port] = strdup(romPath.fileSystemRepresentation);
+        }
+        if (savePath.length > 0) {
+            self->_gbCartSaveCStr[port] = strdup(savePath.fileSystemRepresentation);
+        }
+    }
+
+    ILOG(@"Transfer Pak port %ld: ROM=%@  save=%@", (long)port, romPath ?: @"<none>", savePath ?: @"<auto>");
+}
+
+- (nullable NSString *)gbCartROMPathForPort:(NSInteger)port {
+    if (port < 0 || port >= 4) return nil;
+    @synchronized (self) {
+        return self->gbCartROMPath[port];
+    }
+}
+
+- (nullable NSString *)gbCartSavePathForPort:(NSInteger)port {
+    if (port < 0 || port >= 4) return nil;
+    @synchronized (self) {
+        return self->gbCartSavePath[port];
+    }
+}
+
+- (void)pollController:(GCController* _Nullable)controller forIndex:(NSInteger)playerIndex {
+    if (!controller) {
+        return;
+    }
+    if (LIKELY(controller.extendedGamepad)) {
+        GCExtendedGamepad *gamepad     = [controller extendedGamepad];
+        GCControllerDirectionPad *dpad = [gamepad dpad];
+        
+        GCControllerButtonInput *startButton = nil;
+        // N64 has Start but no Select. Resolve Start only via shared utility.
+        PVResolveStartSelectButtons(controller, &startButton, NULL);
+
+        
+        BOOL dualModeOverrides = self.dualJoystick && (playerIndex == 0 || playerIndex == 2);
+
+        // Left Joystick → Joystick
+        xAxis[playerIndex] = gamepad.leftThumbstick.xAxis.value * N64_ANALOG_MAX;
+        yAxis[playerIndex] = gamepad.leftThumbstick.yAxis.value * N64_ANALOG_MAX;
+
+        // MFi-D-Pad → D-Pad
+        padData[playerIndex][PVN64ButtonDPadUp] = dpad.up.isPressed;
+        padData[playerIndex][PVN64ButtonDPadDown] = dpad.down.isPressed;
+        padData[playerIndex][PVN64ButtonDPadLeft] = dpad.left.isPressed;
+        padData[playerIndex][PVN64ButtonDPadRight] = dpad.right.isPressed;
+
+        if(dualModeOverrides) {
+            // MFi-R2 → P2.Z
+            padData[playerIndex+1][PVN64ButtonZ] = gamepad.rightTrigger.isPressed;
+            
+            // MFi-L2 → P1.Z
+            padData[playerIndex][PVN64ButtonZ] = gamepad.leftTrigger.isPressed;
+
+                //fallback for non-dual sense only if the R3 button exists on the controller
+            padData[playerIndex][PVN64ButtonStart] = gamepad.rightThumbstickButton.isPressed || (startButton && startButton.isPressed);
+        } else {
+            // MFi-R2 → Start
+            padData[playerIndex][PVN64ButtonStart] = gamepad.rightTrigger.isPressed || (startButton && startButton.isPressed);
+
+            // MFi-L2 → Z
+            padData[playerIndex][PVN64ButtonZ] = gamepad.leftTrigger.isPressed;
+        }
+        
+        // If MFi-L2 is not pressed… MFi-L1 → L
+        if (!gamepad.rightShoulder.isPressed) {
+            padData[playerIndex][PVN64ButtonL] = gamepad.leftShoulder.isPressed;
+        }
+        
+        // If MFi-L1 is not pressed… MFi-R1 → R
+        if (!gamepad.leftShoulder.isPressed) {
+            padData[playerIndex][PVN64ButtonR] = gamepad.rightShoulder.isPressed;
+        }
+        // If not C-Mode… MFi-X,A → A,B MFi-Y,B → C←,C↓
+        if (!(gamepad.leftShoulder.isPressed && gamepad.rightShoulder.isPressed)) {
+            padData[playerIndex][PVN64ButtonA] = gamepad.buttonA.isPressed;
+            padData[playerIndex][PVN64ButtonB] = gamepad.buttonX.isPressed;
+            padData[playerIndex][PVN64ButtonCLeft] = gamepad.buttonY.isPressed;
+            padData[playerIndex][PVN64ButtonCDown] = gamepad.buttonB.isPressed;
+        }
+        
+        //C-Mode: MFi-X,Y,A,B -> C←,C↑,C↓,C→
+        if (gamepad.leftShoulder.isPressed && gamepad.rightShoulder.isPressed) {
+            padData[playerIndex][PVN64ButtonCLeft] = gamepad.buttonX.isPressed;
+            padData[playerIndex][PVN64ButtonCUp] = gamepad.buttonY.isPressed;
+            padData[playerIndex][PVN64ButtonCDown] = gamepad.buttonA.isPressed;
+            padData[playerIndex][PVN64ButtonCRight] = gamepad.buttonB.isPressed;
+        }
+
+        // Right Joystick → C Buttons
+        if(dualModeOverrides) {
+            xAxis[playerIndex+1] = gamepad.rightThumbstick.xAxis.value * N64_ANALOG_MAX;
+            yAxis[playerIndex+1] = gamepad.rightThumbstick.yAxis.value * N64_ANALOG_MAX;
+        } else {
+            float rightJoystickDeadZone = 0.45;
+            if (!(gamepad.leftShoulder.isPressed && gamepad.rightShoulder.isPressed) && !(gamepad.buttonY.isPressed || gamepad.buttonB.isPressed)) {
+                padData[playerIndex][PVN64ButtonCUp] = gamepad.rightThumbstick.up.value > rightJoystickDeadZone;
+                padData[playerIndex][PVN64ButtonCDown] = gamepad.rightThumbstick.down.value > rightJoystickDeadZone;
+                padData[playerIndex][PVN64ButtonCLeft] = gamepad.rightThumbstick.left.value > rightJoystickDeadZone;
+                padData[playerIndex][PVN64ButtonCRight] = gamepad.rightThumbstick.right.value > rightJoystickDeadZone;
+            }
+        }
+    } else if ([controller gamepad]) {
+        GCGamepad *gamepad = [controller gamepad];
+        GCControllerDirectionPad *dpad = [gamepad dpad];
+        
+        if (!gamepad.rightShoulder.isPressed) {
+            // Default
+            xAxis[playerIndex] = (dpad.left.value > 0.5 ? -N64_ANALOG_MAX : 0) + (dpad.right.value > 0.5 ? N64_ANALOG_MAX : 0);
+            yAxis[playerIndex] = (dpad.down.value > 0.5 ? -N64_ANALOG_MAX : 0) + (dpad.up.value > 0.5 ? N64_ANALOG_MAX : 0);
+            
+            padData[playerIndex][PVN64ButtonA] = gamepad.buttonA.isPressed;
+            padData[playerIndex][PVN64ButtonB] = gamepad.buttonX.isPressed;
+            
+            padData[playerIndex][PVN64ButtonCLeft] = gamepad.buttonY.isPressed;
+            padData[playerIndex][PVN64ButtonCDown] = gamepad.buttonB.isPressed;
+        } else {
+            // Alt-Mode
+            padData[playerIndex][PVN64ButtonDPadUp] = dpad.up.isPressed;
+            padData[playerIndex][PVN64ButtonDPadDown] = dpad.down.isPressed;
+            padData[playerIndex][PVN64ButtonDPadLeft] = dpad.left.isPressed;
+            padData[playerIndex][PVN64ButtonDPadRight] = dpad.right.isPressed;
+            
+            padData[playerIndex][PVN64ButtonCLeft] = gamepad.buttonX.isPressed;
+            padData[playerIndex][PVN64ButtonCUp] = gamepad.buttonY.isPressed;
+            padData[playerIndex][PVN64ButtonCDown] = gamepad.buttonA.isPressed;
+            padData[playerIndex][PVN64ButtonCRight] = gamepad.buttonB.isPressed;
+        }
+        
+        padData[playerIndex][PVN64ButtonZ] = gamepad.leftShoulder.isPressed;
+        padData[playerIndex][PVN64ButtonR] = gamepad.rightShoulder.isPressed;
+        
+    }
+#if TARGET_OS_TV
+    else if ([controller microGamepad]) {
+        GCMicroGamepad *gamepad = [controller microGamepad];
+        GCControllerDirectionPad *dpad = [gamepad dpad];
+        
+        xAxis[playerIndex] = (dpad.left.value > 0.5 ? -N64_ANALOG_MAX : 0) + (dpad.right.value > 0.5 ? N64_ANALOG_MAX : 0);
+        yAxis[playerIndex] = (dpad.down.value > 0.5 ? -N64_ANALOG_MAX : 0) + (dpad.up.value > 0.5 ? N64_ANALOG_MAX : 0);
+        
+        padData[playerIndex][PVN64ButtonB] = gamepad.buttonA.isPressed;
+        padData[playerIndex][PVN64ButtonA] = gamepad.buttonX.isPressed;
+    }
+#endif
+}
+
+- (void)pollControllers {
+#define USE_CAPTURE 1
+#define USE_QUEUE 1
+
+#if USE_CAPTURE
+#define controllerForNum(num) [self.controller##num capture]
+#else
+#define controllerForNum(num) self.controller##num
+#endif
+
+#if USE_QUEUE
+        //    const NSOperationQueue *queue = [NSOperationQueue currentQueue];
+            [_inputQueue cancelAllOperations];
+            NSMutableArray<NSBlockOperation*>* ops = [NSMutableArray arrayWithCapacity:4];
+        #define CHECK_CONTROLLER(num) \
+            if(self.controller##num) [ops addObject:[NSBlockOperation blockOperationWithBlock:^{[self pollController:controllerForNum(num) forIndex:(num - 1)];}]]
+
+            CHECK_CONTROLLER(1);
+            CHECK_CONTROLLER(2);
+            CHECK_CONTROLLER(3);
+            CHECK_CONTROLLER(4);
+
+            [_inputQueue addOperations:ops waitUntilFinished:NO];
+#else
+#define CHECK_CONTROLLER(num) if(self.controller##num) [self pollController:controllerForNum(num) forIndex:(num - 1)]
+
+    CHECK_CONTROLLER(1);
+    CHECK_CONTROLLER(2);
+    CHECK_CONTROLLER(3);
+    CHECK_CONTROLLER(4);
+#endif
+#undef CHECK_CONTROLLER
+#undef controllerForNum
+}
+
+- (void)didMoveN64JoystickDirection:(PVN64Button)button withXValue:(CGFloat)xValue withYValue:(CGFloat)yValue forPlayer:(NSUInteger)player {
+    if (MupenGameCoreOptions.dualJoystickOption && player == 0) {
+        player = 1;
+    }
+    yAxis[player] = yValue * N64_ANALOG_MAX;
+    xAxis[player] = xValue * N64_ANALOG_MAX;
+    /*
+    switch (button) {
+        case PVN64ButtonAnalogUp:
+//            NSLog(@"Up: %f", round(value * N64_ANALOG_MAX));
+            yAxis[player] = round(value * N64_ANALOG_MAX);
+            break;
+        case PVN64ButtonAnalogDown:
+//            NSLog(@"Down: %f", value * -N64_ANALOG_MAX);
+            yAxis[player] = value * -N64_ANALOG_MAX;
+            break;
+        case PVN64ButtonAnalogLeft:
+            xAxis[player] = value * -N64_ANALOG_MAX;
+            break;
+        case PVN64ButtonAnalogRight:
+            xAxis[player] = value * N64_ANALOG_MAX;
+            break;
+        default:
+            break;
+    }
+   */
+}
+
+- (void)didPushN64Button:(PVN64Button)button forPlayer:(NSUInteger)player {
+    padData[player][button] = 1;
+}
+
+- (void)didReleaseN64Button:(PVN64Button)button forPlayer:(NSUInteger)player {
+    padData[player][button] = 0;
+}
+
+@end
+
+@implementation PVMupenBridge (Rumble)
+
+- (BOOL)supportsRumble {
+    return YES;
+}
+
+- (void)rumbleForPlayer:(NSInteger)player {
+    [PVMupenBridgeRumbleHelper rumbleForBridgeObject:self
+                                              player:player
+                                        lowFrequency:1.0f
+                                       highFrequency:0.3f
+                                            duration:0.5];
+}
+
+- (void)stopRumbleForPlayer:(NSInteger)player {
+    [PVMupenBridgeRumbleHelper stopRumbleForBridgeObject:self player:player];
+}
+
+@end

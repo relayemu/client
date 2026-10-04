@@ -1,0 +1,105 @@
+version = 1
+SPDX-PackageName = "Relay"
+SPDX-PackageSupplier = "Maiko BOSSUYT"
+SPDX-PackageDownloadLocation = "https://github.com/relayemu/client"
+
+# Relay-owned source is stamped file by file (Scripts/relay-spdx-headers.py).
+# The annotations below cover directories whose files are not, or must not be,
+# edited: inherited code keeps its own terms, fixtures keep theirs, and the
+# brand assets are not code.
+
+[[annotations]]
+path = ["Apps/**", "Packages/**", "Scripts/**", "Resources/**", "Tests/**/*.swift", "*.md", ".gitignore", "REUSE.toml"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = "Vendor/Provenance/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Provenance Emu contributors; see Vendor/Provenance/LICENSE.md and LICENSES.md"
+SPDX-License-Identifier = "LicenseRef-Provenance-BSD-3-Clause-Trademark"
+
+[[annotations]]
+path = "Vendor/Provenance/Cores/mGBA/Sources/libmGBA/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2013-2024 Jeffrey Pfau and mGBA contributors"
+SPDX-License-Identifier = "MPL-2.0"
+
+[[annotations]]
+path = "Vendor/Mesen2/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2014-2025 Sour and Mesen contributors; bundled modules under their own licences, see Resources/CoreManifest.json"
+SPDX-License-Identifier = "GPL-3.0-only"
+
+[[annotations]]
+path = "Vendor/melonDS/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2016-2026 melonDS team; bundled modules under their own licences, see Resources/CoreManifest.json"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Official achievement runtime; hashing helpers keep their upstream terms.
+[[annotations]]
+path = "Vendor/rcheevos/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2018 RetroAchievements.org"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["Vendor/rcheevos/src/rhash/md5.c", "Vendor/rcheevos/src/rhash/md5.h"]
+precedence = "override"
+SPDX-FileCopyrightText = "1999, 2000, 2002 Aladdin Enterprises"
+SPDX-License-Identifier = "Zlib"
+
+[[annotations]]
+path = ["Vendor/rcheevos/src/rhash/aes.c", "Vendor/rcheevos/src/rhash/aes.h"]
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "Unlicense"
+
+[[annotations]]
+path = ["Vendor/rcheevos/Package.swift", "Vendor/rcheevos/RELAY_VENDOR.json",
+        "Vendor/rcheevos/include/RelayRcheevos.h", "Vendor/rcheevos/include/module.modulemap"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# Relay's own additions inside the vendored trees: build manifests and bridges.
+[[annotations]]
+path = ["Vendor/Mesen2/Package.swift", "Vendor/Mesen2/RELAY_VENDOR.json", "Vendor/Mesen2/RelayBridge/**",
+        "Vendor/melonDS/Package.swift", "Vendor/melonDS/RELAY_VENDOR.json", "Vendor/melonDS/RelayBridge/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = ["Tests/Fixtures/ROMs/relay-sram-counter/**", "Tests/Fixtures/ROMs/relay-gb-counter/**",
+        "Tests/Fixtures/ROMs/relay-nes-counter/**", "Tests/Fixtures/ROMs/relay-snes-counter/**",
+        "Tests/Fixtures/ROMs/relay-ds-counter/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "Tests/Fixtures/ROMs/240p-test-suite-gba/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Artemio Urbina and 240p Test Suite contributors"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = "Brand/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "LicenseRef-Relay-Brand"
+
+[[annotations]]
+path = ["Apps/**/Assets.xcassets/**", "Apps/**/*.xcassets/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Maiko BOSSUYT"
+SPDX-License-Identifier = "LicenseRef-Relay-Brand"
+
+[[annotations]]
+path = ["Packages/RelayTitleCatalog/Sources/RelayTitleCatalog/Resources/RelayTitles.sqlite", "Resources/Metadata/RelayTitleCatalog.json"]
+precedence = "override"
+SPDX-FileCopyrightText = "libretro-database contributors"
+SPDX-License-Identifier = "CC-BY-SA-4.0"

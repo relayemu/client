@@ -1,0 +1,561 @@
+#   xcodegen generate --spec Apps/project.yml
+# Produces Apps/Relay.xcodeproj with three native app targets sharing Apps/Shared.
+# Shared/InfoPlist.xcstrings localizes document names for all three app bundles.
+name: Relay
+options:
+  bundleIdPrefix: app.relayemu
+  deploymentTarget:
+    iOS: "18.0"
+    tvOS: "18.0"
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  xcodeVersion: "26.0"
+  defaultConfig: Debug
+configs:
+  Debug: debug
+  Release: release
+  TestFlightPreproduction: release
+fileGroups:
+  - StoreKit
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "10"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    RELAY_DISTRIBUTION_SIGNING: "NO"
+    # Set to RELAY_CLOUDKIT by signed CloudKit builds only (Scripts/relay-verify-cloud.sh, release archives
+    # with the iCloud capability). Unsigned builds never touch CKContainer.
+    RELAY_CLOUDKIT_FLAG: ""
+    # Opt-in only: requires a Sign in with Apple enabled preproduction profile.
+    RELAY_HOSTED_SYNC_FLAG: ""
+  configs:
+    Debug:
+      RELAY_DEV_FIXTURES: "YES"
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG RELAY_DEV_FIXTURES $(RELAY_CLOUDKIT_FLAG) $(RELAY_HOSTED_SYNC_FLAG)
+    Release: &releaseSettings
+      RELAY_DEV_FIXTURES: "NO"
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: RELAY_HOSTED_PRODUCTION $(RELAY_CLOUDKIT_FLAG)
+      EXCLUDED_SOURCE_FILE_NAMES: "240pee_mb.gba relay-sram-counter.gba relay-sram-tone.gba relay-gb-counter.gb relay-gbc-counter.gbc relay-nes-counter.nes relay-snes-counter.sfc relay-ds-counter.nds relay-sms-counter.sms relay-gg-counter.gg relay-pce-counter.pce relay-ws-counter.ws relay-wsc-counter.wsc relay-ps1-counter.cue relay-ps1-counter.bin"
+    TestFlightPreproduction:
+      <<: *releaseSettings
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: RELAY_TESTFLIGHT_PREPRODUCTION RELAY_HOSTED_PREPRODUCTION RELAY_CLOUDKIT
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      SWIFT_COMPILATION_MODE: wholemodule
+      ENABLE_TESTABILITY: "NO"
+      GCC_OPTIMIZATION_LEVEL: s
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+packages:
+  RelayDomain:
+    path: ../Packages/RelayDomain
+  RelayLibrary:
+    path: ../Packages/RelayLibrary
+  RelayPersistence:
+    path: ../Packages/RelayPersistence
+  RelayTitleCatalog:
+    path: ../Packages/RelayTitleCatalog
+  RelayDesignSystem:
+    path: ../Packages/RelayDesignSystem
+  RelayUI:
+    path: ../Packages/RelayUI
+  RelayEmulation:
+    path: ../Packages/RelayEmulation
+  RelaySync:
+    path: ../Packages/RelaySync
+  RelayHostedSync:
+    path: ../Packages/RelayHostedSync
+  RelayCloudKit:
+    path: ../Packages/RelayCloudKit
+  RelayCommerce:
+    path: ../Packages/RelayCommerce
+targets:
+  RelayiOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Shared
+      - path: RelayiOS
+    dependencies:
+      - package: RelayDomain
+        product: RelayDomain
+      - package: RelayLibrary
+        product: RelayLibrary
+      - package: RelayPersistence
+        product: RelayPersistence
+      - package: RelayTitleCatalog
+        product: RelayTitleCatalog
+      - package: RelayDesignSystem
+        product: RelayDesignSystem
+      - package: RelayUI
+        product: RelayUI
+      - package: RelayEmulation
+        product: RelayEmulation
+      - package: RelayEmulation
+        product: RelayProvenanceAdapter
+      - package: RelayEmulation
+        product: RelayCores
+      - package: RelayEmulation
+        product: RelayVideo
+      - package: RelayEmulation
+        product: RelayInput
+      - package: RelaySync
+        product: RelaySync
+      - package: RelayHostedSync
+        product: RelayHostedSync
+      - package: RelayCloudKit
+        product: RelayCloudKit
+      - package: RelayCommerce
+        product: RelayEntitlements
+      - package: RelayCommerce
+        product: RelayStoreKit
+    info:
+      path: RelayiOS/Info.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Relay
+        NSLocalNetworkUsageDescription: Relay connects to your computer to receive the games you choose.
+        # Explicit owner export declaration (2026-09-15), not an absence-of-cryptography claim.
+        ITSAppUsesNonExemptEncryption: false
+        CFBundleName: Relay
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        LSSupportsOpeningDocumentsInPlace: true
+        UIFileSharingEnabled: true
+        GCSupportsControllerUserInteraction: true
+        UIRequiresFullScreen: false
+        UIBackgroundModes: [remote-notification]
+        CFBundleLocalizations: [en, fr, de, es-ES, es-MX, it, nl, pl, pt-PT, pt-BR, sv, ro, ja, ko, zh-Hant]
+        CFBundleDevelopmentRegion: en
+        # One imported type per playable system (SystemCatalog.playable); a
+        # deferred system is not offered to Files or Finder.
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: app.relayemu.relay.gb
+            UTTypeDescription: Game Boy game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gb]
+          - UTTypeIdentifier: app.relayemu.relay.gbc
+            UTTypeDescription: Game Boy Color game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gbc]
+          - UTTypeIdentifier: app.relayemu.relay.gba
+            UTTypeDescription: Game Boy Advance game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gba]
+          - UTTypeIdentifier: app.relayemu.relay.nes
+            UTTypeDescription: NES game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [nes]
+          - UTTypeIdentifier: app.relayemu.relay.snes
+            UTTypeDescription: Super NES game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [sfc, smc]
+          - UTTypeIdentifier: app.relayemu.relay.nds
+            UTTypeDescription: Nintendo DS game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [nds]
+          - UTTypeIdentifier: app.relayemu.relay.sms
+            UTTypeDescription: Master System game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [sms]
+          - UTTypeIdentifier: app.relayemu.relay.gg
+            UTTypeDescription: Game Gear game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gg]
+          - UTTypeIdentifier: app.relayemu.relay.pce
+            UTTypeDescription: PC Engine game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [pce]
+          - UTTypeIdentifier: app.relayemu.relay.ws
+            UTTypeDescription: WonderSwan game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [ws, wsc]
+          - UTTypeIdentifier: app.relayemu.relay.ps1
+            UTTypeDescription: PlayStation game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [cue, bin, chd, m3u]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Game file
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [app.relayemu.relay.gb, app.relayemu.relay.gbc, app.relayemu.relay.gba, app.relayemu.relay.nes, app.relayemu.relay.snes, app.relayemu.relay.nds, app.relayemu.relay.sms, app.relayemu.relay.gg, app.relayemu.relay.pce, app.relayemu.relay.ws, app.relayemu.relay.ps1, public.zip-archive]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay
+        RELAY_IOS_ENTITLEMENTS: RelayiOS/RelayiOS.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(RELAY_IOS_ENTITLEMENTS)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: "NO"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: "YES"
+      configs:
+        Release:
+          # The existing distribution entitlements deliberately use Production CloudKit/APNs.
+          RELAY_IOS_ENTITLEMENTS: RelayiOS/RelayiOSTestFlight.entitlements
+          DEVELOPMENT_TEAM: ""
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          CODE_SIGNING_ALLOWED: $(RELAY_DISTRIBUTION_SIGNING)
+          CODE_SIGNING_REQUIRED: $(RELAY_DISTRIBUTION_SIGNING)
+          PROVISIONING_PROFILE_SPECIFIER: ""
+        TestFlightPreproduction: &testFlightSigning
+          DEVELOPMENT_TEAM: ""
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          CODE_SIGNING_ALLOWED: "YES"
+          CODE_SIGNING_REQUIRED: "YES"
+          PROVISIONING_PROFILE_SPECIFIER: ""
+          RELAY_IOS_ENTITLEMENTS: RelayiOS/RelayiOSTestFlight.entitlements
+  RelayiOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: RelayiOSUITests
+    dependencies:
+      - target: RelayiOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay.uitests
+        TEST_TARGET_NAME: RelayiOS
+        GENERATE_INFOPLIST_FILE: "YES"
+  RelayMacUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: RelayMacUITests
+    dependencies:
+      - target: RelayMac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay.macuitests
+        TEST_TARGET_NAME: RelayMac
+        GENERATE_INFOPLIST_FILE: "YES"
+  RelayTVUITests:
+    type: bundle.ui-testing
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: RelayTVUITests
+    dependencies:
+      - target: RelayTV
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay.tvuitests
+        TEST_TARGET_NAME: RelayTV
+        GENERATE_INFOPLIST_FILE: "YES"
+  RelayTV:
+    type: application
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Shared
+      - path: RelayTV
+    dependencies:
+      - package: RelayDomain
+        product: RelayDomain
+      - package: RelayLibrary
+        product: RelayLibrary
+      - package: RelayPersistence
+        product: RelayPersistence
+      - package: RelayTitleCatalog
+        product: RelayTitleCatalog
+      - package: RelayDesignSystem
+        product: RelayDesignSystem
+      - package: RelayUI
+        product: RelayUI
+      - package: RelayEmulation
+        product: RelayEmulation
+      - package: RelayEmulation
+        product: RelayProvenanceAdapter
+      - package: RelayEmulation
+        product: RelayCores
+      - package: RelayEmulation
+        product: RelayVideo
+      - package: RelayEmulation
+        product: RelayInput
+      - package: RelaySync
+        product: RelaySync
+      - package: RelayHostedSync
+        product: RelayHostedSync
+      - package: RelayCloudKit
+        product: RelayCloudKit
+      - package: RelayCommerce
+        product: RelayEntitlements
+      - package: RelayCommerce
+        product: RelayStoreKit
+    info:
+      path: RelayTV/Info.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Relay
+        NSLocalNetworkUsageDescription: Relay connects to your computer to receive the games you choose.
+        # Explicit owner export declaration (2026-09-15), not an absence-of-cryptography claim.
+        ITSAppUsesNonExemptEncryption: false
+        CFBundleName: Relay
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        GCSupportsControllerUserInteraction: true
+        UIBackgroundModes: [remote-notification]
+        CFBundleLocalizations: [en, fr, de, es-ES, es-MX, it, nl, pl, pt-PT, pt-BR, sv, ro, ja, ko, zh-Hant]
+        CFBundleDevelopmentRegion: en
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay
+        RELAY_TV_ENTITLEMENTS: RelayTV/RelayTV.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(RELAY_TV_ENTITLEMENTS)
+        TARGETED_DEVICE_FAMILY: "3"
+      configs:
+        Release:
+          RELAY_TV_ENTITLEMENTS: RelayTV/RelayTVTestFlight.entitlements
+          DEVELOPMENT_TEAM: ""
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          CODE_SIGNING_ALLOWED: $(RELAY_DISTRIBUTION_SIGNING)
+          CODE_SIGNING_REQUIRED: $(RELAY_DISTRIBUTION_SIGNING)
+          PROVISIONING_PROFILE_SPECIFIER: ""
+        TestFlightPreproduction:
+          <<: *testFlightSigning
+          PROVISIONING_PROFILE_SPECIFIER: ""
+          RELAY_TV_ENTITLEMENTS: RelayTV/RelayTVTestFlight.entitlements
+  RelayMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Shared
+      - path: RelayMac
+    dependencies:
+      - package: RelayDomain
+        product: RelayDomain
+      - package: RelayLibrary
+        product: RelayLibrary
+      - package: RelayPersistence
+        product: RelayPersistence
+      - package: RelayTitleCatalog
+        product: RelayTitleCatalog
+      - package: RelayDesignSystem
+        product: RelayDesignSystem
+      - package: RelayUI
+        product: RelayUI
+      - package: RelayEmulation
+        product: RelayEmulation
+      - package: RelayEmulation
+        product: RelayProvenanceAdapter
+      - package: RelayEmulation
+        product: RelayCores
+      - package: RelayEmulation
+        product: RelayVideo
+      - package: RelayEmulation
+        product: RelayInput
+      - package: RelaySync
+        product: RelaySync
+      - package: RelayHostedSync
+        product: RelayHostedSync
+      - package: RelayCloudKit
+        product: RelayCloudKit
+      - package: RelayCommerce
+        product: RelayEntitlements
+      - package: RelayCommerce
+        product: RelayStoreKit
+    info:
+      path: RelayMac/Info.plist
+      properties:
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Relay
+        NSLocalNetworkUsageDescription: Relay connects to your computer to receive the games you choose.
+        # Explicit owner export declaration (2026-09-15), not an absence-of-cryptography claim.
+        ITSAppUsesNonExemptEncryption: false
+        CFBundleName: Relay
+        LSMinimumSystemVersion: "15.0"
+        LSApplicationCategoryType: public.app-category.games
+        NSPrincipalClass: NSApplication
+        CFBundleLocalizations: [en, fr, de, es-ES, es-MX, it, nl, pl, pt-PT, pt-BR, sv, ro, ja, ko, zh-Hant]
+        CFBundleDevelopmentRegion: en
+        # One imported type per playable system (SystemCatalog.playable); a
+        # deferred system is not offered to Files or Finder.
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: app.relayemu.relay.gb
+            UTTypeDescription: Game Boy game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gb]
+          - UTTypeIdentifier: app.relayemu.relay.gbc
+            UTTypeDescription: Game Boy Color game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gbc]
+          - UTTypeIdentifier: app.relayemu.relay.gba
+            UTTypeDescription: Game Boy Advance game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gba]
+          - UTTypeIdentifier: app.relayemu.relay.nes
+            UTTypeDescription: NES game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [nes]
+          - UTTypeIdentifier: app.relayemu.relay.snes
+            UTTypeDescription: Super NES game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [sfc, smc]
+          - UTTypeIdentifier: app.relayemu.relay.nds
+            UTTypeDescription: Nintendo DS game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [nds]
+          - UTTypeIdentifier: app.relayemu.relay.sms
+            UTTypeDescription: Master System game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [sms]
+          - UTTypeIdentifier: app.relayemu.relay.gg
+            UTTypeDescription: Game Gear game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gg]
+          - UTTypeIdentifier: app.relayemu.relay.pce
+            UTTypeDescription: PC Engine game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [pce]
+          - UTTypeIdentifier: app.relayemu.relay.ws
+            UTTypeDescription: WonderSwan game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [ws, wsc]
+          - UTTypeIdentifier: app.relayemu.relay.ps1
+            UTTypeDescription: PlayStation game
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [cue, bin, chd, m3u]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Game file
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [app.relayemu.relay.gb, app.relayemu.relay.gbc, app.relayemu.relay.gba, app.relayemu.relay.nes, app.relayemu.relay.snes, app.relayemu.relay.nds, app.relayemu.relay.sms, app.relayemu.relay.gg, app.relayemu.relay.pce, app.relayemu.relay.ws, app.relayemu.relay.ps1, public.zip-archive]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay
+        SDKROOT: macosx
+        ARCHS: arm64
+        VALID_ARCHS: arm64
+        ONLY_ACTIVE_ARCH: "NO"
+        SUPPORTS_MACCATALYST: "NO"
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        ENABLE_HARDENED_RUNTIME: "YES"
+        COMBINE_HIDPI_IMAGES: "YES"
+        # Keep app capabilities off hosted test bundles and package frameworks.
+        RELAY_MAC_ENTITLEMENTS: RelayMac/RelayMac.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(RELAY_MAC_ENTITLEMENTS)
+      configs:
+        Release:
+          RELAY_MAC_ENTITLEMENTS: RelayMac/RelayMacTestFlight.entitlements
+          DEVELOPMENT_TEAM: ""
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Apple Distribution
+          CODE_SIGNING_ALLOWED: $(RELAY_DISTRIBUTION_SIGNING)
+          CODE_SIGNING_REQUIRED: $(RELAY_DISTRIBUTION_SIGNING)
+          PROVISIONING_PROFILE_SPECIFIER: ""
+        TestFlightPreproduction:
+          <<: *testFlightSigning
+          PROVISIONING_PROFILE_SPECIFIER: ""
+          RELAY_MAC_ENTITLEMENTS: RelayMac/RelayMacTestFlight.entitlements
+  RelayCommerceIntegrationTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: RelayCommerceIntegrationTests
+      - path: StoreKit/Relay.storekit
+        buildPhase: resources
+    dependencies:
+      - target: RelayMac
+      - package: RelayCommerce
+        product: RelayEntitlements
+      - package: RelayCommerce
+        product: RelayStoreKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.relayemu.relay.commerce-tests
+        GENERATE_INFOPLIST_FILE: "YES"
+schemes:
+  RelayiOSTestFlightPreproduction:
+    build:
+      targets: { RelayiOS: all }
+    run: { config: TestFlightPreproduction, debugEnabled: false }
+    test: { config: TestFlightPreproduction, debugEnabled: false }
+    profile: { config: TestFlightPreproduction }
+    analyze: { config: TestFlightPreproduction }
+    archive: { config: TestFlightPreproduction }
+  RelayTVTestFlightPreproduction:
+    build:
+      targets: { RelayTV: all }
+    run: { config: TestFlightPreproduction, debugEnabled: false }
+    test: { config: TestFlightPreproduction, debugEnabled: false }
+    profile: { config: TestFlightPreproduction }
+    analyze: { config: TestFlightPreproduction }
+    archive: { config: TestFlightPreproduction }
+  RelayMacTestFlightPreproduction:
+    build:
+      targets: { RelayMac: all }
+    run: { config: TestFlightPreproduction, debugEnabled: false }
+    test: { config: TestFlightPreproduction, debugEnabled: false }
+    profile: { config: TestFlightPreproduction }
+    analyze: { config: TestFlightPreproduction }
+    archive: { config: TestFlightPreproduction }
+  RelayiOS:
+    build:
+      targets: { RelayiOS: all }
+    run:
+      config: Debug
+      storeKitConfiguration: StoreKit/Relay.storekit
+    test:
+      config: Debug
+      targets: [RelayiOSUITests]
+    archive: { config: Release }
+  RelayTV:
+    build:
+      targets: { RelayTV: all }
+    run:
+      config: Debug
+      storeKitConfiguration: StoreKit/Relay.storekit
+    test:
+      config: Debug
+      targets: [RelayTVUITests]
+    archive: { config: Release }
+  RelayMac:
+    build:
+      targets: { RelayMac: all }
+    run:
+      config: Debug
+      storeKitConfiguration: StoreKit/Relay.storekit
+    test:
+      config: Debug
+      targets: [RelayCommerceIntegrationTests, RelayMacUITests]
+    archive: { config: Release }

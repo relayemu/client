@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PVCoreIdentifier</key>
+	<string>com.provenance.core.mednafen</string>
+	<key>PVPrincipleClass</key>
+	<string>MednafenGameCore.MednafenGameCore</string>
+	<key>PVProjectName</key>
+	<string>Mednafen</string>
+	<key>PVSupportedSystems</key>
+	<array>
+		<string>com.provenance.saturn</string>
+		<string>com.provenance.psx</string>
+		<string>com.provenance.lynx</string>
+		<string>com.provenance.ngp</string>
+		<string>com.provenance.ngpc</string>
+		<string>com.provenance.pce</string>
+		<string>com.provenance.pcecd</string>
+		<string>com.provenance.pcfx</string>
+		<string>com.provenance.sgfx</string>
+		<string>com.provenance.vb</string>
+		<string>com.provenance.ws</string>
+		<string>com.provenance.wsc</string>
+		<string>com.provenance.nes</string>
+		<string>com.provenance.fds</string>
+		<string>com.provenance.snes</string>
+		<string>com.provenance.gb</string>
+		<string>com.provenance.gbc</string>
+		<string>com.provenance.gba</string>
+	</array>
+	<key>PVProjectURL</key>
+	<string>https://mednafen.github.io</string>
+	<key>PVProjectVersion</key>
+	<string>1.32.1</string>
+	<key>PVCapabilities</key>
+	<array>
+		<string>highAccuracy</string>
+		<string>cdAudio</string>
+		<string>subChannelAudio</string>
+		<string>multitapSupport</string>
+		<string>lightgunSupport</string>
+		<string>cheats</string>
+		<string>retroAchievements</string>
+	</array>
+	<key>PVLicenseName</key>
+	<string>GPL-2.0-or-later</string>
+	<key>PVLicenseURL</key>
+	<string>https://mednafen.github.io/documentation/</string>
+	<key>PVCopyright</key>
+	<string>Copyright © 2005-2024 Mednafen Team</string>
+</dict>
+</plist>

@@ -1,0 +1,343 @@
+{
+ "schema": 3,
+ "nowMs": 1788520060000,
+ "requestHeaders": {
+  "X-Relay-Sync-Schema": "3"
+ },
+ "note": "Synthetic deterministic custom-cover (artwork) vectors; each case uses an isolated account. ownedCovers lists the images the account must already own through game_artwork references (the real flow uploads them first). expected.cover is the surviving cover fingerprint, null for a reset, and absent means no value was stored. Order: greatest (updatedAt, artworkFingerprint or empty string).",
+ "cases": [
+  {
+   "name": "later-cover-wins",
+   "ownedCovers": [
+    {
+     "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+     "size": 60000
+    },
+    {
+     "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "cover": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+     "size": 60000
+    }
+   ],
+   "operations": [
+    {
+     "operationId": "10000000-0000-4000-8000-000000000100",
+     "schema": 3,
+     "kind": "game",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "systemID": "gba",
+      "title": "Example Game",
+      "isFavorite": false,
+      "addedAt": 1788520000000,
+      "updatedAt": 1788520000000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000101",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520002000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000102",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "artworkSize": 60000
+     }
+    }
+   ],
+   "expectedStatuses": [
+    "applied",
+    "applied",
+    "duplicate"
+   ],
+   "expected": {
+    "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+   }
+  },
+  {
+   "name": "later-reset-wins",
+   "ownedCovers": [
+    {
+     "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+     "size": 60000
+    }
+   ],
+   "operations": [
+    {
+     "operationId": "10000000-0000-4000-8000-000000000103",
+     "schema": 3,
+     "kind": "game",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "systemID": "gba",
+      "title": "Example Game",
+      "isFavorite": false,
+      "addedAt": 1788520000000,
+      "updatedAt": 1788520000000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000104",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000105",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "delete",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520002000,
+      "installationID": "30000000-0000-4000-8000-000000000001"
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000106",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001500,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    }
+   ],
+   "expectedStatuses": [
+    "applied",
+    "applied",
+    "applied",
+    "duplicate"
+   ],
+   "expected": {
+    "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cover": null
+   }
+  },
+  {
+   "name": "tie-breaks-by-fingerprint-and-a-cover-beats-a-reset",
+   "ownedCovers": [
+    {
+     "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+     "size": 60000
+    },
+    {
+     "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "cover": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+     "size": 60000
+    }
+   ],
+   "operations": [
+    {
+     "operationId": "10000000-0000-4000-8000-000000000107",
+     "schema": 3,
+     "kind": "game",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "systemID": "gba",
+      "title": "Example Game",
+      "isFavorite": false,
+      "addedAt": 1788520000000,
+      "updatedAt": 1788520000000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000108",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "delete",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001"
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-000000000109",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010a",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "artworkSize": 60000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010b",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    }
+   ],
+   "expectedStatuses": [
+    "applied",
+    "applied",
+    "applied",
+    "applied",
+    "duplicate"
+   ],
+   "expected": {
+    "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cover": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+   }
+  },
+  {
+   "name": "waits-for-its-game",
+   "ownedCovers": [
+    {
+     "game": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+     "size": 60000
+    }
+   ],
+   "operations": [
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010c",
+     "schema": 3,
+     "kind": "artwork",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001",
+      "artworkFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "artworkSize": 60000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010d",
+     "schema": 3,
+     "kind": "game",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "generation": 0,
+      "systemID": "gba",
+      "title": "Example Game",
+      "isFavorite": false,
+      "addedAt": 1788520000000,
+      "updatedAt": 1788520000000
+     }
+    }
+   ],
+   "expectedStatuses": [
+    "deferred",
+    "applied"
+   ],
+   "expected": {
+    "game": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cover": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+   }
+  },
+  {
+   "name": "operation-schema-must-match-negotiation",
+   "ownedCovers": [],
+   "operations": [
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010e",
+     "schema": 3,
+     "kind": "game",
+     "action": "upsert",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "systemID": "gba",
+      "title": "Example Game",
+      "isFavorite": false,
+      "addedAt": 1788520000000,
+      "updatedAt": 1788520000000
+     }
+    },
+    {
+     "operationId": "10000000-0000-4000-8000-00000000010f",
+     "schema": 2,
+     "kind": "artwork",
+     "action": "delete",
+     "object": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "generation": 0,
+      "updatedAt": 1788520001000,
+      "installationID": "30000000-0000-4000-8000-000000000001"
+     }
+    }
+   ],
+   "expectedStatuses": [
+    "applied",
+    "rejected"
+   ],
+   "expected": {
+    "game": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "absent": true
+   }
+  }
+ ]
+}

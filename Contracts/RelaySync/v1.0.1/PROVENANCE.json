@@ -1,0 +1,13 @@
+{
+  "protocolVersion": "1.0.1",
+  "apiMajor": 1,
+  "semanticSchema": 1,
+  "sourceCommit": "34643ca0a079e2133c6023635afb3feee9795add",
+  "sourceManifestSHA256": "b9fad721037815597a6e3ebf6dd0d72b7928f234218896a3406ab7b59c9ed078",
+  "snapshotKind": "public-client-projection",
+  "licensing": "Licence metadata is retained in openapi.yaml.",
+  "transformations": {
+    "VERSION.json": "Documentation metadata omitted; functional structures retained.",
+    "openapi.yaml": "Documentation metadata omitted; functional structures retained."
+  }
+}

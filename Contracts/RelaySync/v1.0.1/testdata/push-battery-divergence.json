@@ -1,0 +1,59 @@
+{
+  "scenario": "two installations create divergent children from revision A",
+  "prerequisites": {
+    "gameFingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "parentRevisionID": "20000000-0000-4000-8000-00000000000a",
+    "ownedPayloadReferences": [
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    ]
+  },
+  "pushes": [
+    {
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000001",
+      "request": {
+        "operations": [
+          {
+            "operationId": "10000000-0000-4000-8000-000000000001",
+            "schema": 1,
+            "kind": "battery_revision",
+            "action": "upsert",
+            "object": {
+              "revisionID": "20000000-0000-4000-8000-00000000000b",
+              "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "parentIDs": ["20000000-0000-4000-8000-00000000000a"],
+              "createdAt": 1788520002000,
+              "dataFingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "dataSize": 32768,
+              "installationID": "30000000-0000-4000-8000-000000000001",
+              "deviceKind": "mac"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "request": {
+        "operations": [
+          {
+            "operationId": "10000000-0000-4000-8000-000000000002",
+            "schema": 1,
+            "kind": "battery_revision",
+            "action": "upsert",
+            "object": {
+              "revisionID": "20000000-0000-4000-8000-00000000000c",
+              "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "parentIDs": ["20000000-0000-4000-8000-00000000000a"],
+              "createdAt": 1788520003000,
+              "dataFingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "dataSize": 32768,
+              "installationID": "30000000-0000-4000-8000-000000000002",
+              "deviceKind": "iphone"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

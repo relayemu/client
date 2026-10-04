@@ -1,0 +1,1596 @@
+//
+//  HomeView.swift
+//  Provenance
+//
+//  Created by Ian Clawson on 1/22/22.
+//  Copyright 2022 Provenance Emu. All rights reserved.
+//
+
+#if canImport(SwiftUI)
+import Foundation
+import SwiftUI
+import RealmSwift
+import PVLibrary
+import PVThemes
+import Combine
+import PVUIBase
+import PVWebServer
+#if canImport(UIKit)
+import UIKit
+#endif
+#if canImport(FreemiumKit)
+import FreemiumKit
+#endif
+
+@available(iOS 14, tvOS 14, *)
+// HomeView's body is 1128 lines against a 600-line limit. It was already 1124
+// lines on develop — pre-existing debt, not introduced by the keyboard-navigation
+// or desktop-layout work. Splitting it into per-section subviews is a separate,
+// larger change. Remove this disable when that split happens.
+// swiftlint:disable:next type_body_length
+struct HomeView: SwiftUI.View {
+
+    //    var gameLibrary: PVGameLibrary<RealmDatabaseDriver>!
+
+    weak var rootDelegate: PVRootDelegate?
+    @ObservedObject var viewModel: PVRootViewModel
+    var showGameInfo: (String) -> Void
+
+    @Default(.showRecentSaveStates) private var showRecentSaveStates
+    @Default(.showRecentGames) private var showRecentGames
+    @Default(.showSearchbar) private var showSearchbar
+    @Default(.showFavorites) private var showFavorites
+    @Default(.showAutoSavesInRecents) private var showAutoSavesInRecents
+    @Default(.iCloudSync) private var iCloudSyncEnabled
+
+    // Import status view properties
+    @State private var showImportStatusView = false
+
+    // Modal state for log viewer and system status
+    @State private var showLogViewer = false
+    @State private var showSystemStatus = false
+
+    @ObservedResults(
+        PVSaveState.self,
+        filter: NSPredicate(format: "game != nil && game.system != nil"),
+        sortDescriptor: SortDescriptor(keyPath: #keyPath(PVSaveState.date), ascending: false)
+    ) var recentSaveStates
+
+    /// Manages game-related Realm observations on a background queue,
+    /// publishing immutable snapshots to avoid excessive SwiftUI invalidation.
+    /// Fixes #3184: HomeView flickering/reloading caused by multiple @ObservedResults.
+    @StateObject private var homeViewModel: HomeViewModel
+
+    // Convenience accessors matching old @ObservedResults names for minimal diff.
+    private var recentlyPlayedGames: [GameCellModel] { homeViewModel.recentlyPlayedModels }
+    private var favorites: [GameCellModel] { homeViewModel.favoritesModels }
+    private var mostPlayed: [GameCellModel] { homeViewModel.mostPlayedModels }
+    private var allGames: [GameCellModel] { homeViewModel.allGamesModels }
+
+    @State private var gamepadCancellable: AnyCancellable?
+
+    @State private var focusedSection: HomeSectionType?
+    @State private var focusedItemInSection: String?
+
+    @State private var continuousNavigationTask: Task<Void, Never>?
+    @State private var delayTask: Task<Void, Never>?
+
+    @State private var isControllerConnected: Bool = false
+
+    /// GameContextMenuDelegate
+    @State internal var showImagePicker = false
+    @State internal var showArtworkSearch = false
+    @State internal var selectedImage: UIImage?
+    @State internal var gameToUpdateCover: PVGame?
+    @State internal var showingRenameAlert = false
+    @State internal var gameToRename: PVGame?
+    @State internal var newGameTitle = ""
+    @FocusState internal var renameTitleFieldIsFocused: Bool
+    @State internal var systemMoveState: SystemMoveState?
+    @State internal var continuesManagementState: ContinuesManagementState?
+    @State private var showAllSavesBrowser = false
+
+    @State private var showArtworkSourceAlert = false
+
+    @State private var discSelectionAlert: DiscSelectionAlert?
+
+    @State private var searchText = ""
+
+
+    init(
+        gameLibrary: PVGameLibrary<RealmDatabaseDriver>? = nil,
+        delegate: PVRootDelegate? = nil,
+        viewModel: PVRootViewModel,
+        showGameInfo: @escaping (String) -> Void
+    ) {
+        //        self.gameLibrary = gameLibrary
+        self.rootDelegate = delegate
+        self.viewModel = viewModel
+        self.showGameInfo = showGameInfo
+        self._homeViewModel = StateObject(wrappedValue: HomeViewModel(sortAscending: viewModel.sortGamesAscending))
+
+    }
+
+    @ObservedObject private var themeManager = ThemeManager.shared
+    @ObservedObject private var bootupStateManager = AppState.shared.bootupStateManager
+
+    /// Maximum number of recent save states scanned for the Recent Saves carousel.
+    /// Caps the O(n) deduplication pass to avoid scanning unbounded Realm result sets
+    /// when autosaves accumulate (the carousel can only display a fixed number of items).
+    private static let recentSaveStateScanLimit = 100
+
+    /// Save state IDs for Recent Saves carousel navigation.
+    /// When showAutoSavesInRecents is false (default), deduplicates timed autosaves:
+    /// at most one (the latest) autosave per game is included to prevent flooding.
+    /// Manual saves are always included. Mirrors the filter in RealmContinuesDataDriver.
+    /// Only the first `recentSaveStateScanLimit` records are examined to bound the cost
+    /// of repeated calls from gamepad navigation helpers.
+    private var recentSaveStateIDs: [String] {
+        let window = recentSaveStates.prefix(Self.recentSaveStateScanLimit)
+        if showAutoSavesInRecents {
+            return window.compactMap { $0.isInvalidated ? nil : $0.id }
+        }
+        var seenAutoSaveGameIDs = Set<String>()
+        return window.compactMap { state -> String? in
+            guard !state.isInvalidated else { return nil }
+            if state.isAutosave {
+                let gameID = state.game?.id ?? ""
+                guard !gameID.isEmpty, seenAutoSaveGameIDs.insert(gameID).inserted else {
+                    return nil
+                }
+            }
+            return state.id
+        }
+    }
+
+    private var availableSections: [HomeSectionType] {
+        [
+            (showRecentSaveStates && !recentSaveStateIDs.isEmpty) ? .recentSaveStates : nil,
+            (showRecentGames && !recentlyPlayedGames.isEmpty) ? .recentlyPlayedGames : nil,
+            (showFavorites && !favorites.isEmpty) ? .favorites : nil,
+            !mostPlayed.isEmpty ? .mostPlayed : nil,
+            !allGames.isEmpty ? .allGames : nil
+        ].compactMap { $0 }
+    }
+
+    private var isLibraryCompletelyEmpty: Bool {
+        // If the view model arrays are populated, trust them.
+        guard allGames.isEmpty,
+              recentlyPlayedGames.isEmpty,
+              favorites.isEmpty,
+              mostPlayed.isEmpty,
+              recentSaveStates.isEmpty
+        else { return false }
+
+        // View model observations are async and may not have delivered yet.
+        // Fall back to a synchronous Realm count (O(1)) to avoid briefly
+        // flashing the empty-state CloudSyncUpsellView while data loads.
+        if let realm = try? Realm(),
+           realm.objects(PVGame.self).count > 0 {
+            return false
+        }
+        return true
+    }
+
+    var body: some SwiftUI.View {
+        StatusBarProtectionWrapper {
+            VStack(spacing: 0) {
+                // `desktopLibraryContentColumn()` is identity off-Mac; on a desktop window it
+                // clamps + centers each band so the toolbar, import panel and scroll content
+                // all share one content column instead of stretching edge to edge.
+                displayOptionsView()
+                    .desktopLibraryContentColumn()
+
+                // Import Progress View
+                ImportProgressView(
+                    gameImporter: AppState.shared.gameImporter ?? GameImporter.shared,
+                    updatesController: AppState.shared.libraryUpdatesController!,
+                    onTap: {
+                        withAnimation {
+                            showImportStatusView = true
+                        }
+                    }
+                )
+                .desktopLibraryContentColumn()
+
+                ScrollView {
+                    ScrollViewReader { proxy in
+                        LazyVStack {
+                            // Search bar inside scroll — no auto-hide, just scrolls with content
+                            if allGames.count > 8 && showSearchbar {
+                                PVSearchBar(text: $searchText)
+                                    // Desktop aligns the field to the same gutter as the
+                                    // shelves and grid; touch keeps its wider 16pt inset.
+                                    .padding(.horizontal, DesktopLibraryMetrics.isDesktop ? DesktopLibraryMetrics.columnGutter : 16)
+                                    .padding(.bottom, 8)
+                            }
+                            if bootupStateManager.isBootupCompleted && isLibraryCompletelyEmpty {
+                                cloudSyncUpsell()
+                                    .padding(.horizontal)
+                            } else if !iCloudSyncEnabled && CloudSyncUpsellView.detectCachedCloudData() {
+                                cloudSyncUpsell()
+                                    .padding(.horizontal)
+                                    .padding(.vertical, 4)
+                            }
+                            continuesSection()
+                                .id("section_continues")
+                            favoritesSection()
+                                .id("section_favorites")
+                            recentlyPlayedSection()
+                                .id("section_recent")
+                            mostPlayedSection()
+                            if viewModel.viewGamesAsGrid {
+                                showGamesGrid(allGames)
+                                    .id("section_allgames")
+                            } else {
+                                showGamesList(allGames)
+                                    .id("section_allgames")
+                            }
+                        }
+                        .desktopLibraryContentColumn()
+                        .onChange(of: focusedItemInSection) { newValue in
+                            if let id = newValue {
+                                withAnimation(.easeInOut(duration: 0.3)) {
+                                    proxy.scrollTo(id, anchor: .center)
+                                }
+                            }
+                        }
+                    }
+                }
+                .overlay(
+                    Group {
+                        if !searchText.isEmpty {
+                            ScrollView {
+                                searchResultsView()
+                                    .desktopLibraryContentColumn()
+                            }
+                            .background(themeManager.currentPalette.gameLibraryBackground.swiftUIColor)
+                        }
+                    }
+                )
+            }
+            .background(themeManager.currentPalette.gameLibraryBackground.swiftUIColor)
+            .padding(.bottom, 64)
+        }
+        .background {
+            RetroTheme.RetroBackgroundView()
+                .environmentObject(themeManager)
+        }
+        .onAppear {
+            adjustZoomLevel(for: gameLibraryScale)
+            setupGamepadHandling()
+            homeViewModel.sortAscending = viewModel.sortGamesAscending
+
+            // Check initial controller connection state
+            isControllerConnected = GamepadManager.shared.isControllerConnected
+
+            if isControllerConnected {
+                setInitialFocus()
+            }
+
+            // Consume any pending search action from LibraryNavigator (covers cold-launch).
+            consumePendingSearch()
+        }
+        .onChange(of: viewModel.sortGamesAscending) { newValue in
+            homeViewModel.sortAscending = newValue
+        }
+        .onChange(of: GamepadManager.shared.isControllerConnected) { isConnected in
+            isControllerConnected = isConnected
+            if isConnected {
+                setInitialFocus()
+            }
+        }
+        .task {
+            // Set initial focus
+            if let firstSection = [
+                showRecentSaveStates && !recentSaveStateIDs.isEmpty ? HomeSectionType.recentSaveStates : nil,
+                showRecentGames && !recentlyPlayedGames.isEmpty ? .recentlyPlayedGames : nil,
+                showFavorites && !favorites.isEmpty ? .favorites : nil,
+                !allGames.isEmpty ? .allGames : nil
+            ].compactMap({ $0 }).first {
+                focusedSection = firstSection
+                focusedItemInSection = getFirstItemInSection(firstSection)
+            }
+        }
+        .onDisappear {
+            delayTask?.cancel()
+            continuousNavigationTask?.cancel()
+            gamepadCancellable?.cancel()
+        }
+        .onChange(of: focusedSection) { newValue in
+            DLOG("Focus changed to section: \(String(describing: newValue))")
+        }
+        .onChange(of: focusedItemInSection) { newValue in
+            DLOG("Focus changed to item: \(String(describing: newValue))")
+        }
+        /// GameContextMenuDelegate
+        /// TODO: This is an ugly copy/paste from `ConsolesGameView.swift`
+        // Import Status View
+        .fullScreenCover(isPresented: $showImportStatusView) {
+            ImportStatusView(
+                updatesController: AppState.shared.libraryUpdatesController!,
+                gameImporter: AppState.shared.gameImporter ?? GameImporter.shared,
+                delegate: rootDelegate as? ImportStatusDelegate,
+                dismissAction: {
+                    withAnimation {
+                        showImportStatusView = false
+                    }
+                }
+            )
+        }
+        // Log Viewer Modal
+        .fullScreenCover(isPresented: $showLogViewer) {
+            RetroLogView(isFullscreen: $showLogViewer)
+        }
+        // System Status Modal
+        .fullScreenCover(
+            isPresented: Binding(
+                get: {
+                    #if os(tvOS)
+                    false
+                    #else
+                    showSystemStatus && UIDevice.current.userInterfaceIdiom == .pad
+                    #endif
+                },
+                set: { newValue in
+                    if !newValue {
+                        showSystemStatus = false
+                    }
+                }
+            )
+        ) {
+            NavigationStack {
+                ScrollView {
+                    RetroStatusControlView()
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                }
+                .navigationTitle("System Status")
+                #if !os(tvOS)
+                .navigationBarTitleDisplayMode(.inline)
+                #endif
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") {
+                            showSystemStatus = false
+                        }
+                        .foregroundColor(RetroTheme.retroPink)
+                    }
+                }
+            }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: {
+                    #if os(tvOS)
+                    showSystemStatus
+                    #else
+                    showSystemStatus && UIDevice.current.userInterfaceIdiom != .pad
+                    #endif
+                },
+                set: { newValue in
+                    if !newValue {
+                        showSystemStatus = false
+                    }
+                }
+            )
+        ) {
+            NavigationStack {
+                ScrollView {
+                    RetroStatusControlView()
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                }
+                .navigationTitle("System Status")
+                #if !os(tvOS)
+                .navigationBarTitleDisplayMode(.inline)
+                #endif
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") {
+                            showSystemStatus = false
+                        }
+                        .foregroundColor(RetroTheme.retroPink)
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showImagePicker) {
+#if !os(tvOS)
+            ImagePicker(sourceType: .photoLibrary) { image in
+                if let game = gameToUpdateCover {
+                    saveArtwork(image: image, forGame: game)
+                }
+                showImagePicker = false
+                gameToUpdateCover = nil
+            }
+#endif
+        }
+        .sheet(isPresented: $showArtworkSearch) {
+            ArtworkSearchView(
+                initialSearch: gameToUpdateCover?.title ?? "",
+                initialSystem: gameToUpdateCover?.system?.enumValue ?? SystemIdentifier.Unknown
+            ) { selection in
+                if let game = gameToUpdateCover {
+                    Task {
+                        do {
+                            // Load image data from URL
+                            let (data, _) = try await URLSession.shared.data(from: selection.metadata.url)
+                            if let uiImage = UIImage(data: data) {
+                                await MainActor.run {
+                                    saveArtwork(image: uiImage, forGame: game)
+                                    showArtworkSearch = false
+                                    gameToUpdateCover = nil
+                                }
+                            }
+                        } catch {
+                            DLOG("Failed to load artwork image: \(error)")
+                        }
+                    }
+                }
+            }
+        }
+        .uiKitAlert(
+            "Rename Game",
+            message: "Enter a new name for \(gameToRename?.title ?? "")",
+            isPresented: $showingRenameAlert,
+            textValue: newGameTitleBinding,
+            preferredContentSize: CGSize(width: 300, height: 200),
+            textField: { textField in
+                textField.placeholder = "Game name"
+                textField.clearButtonMode = .whileEditing
+                textField.autocapitalizationType = .words
+            }
+        ) {
+            [
+                UIAlertAction(title: "Save", style: .default) { _ in
+                    submitRename()
+                    gameToRename = nil
+                    newGameTitle = ""
+                    showingRenameAlert = false
+                },
+                UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    showingRenameAlert = false
+                    gameToRename = nil
+                    newGameTitle = ""
+                    showingRenameAlert = false
+                }
+            ]
+        }
+        .sheet(isPresented: $showAllSavesBrowser) {
+            NavigationView {
+                AllSaveStatesBrowserView(rootDelegate: rootDelegate)
+            }
+            .navigationViewStyle(.stack)
+        }
+        .sheet(item: $systemMoveState) { state in
+            SystemPickerView(
+                game: state.game,
+                isPresented: Binding(
+                    get: { state.isPresenting },
+                    set: { newValue in
+                        if !newValue {
+                            systemMoveState = nil
+                        }
+                    }
+                )
+            )
+        }
+        .sheet(item: $continuesManagementState) { state in
+            let game = state.game.warmUp()
+            let realm = game.realm?.thaw() ?? RomDatabase.sharedInstance.realm
+            /// Create the Realm driver
+            if let driver = try? RealmSaveStateDriver(realm: realm) {
+
+                /// Create view model
+                let viewModel = ContinuesMagementViewModel(
+                    driver: driver,
+                    gameTitle: game.title,
+                    systemTitle: game.system?.name ?? "",
+                    numberOfSaves: game.saveStates.count,
+                    onLoadSave: { saveID in
+                        continuesManagementState = nil
+                        Task.detached {
+                            Task { @MainActor in
+                                let realm = RomDatabase.sharedInstance.realm
+                                guard let saveState = realm.object(ofType: PVSaveState.self, forPrimaryKey: saveID) else {
+                                    SceneCoordinator.shared.alertState.show(
+                                        title: "Failed to Load Save State",
+                                        message: "Save state with id: \(saveID) not found",
+                                        type: .error
+                                    )
+                                    return
+                                }
+                                SceneCoordinator.shared.launchSaveState(saveState.freeze())
+                            }
+                        }
+                    })
+
+                /// Create and configure the view
+                if #available(iOS 16.4, tvOS 16.4, *) {
+                    ContinuesManagementView(viewModel: viewModel)
+                        .onAppear {
+                            /// Set the game ID filter
+                            driver.gameId = game.id
+
+                            let game = game.freeze()
+                            Task { @MainActor in
+                                let image: UIImage? = await game.fetchArtworkFromCache()
+                                viewModel.gameUIImage = image
+                            }
+                        }
+                        .presentationBackground(content: {Color.clear})
+                } else {
+                    ContinuesManagementView(viewModel: viewModel)
+                        .onAppear {
+                            /// Set the game ID filter
+                            driver.gameId = game.id
+
+                            let game = game.freeze()
+                            Task { @MainActor in
+                                let image: UIImage? = await game.fetchArtworkFromCache()
+                                viewModel.gameUIImage = image
+                            }
+                        }
+                }
+            } else {
+                Text(String(localized: "Error: Could not load save states"))
+            }
+        }
+
+        .uiKitAlert(
+            String(localized: "Select Disc"),
+            message: String(localized: "Choose which disc to load"),
+            isPresented: Binding(
+                get: { discSelectionAlert != nil },
+                set: { if !$0 { discSelectionAlert = nil } }
+            ),
+            preferredContentSize: CGSize(width: 500, height: 300)
+        ) {
+            if let alert = discSelectionAlert, let game = alert.game {
+                let actions = alert.discs.map { (disc: DiscSelectionAlert.Disc) -> UIAlertAction in
+                    UIAlertAction(title: disc.fileName, style: .default) { _ in
+                        Task { @MainActor in
+                            SceneCoordinator.shared.launchGame(game.freeze(), discPath: disc.path, core: nil, saveState: nil)
+                        }
+                    }
+                }
+
+                actions + [UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel"), style: .cancel)]
+            } else {
+                [UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel"), style: .cancel)]
+            }
+        }
+        .uiKitAlert(
+            "Choose Artwork Source",
+            message: "Select artwork from your photo library or search online sources",
+            isPresented: $showArtworkSourceAlert,
+            buttons: {
+                UIAlertAction(title: "Select from Photos", style: .default) { _ in
+                    showArtworkSourceAlert = false
+                    showImagePicker = true
+                }
+                UIAlertAction(title: "Search Online", style: .default) { [game = gameToUpdateCover] _ in
+                    showArtworkSourceAlert = false
+                    gameToUpdateCover = game
+                    showArtworkSearch = true
+                }
+                UIAlertAction(title: NSLocalizedString("Cancel", comment: "Cancel"), style: .cancel) { _ in
+                    showArtworkSourceAlert = false
+                }
+            }
+        )
+        .onReceive(LibraryNavigator.shared.$pendingAction) { _ in
+            // Hot-launch / foreground Siri handoff: ConsolesWrapperView switches the
+            // tab in the SAME render pass.  Delay the search population by one tab-
+            // animation duration (~0.35 s) so the overlay appears after the page
+            // transition settles rather than mid-animation over the wrong tab.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                consumePendingSearch()
+            }
+        }
+        // ROM drag & drop import — iOS/iPadOS/macCatalyst only (#3406)
+#if os(iOS)
+        .romDropTarget()
+#endif
+    }
+
+    @ViewBuilder
+    private func cloudSyncUpsell() -> some View {
+        CloudSyncUpsellView(
+            hasCachedCloudData: CloudSyncUpsellView.detectCachedCloudData(),
+            onOpenSettings: {
+                SettingsNavigator.shared.navigate(to: .cloudSync)
+                NotificationCenter.default.post(name: NSNotification.Name("PVShowSettings"), object: nil)
+            },
+            onUpgrade: {
+                SettingsNavigator.shared.navigate(to: .cloudSync)
+                NotificationCenter.default.post(name: NSNotification.Name("PVShowSettings"), object: nil)
+            }
+        )
+    }
+
+    /// Consume any pending `.search` action from `LibraryNavigator` and populate
+    /// the search field. Called from both `.onAppear` (cold-launch) and
+    /// `.onReceive(LibraryNavigator.shared.$pendingAction)` (hot-launch / foreground handoff).
+    private func consumePendingSearch() {
+        LibraryNavigator.shared.consumeSearch { query in
+            searchText = query
+        }
+    }
+
+    private func setupGamepadHandling() {
+        gamepadCancellable = GamepadManager.shared.eventPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { event in
+                guard !viewModel.isMenuVisible else {
+                    DLOG("🎮 HomeView: Ignoring input - menu visible")
+                    return
+                }
+                // Don't let HomeView consume A / d-pad while a full-screen
+                // retrowave alert (core picker, save-state picker, imports
+                // popover, etc.) is presented above it.
+                if GamepadManager.shared.isModalAlertPresented {
+                    return
+                }
+
+                DLOG("🎮 HomeView: Received event: \(event)")
+
+                switch event {
+                case .buttonPress(true):
+                    DLOG("🎮 HomeView: Button press detected")
+                    handleButtonPress()
+                case .verticalNavigation(let value, true):
+                    DLOG("🎮 HomeView: Vertical navigation: \(value)")
+                    DLOG("🎮 HomeView: Current section: \(String(describing: focusedSection))")
+                    DLOG("🎮 HomeView: Current item: \(String(describing: focusedItemInSection))")
+                    DLOG("🎮 HomeView: Available sections: \(availableSections)")
+                    handleVerticalNavigation(value)
+                case .horizontalNavigation(let value, true):
+                    DLOG("🎮 HomeView: Horizontal navigation: \(value)")
+                    handleHorizontalNavigation(value)
+                default:
+                    break
+                }
+            }
+    }
+
+    @Default(.gameLibraryScale) internal var gameLibraryScale
+    @State internal var gameLibraryItemsPerRow: Int = 4
+    private func adjustZoomLevel(for magnification: Float) {
+        gameLibraryItemsPerRow = calculatedZoomLevel(for: magnification)
+    }
+
+    private func calculatedZoomLevel(for magnification: Float) -> Int {
+        let isIPad = UIDevice.current.userInterfaceIdiom == .pad
+        let defaultZoomLevel = isIPad ? 8 : 4
+
+        // Handle invalid magnification values
+        guard !magnification.isNaN && !magnification.isInfinite else {
+            return defaultZoomLevel
+        }
+
+        // Calculate the target zoom level based on magnification
+        let targetZoomLevel = Float(defaultZoomLevel) / magnification
+
+        // Round to the nearest even number
+        let roundedZoomLevel = round(targetZoomLevel / 2) * 2
+
+        // Clamp the value between 2 and 16
+        let clampedZoomLevel = max(2, min(16, roundedZoomLevel))
+
+        return Int(clampedZoomLevel)
+    }
+
+    var itemsPerRow: Int {
+        let roundedScale = Int(gameLibraryScale.rounded())
+        // If games is less than count, just use the games to fill the row.
+        // also don't go below 0
+        let count: Int
+        if AppState.shared.isSimulator {
+            count = max(0,roundedScale )
+        } else {
+            count = min(max(0, roundedScale), allGames.count)
+        }
+        return max(1, count)
+    }
+
+
+    private func handleMenuToggle() {
+        // Implement menu toggle logic here
+        DLOG("Menu toggle requested")
+    }
+
+    @ViewBuilder
+    private func displayOptionsView() -> some View {
+        GamesDisplayOptionsView(
+            viewModel: viewModel,
+            showImportStatusView: $showImportStatusView,
+            importStatusAction: {
+                withAnimation {
+                    showImportStatusView = true
+                }
+            },
+            logViewerAction: {
+                showLogViewer = true
+            },
+            systemStatusAction: {
+                showSystemStatus = true
+            },
+            settingsAction: {
+                // TODO: This is a hack, we should use the delegate
+                // Use NotificationCenter to trigger settings
+                NotificationCenter.default.post(name: NSNotification.Name("PVShowSettings"), object: nil)
+            },
+            settingsContext: .home,
+            toggleFilterAction: { self.rootDelegate?.showUnderConstructionAlert() },
+            toggleSortAction: {
+                viewModel.sortGamesAscending.toggle()
+                homeViewModel.sortAscending = viewModel.sortGamesAscending
+            },
+            toggleViewTypeAction: { viewModel.viewGamesAsGrid.toggle() }
+        )
+        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
+        .retroPausePanelBackground(isDark: themeManager.currentPalette.dark)
+        .clipShape(RoundedRectangle(cornerRadius: RetroPauseChrome.panelCornerRadius))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func showGamesList(_ games: [GameCellModel]) -> some View {
+        LazyVStack(spacing: 8) {
+            ForEach(games, id: \.id) { model in
+                GameItemPresentableView(
+                    game: model,
+                    constrainHeight: true,
+                    viewType: .row,
+                    sectionContext: .allGames,
+                    isFocused: Binding(
+                        get: {
+                            focusedSection == .allGames &&
+                            focusedItemInSection == model.id
+                        },
+                        set: {
+                            if $0 {
+                                focusedSection = .allGames
+                                focusedItemInSection = model.id
+                            }
+                        }
+                    )
+                ) {
+                    launchGame(md5: model.md5)
+                }
+#if os(iOS)
+                .romDragSource(gameMD5: model.md5)
+#endif
+                .contextMenu {
+                    if let live = liveGame(for: model) {
+                        GameContextMenu(game: live, rootDelegate: rootDelegate, contextMenuDelegate: self)
+                    }
+                }
+                #if os(iOS)
+                .saveStateDropTarget(gameId: model.md5)
+                #endif
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func showGamesGrid(_ games: [GameCellModel]) -> some View {
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: itemsPerRow)
+
+        LazyVGrid(columns: columns, spacing: 10) {
+            ForEach(games, id: \.id) { model in
+                GameItemPresentableView(
+                    game: model,
+                    constrainHeight: true,
+                    viewType: .cell,
+                    sectionContext: .allGames,
+                    isFocused: Binding(
+                        get: {
+                            focusedSection == .allGames &&
+                            focusedItemInSection == model.id
+                        },
+                        set: {
+                            if $0 {
+                                focusedSection = .allGames
+                                focusedItemInSection = model.id
+                            }
+                        }
+                    )
+                ) {
+                    launchGame(md5: model.md5)
+                }
+                .focusableIfAvailable()
+#if os(iOS)
+                .romDragSource(gameMD5: model.md5)
+#endif
+                .contextMenu {
+                    if let live = liveGame(for: model) {
+                        GameContextMenu(game: live, rootDelegate: rootDelegate, contextMenuDelegate: self)
+                    }
+                }
+                #if os(iOS)
+                .saveStateDropTarget(gameId: model.md5)
+                #endif
+            }
+        }
+        .padding(.horizontal, 10)
+    }
+
+    // MARK: - Realm resolution helpers
+
+    /// Resolve a live `PVGame` from the main-thread Realm by MD5.
+    /// Tries the raw casing first, then uppercase and lowercase variants.
+    @MainActor
+    private func resolveGame(md5: String) -> PVGame? {
+        let realm = RomDatabase.sharedInstance.realm
+        var seen = Set<String>()
+        for key in [md5, md5.uppercased(), md5.lowercased()] where seen.insert(key).inserted {
+            if let game = realm.object(ofType: PVGame.self, forPrimaryKey: key) {
+                return game
+            }
+        }
+        return nil
+    }
+
+    /// Resolve a live `PVGame` from the main-thread Realm for a snapshot model.
+    private func liveGame(for model: GameCellModel) -> PVGame? {
+        resolveGame(md5: model.md5)
+    }
+
+    /// Launch a game by MD5, resolving the Realm object on the main thread.
+    func launchGame(md5: String) {
+        Task { @MainActor in
+            guard let game = resolveGame(md5: md5) else {
+                WLOG("HomeView: could not resolve PVGame for md5 '\(md5)' — object may have been deleted")
+                return
+            }
+            SceneCoordinator.shared.launchGame(game.freeze())
+        }
+    }
+
+    // MARK: - GamepadNavigationDelegate
+
+    func handleButtonPress() {
+        guard let section = focusedSection,
+              let itemId = focusedItemInSection else { return }
+
+        switch section {
+        case .recentSaveStates:
+            if let saveState = recentSaveStates.first(where: { $0.id == itemId }) {
+                Task { @MainActor in
+                    SceneCoordinator.shared.launchSaveState(saveState.freeze(), core: saveState.core?.freeze())
+                }
+            }
+        case .recentlyPlayedGames:
+            if let model = recentlyPlayedGames.first(where: { $0.id == itemId }) {
+                launchGame(md5: model.md5)
+            }
+        case .favorites, .mostPlayed, .allGames:
+            if let model = allGames.first(where: { $0.id == itemId }) {
+                launchGame(md5: model.md5)
+            }
+        }
+    }
+
+    private func handleVerticalNavigation(_ yValue: Float) {
+        DLOG("🎮 HomeView: Vertical navigation: \(yValue)")
+
+        guard let currentSection = focusedSection else {
+            DLOG("🎮 HomeView: No section focused, setting initial focus")
+            setInitialFocus()
+            return
+        }
+
+        // Handle navigation within current section first
+        let items = getItemsForSection(currentSection)
+        if let currentItem = focusedItemInSection,
+           let currentIndex = items.firstIndex(of: currentItem) {
+
+            if currentSection == .allGames {
+                // Grid navigation. Derive the step from the same `itemsPerRow` the
+                // `LazyVGrid` in `showGamesGrid` uses — a hardcoded guess desyncs focus
+                // from the drawn grid the moment the user changes the library zoom.
+                // In list mode there is exactly one item per row.
+                let itemsPerRow = viewModel.viewGamesAsGrid ? self.itemsPerRow : 1
+                if yValue > 0 { // Moving up
+                    let newIndex = currentIndex - itemsPerRow
+                    if newIndex >= 0 {
+                        focusedItemInSection = items[newIndex]
+                        DLOG("🎮 HomeView: Moving up in grid to index: \(newIndex)")
+                        return
+                    }
+                    // If we can't move up in the grid, try moving to previous section
+                    if let prevSection = getPreviousSection(from: currentSection) {
+                        focusedSection = prevSection
+                        focusedItemInSection = getLastItemInSection(prevSection)
+                        DLOG("🎮 HomeView: Moving to previous section: \(prevSection)")
+                    }
+                } else { // Moving down
+                    let newIndex = currentIndex + itemsPerRow
+                    if newIndex < items.count {
+                        focusedItemInSection = items[newIndex]
+                        DLOG("🎮 HomeView: Moving down in grid to index: \(newIndex)")
+                    }
+                }
+            } else {
+                // Linear navigation for non-grid sections
+                handleVerticalNavigationWithinSection(currentSection, direction: yValue)
+            }
+        }
+    }
+
+    private func getPreviousSection(from currentSection: HomeSectionType) -> HomeSectionType? {
+        let sections = availableSections
+        guard let currentIndex = sections.firstIndex(of: currentSection),
+              currentIndex > 0 else { return nil }
+        return sections[currentIndex - 1]
+    }
+
+    private func getNextSection(from currentSection: HomeSectionType) -> HomeSectionType? {
+        let sections = availableSections
+        guard let currentIndex = sections.firstIndex(of: currentSection),
+              currentIndex < sections.count - 1 else { return nil }
+        return sections[currentIndex + 1]
+    }
+
+    private func handleHorizontalNavigation(_ xValue: Float) {
+        guard let section = focusedSection else { return }
+
+        let items = getItemsForSection(section)
+        guard let currentItem = focusedItemInSection,
+              let currentIndex = items.firstIndex(of: currentItem) else { return }
+
+        let newIndex = xValue < 0 ?
+        max(0, currentIndex - 1) :
+        min(items.count - 1, currentIndex + 1)
+
+        focusedItemInSection = items[newIndex]
+    }
+
+    private func isMovingToNewSection(currentSection: HomeSectionType, direction: Float) -> Bool {
+        let sections = availableSections
+        guard let currentIndex = sections.firstIndex(of: currentSection) else {
+            DLOG("Current section not found in available sections")
+            return false
+        }
+
+        if direction > 0 && currentIndex > 0 { // Moving up
+            return true
+        } else if direction < 0 && currentIndex < sections.count - 1 { // Moving down
+            return true
+        }
+
+        return false
+    }
+
+    private func getNextSection(from currentSection: HomeSectionType, direction: Float) -> HomeSectionType? {
+        let sections = availableSections
+        guard let currentIndex = sections.firstIndex(of: currentSection) else { return nil }
+
+        let newIndex = direction > 0 ?
+        currentIndex - 1 : // Moving up
+        currentIndex + 1   // Moving down
+
+        guard newIndex >= 0 && newIndex < sections.count else { return nil }
+        return sections[newIndex]
+    }
+
+    private func moveWithinSection(_ section: HomeSectionType, direction: Float) -> Bool {
+        let items = getItemsForSection(section)
+        guard let currentItem = focusedItemInSection,
+              let currentIndex = items.firstIndex(of: currentItem) else { return false }
+
+        let newIndex = direction < 0 ?
+        max(0, currentIndex - 1) :
+        min(items.count - 1, currentIndex + 1)
+
+        focusedItemInSection = items[newIndex]
+        return true
+    }
+
+    private func moveBetweenSections(_ currentSection: HomeSectionType, direction: Float) -> Bool {
+        if let nextSection = getNextSection(from: currentSection, direction: direction) {
+            let newItem = direction < 0 ?
+            getFirstItemInSection(nextSection) :
+            getLastItemInSection(nextSection)
+
+            focusedSection = nextSection
+            focusedItemInSection = newItem
+            return true
+        }
+        return false
+    }
+
+    private func isOnFirstItemInSection(_ section: HomeSectionType) -> Bool {
+        let items = getItemsForSection(section)
+        guard let currentItem = focusedItemInSection,
+              let currentIndex = items.firstIndex(of: currentItem) else { return false }
+        return currentIndex == 0
+    }
+
+    private func isOnLastItemInSection(_ section: HomeSectionType) -> Bool {
+        let items = getItemsForSection(section)
+        guard let currentItem = focusedItemInSection,
+              let currentIndex = items.firstIndex(of: currentItem) else { return false }
+        return currentIndex == items.count - 1
+    }
+
+    private func getLastItemInSection(_ section: HomeSectionType) -> String? {
+        switch section {
+        case .recentSaveStates:
+            return recentSaveStateIDs.last
+        case .recentlyPlayedGames:
+            return recentlyPlayedGames.last?.id
+        case .favorites:
+            return favorites.last?.id
+        case .mostPlayed:
+            return mostPlayed.last?.id
+        case .allGames:
+            return allGames.last?.id
+        }
+    }
+
+    private func getItemsForSection(_ section: HomeSectionType) -> [String] {
+        switch section {
+        case .recentSaveStates:
+            return recentSaveStateIDs
+        case .recentlyPlayedGames:
+            return recentlyPlayedGames.map { $0.id }
+        case .favorites:
+            return favorites.map { $0.id }
+        case .mostPlayed:
+            return mostPlayed.map { $0.id }
+        case .allGames:
+            return allGames.map { $0.id }
+        }
+    }
+
+    private func getFirstItemInSection(_ section: HomeSectionType) -> String? {
+        switch section {
+        case .recentSaveStates:
+            return recentSaveStateIDs.first
+        case .recentlyPlayedGames:
+            return recentlyPlayedGames.first?.id
+        case .favorites:
+            return favorites.first?.id
+        case .mostPlayed:
+            return mostPlayed.first?.id
+        case .allGames:
+            return allGames.first?.id
+        }
+    }
+
+    private func showOptionsMenu(for gameId: String) {
+        // Similar to ConsoleGamesView implementation
+        // Show context menu for the focused game
+    }
+
+    @ViewBuilder
+    private func continuesSection() -> some View {
+        if showRecentSaveStates {
+            VStack(alignment: .leading, spacing: 0) {
+                // Section header with title and "Show All" button
+                HStack {
+                    Text(String(localized: "RECENT SAVES"))
+                        .foregroundColor(themeManager.currentPalette.gameLibraryText.swiftUIColor.opacity(RetroPauseChrome.sectionTitleMutedOpacity))
+                        .retroPauseSectionHeaderTypography()
+                    Spacer()
+                    if !recentSaveStates.isEmpty {
+                        Button {
+                            showAllSavesBrowser = true
+                        } label: {
+                            Text(String(localized: "Show All"))
+                                .retroPauseSectionHeaderTypography()
+                                .foregroundColor(themeManager.currentPalette.defaultTintColor.swiftUIColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 20)
+                .padding(.bottom, 14)
+
+                HomeContinueSection(
+                    rootDelegate: rootDelegate,
+                    consoleIdentifier: nil,
+                    parentFocusedSection: Binding(
+                        get: { self.focusedSection },
+                        set: { self.focusedSection = $0 }
+                    ),
+                    parentFocusedItem: Binding(
+                        get: { self.focusedItemInSection },
+                        set: { self.focusedItemInSection = $0 }
+                    )
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recentlyPlayedSection() -> some View {
+        if showRecentGames {
+            HomeSection(title: String(localized: "Recently Played")) {
+                ForEach(recentlyPlayedGames, id: \.id) { model in
+                    gameItem(model, section: .recentlyPlayedGames, shelfRowHeightScale: PVCompactShelfRowHeightScale)
+                }
+            }
+            HomeDividerView()
+        }
+    }
+
+    @ViewBuilder
+    private func favoritesSection() -> some View {
+        if showFavorites {
+            HomeSection(title: String(localized: "Favorites")) {
+                ForEach(favorites, id: \.id) { model in
+                    gameItem(model, section: .favorites, shelfRowHeightScale: PVCompactShelfRowHeightScale)
+                }
+            }
+            HomeDividerView()
+        }
+    }
+
+    @ViewBuilder
+    private func mostPlayedSection() -> some View {
+        HomeSection(title: "Most Played") {
+            ForEach(mostPlayed, id: \.id) { model in
+                gameItem(model, section: .mostPlayed)
+            }
+        }
+        HomeDividerView()
+    }
+
+    /// Shared game item builder used by all horizontal carousel sections.
+    @ViewBuilder
+    private func gameItem(_ model: GameCellModel, section: HomeSectionType, shelfRowHeightScale: CGFloat = 1.0) -> some View {
+        GameItemPresentableView(
+            game: model,
+            constrainHeight: true,
+            shelfRowHeightScale: shelfRowHeightScale,
+            viewType: .cell,
+            sectionContext: section,
+            isFocused: Binding(
+                get: {
+                    focusedSection == section &&
+                    focusedItemInSection == model.id
+                },
+                set: {
+                    if $0 {
+                        focusedSection = section
+                        focusedItemInSection = model.id
+                    }
+                }
+            )
+        ) {
+            launchGame(md5: model.md5)
+        }
+        .focusableIfAvailable()
+#if os(iOS)
+        .romDragSource(gameMD5: model.md5)
+#endif
+        .contextMenu {
+            if let live = liveGame(for: model) {
+                GameContextMenu(game: live, rootDelegate: rootDelegate, contextMenuDelegate: self)
+            }
+        }
+        #if os(iOS)
+        .saveStateDropTarget(gameId: model.md5)
+        #endif
+#if !os(tvOS) && !os(watchOS)
+        .onDrag { romDragProvider(for: model) }
+#endif
+    }
+
+    // MARK: - Drag Export
+
+#if !os(tvOS) && !os(watchOS)
+    /// Resolves the live Realm game from a `GameCellModel` then delegates to the shared
+    /// `PVGame.romDragProvider()` helper for consistent iCloud-eviction handling.
+    private func romDragProvider(for model: GameCellModel) -> NSItemProvider {
+        guard let live = liveGame(for: model) else { return NSItemProvider() }
+        return live.romDragProvider()
+    }
+#endif
+
+    private func setInitialFocus() {
+        if let firstSection = [
+            showRecentSaveStates && !recentSaveStateIDs.isEmpty ? HomeSectionType.recentSaveStates : nil,
+            showRecentGames && !recentlyPlayedGames.isEmpty ? .recentlyPlayedGames : nil,
+            showFavorites && !favorites.isEmpty ? .favorites : nil,
+            !allGames.isEmpty ? .allGames : nil
+        ].compactMap({ $0 }).first {
+            focusedSection = firstSection
+            focusedItemInSection = getFirstItemInSection(firstSection)
+        }
+    }
+
+    private func handleVerticalNavigationWithinSection(_ section: HomeSectionType, direction: Float) {
+        DLOG("Handling vertical navigation within section: \(section)")
+
+        switch section {
+        case .allGames:
+            let games = Array(allGames)
+            if let currentItem = focusedItemInSection,
+               let currentIndex = games.firstIndex(where: { $0.id == currentItem }) {
+
+                // Calculate items per row based on screen width or use default
+                let itemsPerRow = 4 // We can make this dynamic later if needed
+
+                if direction > 0 { // Moving up
+                    let newIndex = currentIndex - itemsPerRow
+                    if newIndex >= 0 {
+                        focusedItemInSection = games[newIndex].id
+                        DLOG("Moving up in grid to index: \(newIndex)")
+                    } else {
+                        // At top of grid, try to move to previous section
+                        if let prevSection = getNextSection(from: section, direction: direction) {
+                            focusedSection = prevSection
+                            focusedItemInSection = getLastItemInSection(prevSection)
+                            DLOG("Moving to previous section: \(prevSection)")
+                        }
+                    }
+                } else { // Moving down
+                    let newIndex = currentIndex + itemsPerRow
+                    if newIndex < games.count {
+                        focusedItemInSection = games[newIndex].id
+                        DLOG("Moving down in grid to index: \(newIndex)")
+                    } else {
+                        // At bottom of grid, try to move to next section
+                        if let nextSection = getNextSection(from: section, direction: direction) {
+                            focusedSection = nextSection
+                            focusedItemInSection = getFirstItemInSection(nextSection)
+                            DLOG("Moving to next section: \(nextSection)")
+                        }
+                    }
+                }
+            }
+
+        default:
+            // For non-grid sections, handle linear navigation
+            let items = getItemsForSection(section)
+            if let currentItem = focusedItemInSection,
+               let currentIndex = items.firstIndex(of: currentItem) {
+
+                if direction > 0 { // Moving up
+                    if currentIndex > 0 {
+                        focusedItemInSection = items[currentIndex - 1]
+                        DLOG("Moving up in section to index: \(currentIndex - 1)")
+                    } else {
+                        // At top of section, try to move to previous section
+                        if let prevSection = getNextSection(from: section, direction: direction) {
+                            focusedSection = prevSection
+                            focusedItemInSection = getLastItemInSection(prevSection)
+                            DLOG("Moving to previous section: \(prevSection)")
+                        }
+                    }
+                } else { // Moving down
+                    if currentIndex < items.count - 1 {
+                        focusedItemInSection = items[currentIndex + 1]
+                        DLOG("Moving down in section to index: \(currentIndex + 1)")
+                    } else {
+                        // At bottom of section, try to move to next section
+                        if let nextSection = getNextSection(from: section, direction: direction) {
+                            focusedSection = nextSection
+                            focusedItemInSection = getFirstItemInSection(nextSection)
+                            DLOG("Moving to next section: \(nextSection)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add this computed property to create the binding wrapper
+    private var newGameTitleBinding: Binding<String?> {
+        Binding<String?>(
+            get: { self.newGameTitle },
+            set: { self.newGameTitle = $0 ?? "" }
+        )
+    }
+
+    /// Function to filter games based on search text
+    private func filteredSearchResults() -> [GameCellModel] {
+        guard !searchText.isEmpty else { return [] }
+
+        let searchTextLowercased = searchText.lowercased()
+        return allGames.filter { model in
+            model.title.lowercased().contains(searchTextLowercased)
+        }
+    }
+
+    @ViewBuilder
+    private func searchResultsView() -> some View {
+        VStack(alignment: .leading) {
+            Text(String(localized: "Search Results"))
+                .font(.title2)
+                .foregroundColor(themeManager.currentPalette.gameLibraryText.swiftUIColor)
+                .padding(.horizontal)
+
+            LazyVStack(spacing: 0) {
+                let results = filteredSearchResults()
+                if results.isEmpty {
+                    Text(String(localized: "NO GAMES FOUND"))
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(RetroTheme.retroBlue)
+                        .shadow(color: RetroTheme.retroBlue.opacity(0.7), radius: 3, x: 0, y: 0)
+                        .padding()
+                } else {
+                    ForEach(results, id: \.id) { model in
+                        GameItemPresentableView(
+                            game: model,
+                            constrainHeight: true,
+                            viewType: .row,
+                            sectionContext: .allGames,
+                            isFocused: Binding(
+                                get: {
+                                    focusedSection == .allGames &&
+                                    focusedItemInSection == model.id
+                                },
+                                set: {
+                                    if $0 {
+                                        focusedSection = .allGames
+                                        focusedItemInSection = model.id
+                                    }
+                                }
+                            )
+                        ) {
+                            launchGame(md5: model.md5)
+                        }
+                        .focusableIfAvailable()
+                        .contextMenu {
+                            if let live = liveGame(for: model) {
+                                GameContextMenu(game: live, rootDelegate: rootDelegate, contextMenuDelegate: self)
+                            }
+                        }
+                        #if os(iOS)
+                        .saveStateDropTarget(gameId: model.md5)
+                        #endif
+                        GamesDividerView()
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
+
+extension HomeView: GameContextMenuDelegate {
+
+#if !os(tvOS)
+    @ViewBuilder
+    internal func imagePickerView() -> some View {
+        ImagePicker(sourceType: .photoLibrary) { image in
+            if let game = gameToUpdateCover {
+                saveArtwork(image: image, forGame: game)
+            }
+            gameToUpdateCover = nil
+            showImagePicker = false
+        }
+    }
+#endif
+
+    @ViewBuilder
+    internal func renameAlertView() -> some View {
+        Group {
+            TextField("New name", text: $newGameTitle)
+                .onSubmit { submitRename() }
+                .textInputAutocapitalization(.words)
+                .disableAutocorrection(true)
+
+            Button(NSLocalizedString("Cancel", comment: "Cancel"), role: .cancel) { showingRenameAlert = false }
+            Button("OK") { submitRename() }
+        }
+    }
+
+    // MARK: - Rename Methods
+    func gameContextMenu(_ menu: GameContextMenu, didRequestRenameFor game: PVGame) {
+        gameToRename = game.freeze()
+        newGameTitle = game.title
+        showingRenameAlert = true
+    }
+
+    private func submitRename() {
+        if !newGameTitle.isEmpty, let frozenGame = gameToRename, newGameTitle != frozenGame.title {
+            do {
+                guard let thawedGame = frozenGame.thaw() else {
+                    throw NSError(domain: "ConsoleGamesView", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to thaw game object"])
+                }
+                RomDatabase.sharedInstance.renameGame(thawedGame, toTitle: newGameTitle)
+                rootDelegate?.showMessage("Game renamed successfully.", title: "Success")
+            } catch {
+                DLOG("Failed to rename game: \(error.localizedDescription)")
+                rootDelegate?.showMessage("Failed to rename game: \(error.localizedDescription)", title: "Error")
+            }
+        } else if newGameTitle.isEmpty {
+            rootDelegate?.showMessage("Cannot set a blank title.", title: "Error")
+        }
+        showingRenameAlert = false
+        gameToRename = nil
+    }
+
+    // MARK: - Image Picker Methods
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestChooseCoverFor game: PVGame) {
+        gameToUpdateCover = game
+        showImagePicker = true
+    }
+
+    private func saveArtwork(image: UIImage, forGame game: PVGame) {
+        DLOG("GameContextMenu: Attempting to save artwork for game: \(game.title)")
+
+        let uniqueID = UUID().uuidString
+        let md5: String = game.md5Hash ?? ""
+        let key = "artwork_\(md5)_\(uniqueID)"
+        DLOG("Generated key for image: \(key)")
+
+        do {
+            DLOG("Attempting to write image to disk")
+            try PVMediaCache.writeImage(toDisk: image, withKey: key)
+            DLOG("Image successfully written to disk")
+
+            DLOG("Attempting to update game's customArtworkURL")
+            try RomDatabase.sharedInstance.writeTransaction {
+                let thawedGame = game.thaw()
+                DLOG("Game thawed: \(thawedGame?.title ?? "Unknown")")
+                thawedGame?.customArtworkURL = key
+                DLOG("Game's customArtworkURL updated to: \(key)")
+            }
+            DLOG("Database transaction completed successfully")
+            rootDelegate?.showMessage("Artwork has been saved for \(game.title).", title: "Artwork Saved")
+
+            DLOG("Attempting to verify image retrieval")
+            PVMediaCache.shareInstance().image(forKey: key) { retrievedKey, retrievedImage in
+                if let retrievedImage = retrievedImage {
+                    DLOG("Successfully retrieved saved image for key: \(retrievedKey)")
+                    DLOG("Retrieved image size: \(retrievedImage.size)")
+                } else {
+                    DLOG("Failed to retrieve saved image for key: \(retrievedKey)")
+                }
+            }
+        } catch {
+            DLOG("Failed to set custom artwork: \(error.localizedDescription)")
+            DLOG("Error details: \(error)")
+            rootDelegate?.showMessage("Failed to set custom artwork for \(game.title): \(error.localizedDescription)", title: "Error")
+        }
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestMoveToSystemFor game: PVGame) {
+        DLOG("ConsoleGamesView: Received request to move game to system")
+        let frozenGame = game.isFrozen ? game : game.freeze()
+        systemMoveState = SystemMoveState(game: frozenGame)
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestShowSaveStatesFor game: PVGame) {
+        DLOG("ConsoleGamesView: Received request to show save states for game")
+        continuesManagementState = ContinuesManagementState(game: game)
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestShowGameInfoFor game: String) {
+        showGameInfo(game)
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestShowImagePickerFor game: PVGame) {
+        gameToUpdateCover = game
+        showImagePicker = true
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestShowArtworkSearchFor game: PVGame) {
+        gameToUpdateCover = game
+        showArtworkSearch = true
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestChooseArtworkSourceFor game: PVGame) {
+        DLOG("Setting gameToUpdateCover with game: \(game.title)")
+        gameToUpdateCover = game
+        showArtworkSourceAlert = true
+    }
+
+    func gameContextMenu(_ menu: GameContextMenu, didRequestDiscSelectionFor game: PVGame) {
+        // Only show disc selection if there are multiple associated files
+        let associatedFiles = game.relatedFiles.toArray()
+        let uniqueFiles = Set(associatedFiles.compactMap { $0.url?.path })
+
+        guard uniqueFiles.count > 1 else {
+            return
+        }
+
+        presentDiscSelectionAlert(for: game, rootDelegate: rootDelegate)
+    }
+
+    private func presentDiscSelectionAlert(for game: PVGame, rootDelegate: PVRootDelegate?) {
+        let discs = game.relatedFiles.toArray()
+        let alertDiscs: [DiscSelectionAlert.Disc] = discs.compactMap { (disc: PVFile?) -> DiscSelectionAlert.Disc? in
+            guard let disc = disc, let url = disc.url else {
+                WLOG("nil file for disc")
+                return nil
+            }
+            return DiscSelectionAlert.Disc(fileName: disc.fileName, path: url.path)
+        }
+
+        self.discSelectionAlert = DiscSelectionAlert(
+            game: game,
+            discs: alertDiscs
+        )
+    }
+}
+
+// Add this struct at the end of the file
+private struct ConditionalSearchModifier: ViewModifier {
+    let isEnabled: Bool
+    @Binding var searchText: String
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            #if !os(tvOS)
+            content
+                .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search games")
+            #else
+            content
+                .searchable(text: $searchText, placement: .automatic, prompt: "Search games")
+            #endif
+        } else {
+            content
+        }
+    }
+}
+
+// Add this ScrollViewWithOffset struct if it doesn't already exist in the file
+struct ScrollViewWithOffset<Content: View>: View {
+    let axes: Axis.Set
+    let showsIndicators: Bool
+    let offsetChanged: (CGFloat) -> Void
+    let content: Content
+
+    init(
+        axes: Axis.Set = .vertical,
+        showsIndicators: Bool = true,
+        offsetChanged: @escaping (CGFloat) -> Void = { _ in },
+        @ViewBuilder content: () -> Content
+    ) {
+        self.axes = axes
+        self.showsIndicators = showsIndicators
+        self.offsetChanged = offsetChanged
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView(axes, showsIndicators: showsIndicators) {
+            offsetReader
+
+            content
+        }
+        .coordinateSpace(name: "scrollView")
+        .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
+            offsetChanged(offset)
+        }
+    }
+
+    /// Tracks scroll offset with modern geometry observation when available.
+    @ViewBuilder
+    private var offsetReader: some View {
+        if #available(iOS 18.0, tvOS 18.0, *) {
+            Color.clear
+                .frame(width: 0, height: 0)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.frame(in: .named("scrollView")).origin.y
+                } action: { offset in
+                    offsetChanged(offset)
+                }
+        } else {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: ScrollOffsetPreferenceKey.self,
+                    value: geometry.frame(in: .named("scrollView")).origin.y
+                )
+            }
+            .frame(width: 0, height: 0)
+        }
+    }
+}

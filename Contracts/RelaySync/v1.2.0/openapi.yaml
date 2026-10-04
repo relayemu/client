@@ -1,0 +1,1467 @@
+---
+openapi: 3.1.0
+info:
+  title: Relay Sync API
+  version: 1.2.0
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+security:
+- bearerAuth: []
+paths:
+  "/healthz":
+    get:
+      security: []
+      operationId: health
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Health"
+  "/v1/auth/apple/challenges":
+    post:
+      security: []
+      operationId: createAppleAuthChallenge
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AppleAuthChallenge"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/auth/apple":
+    post:
+      security: []
+      operationId: authenticateWithApple
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/AppleAuthRequest"
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AuthResponse"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/auth/apple/start":
+    get:
+      operationId: startPortalAppleAuth
+      security: []
+      responses:
+        '302': {}
+        '404':
+          "$ref": "#/components/responses/Problem"
+        '421':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+  "/auth/apple/callback":
+    post:
+      operationId: completePortalAppleAuth
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                state:
+                  type: string
+                error:
+                  type: string
+      responses:
+        '303': {}
+        '404':
+          "$ref": "#/components/responses/Problem"
+        '421':
+          "$ref": "#/components/responses/Problem"
+  "/v1/auth/logout":
+    post:
+      operationId: logout
+      responses:
+        '204': {}
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/auth/rotate":
+    post:
+      operationId: rotateSession
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AuthResponse"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+  "/v1/account":
+    get:
+      operationId: getAccount
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/account/export":
+    get:
+      operationId: exportAccountMetadata
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/account/vault/delete":
+    post:
+      operationId: deleteVaultNow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - confirmation
+              properties:
+                confirmation:
+                  const: DELETE RELAY SYNC DATA
+      responses:
+        '202': {}
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+  "/v1/devices":
+    get:
+      operationId: listDevices
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      "$ref": "#/components/schemas/Device"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/devices/{id}":
+    delete:
+      operationId: revokeDevice
+      parameters:
+      - "$ref": "#/components/parameters/UUIDPath"
+      responses:
+        '204': {}
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '404':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/uploads":
+    post:
+      operationId: prepareUpload
+      parameters:
+      - "$ref": "#/components/parameters/SyncSchema"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/PrepareContent"
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/PreparedUpload"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '426':
+          "$ref": "#/components/responses/SyncUpgradeRequired"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/uploads/{id}":
+    get:
+      operationId: getUploadStatus
+      parameters:
+      - "$ref": "#/components/parameters/UUIDPath"
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/UploadStatus"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '404':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/uploads/{id}/parts/{part}":
+    post:
+      operationId: presignMultipartPart
+      parameters:
+      - "$ref": "#/components/parameters/UUIDPath"
+      - name: part
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10000
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/PresignedRequest"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '410':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/uploads/{id}/complete":
+    post:
+      operationId: completeUpload
+      parameters:
+      - "$ref": "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parts:
+                  type: array
+                  maxItems: 10000
+                  items:
+                    type: object
+                    required:
+                    - number
+                    - etag
+                    properties:
+                      number:
+                        type: integer
+                        minimum: 1
+                        maximum: 10000
+                      etag:
+                        type: string
+                        maxLength: 128
+      responses:
+        '202': {}
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '410':
+          "$ref": "#/components/responses/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/claims":
+    post:
+      operationId: prepareProofClaim
+      parameters:
+      - "$ref": "#/components/parameters/SyncSchema"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/PrepareContent"
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ProofChallenge"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '426':
+          "$ref": "#/components/responses/SyncUpgradeRequired"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/claims/{id}/verify":
+    post:
+      operationId: verifyProofClaim
+      parameters:
+      - "$ref": "#/components/parameters/UUIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - digest
+              properties:
+                digest:
+                  "$ref": "#/components/schemas/SHA256Hex"
+      responses:
+        '204': {}
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '403':
+          "$ref": "#/components/responses/Problem"
+        '409':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Problem"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/content/downloads/{fingerprint}":
+    get:
+      operationId: authorizeDownload
+      parameters:
+      - "$ref": "#/components/parameters/FingerprintHexPath"
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - download
+                - size
+                properties:
+                  download:
+                    "$ref": "#/components/schemas/PresignedRequest"
+                  size:
+                    type: integer
+                    format: int64
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '404':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+  "/v1/covers/{system}/{digest}":
+    get:
+      operationId: catalogCover
+      security: []
+      parameters:
+      - name: system
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - gb
+          - gbc
+          - gba
+          - nes
+          - snes
+          - nds
+          - sms
+          - gg
+          - pce
+          - ws
+          - wsc
+          - ps1
+      - name: digest
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+      responses:
+        '302':
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '404':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+  "/v1/sync/push":
+    post:
+      operationId: pushSemanticOperations
+      parameters:
+      - "$ref": "#/components/parameters/SyncSchema"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/PushRequest"
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/PushResponse"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '426':
+          "$ref": "#/components/responses/SyncUpgradeRequired"
+        '413':
+          "$ref": "#/components/responses/Problem"
+        '415':
+          "$ref": "#/components/responses/Problem"
+        '423':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+  "/v1/sync/changes":
+    get:
+      operationId: getSemanticChanges
+      parameters:
+      - "$ref": "#/components/parameters/SyncSchema"
+      - name: cursor
+        in: query
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 500
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ChangesResponse"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '426':
+          "$ref": "#/components/responses/SyncUpgradeRequired"
+        '500':
+          "$ref": "#/components/responses/Problem"
+  "/v1/sync/games/{fingerprint}/battery-heads":
+    get:
+      operationId: getBatteryHeads
+      parameters:
+      - "$ref": "#/components/parameters/SyncSchema"
+      - "$ref": "#/components/parameters/FingerprintHexPath"
+      - name: generation
+        in: query
+        required: true
+        schema:
+          "$ref": "#/components/schemas/Generation"
+      - name: cursor
+        in: query
+        schema:
+          "$ref": "#/components/schemas/UUID"
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 2
+          maximum: 500
+          default: 100
+      - name: snapshot
+        in: query
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/HeadsResponse"
+        '400':
+          "$ref": "#/components/responses/Problem"
+        '401':
+          "$ref": "#/components/responses/Problem"
+        '426':
+          "$ref": "#/components/responses/SyncUpgradeRequired"
+        '409':
+          "$ref": "#/components/responses/Problem"
+        '429':
+          "$ref": "#/components/responses/Problem"
+        '503':
+          "$ref": "#/components/responses/Problem"
+        '500':
+          "$ref": "#/components/responses/Problem"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    SyncSchema:
+      name: X-Relay-Sync-Schema
+      in: header
+      required: true
+      schema:
+        type: string
+        enum:
+        - '2'
+        - '3'
+    UUIDPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        "$ref": "#/components/schemas/UUID"
+    FingerprintHexPath:
+      name: fingerprint
+      in: path
+      required: true
+      schema:
+        "$ref": "#/components/schemas/SHA256Hex"
+  responses:
+    SyncUpgradeRequired:
+      headers:
+        X-Relay-Sync-Schema:
+          schema:
+            type: string
+            const: '3'
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/Problem"
+    Problem:
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/Problem"
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+    SHA256Hex:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+    Fingerprint:
+      type: string
+      pattern: "^sha256:[0-9a-f]{64}$"
+    Generation:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 2147483647
+    Milliseconds:
+      type: integer
+      format: int64
+      minimum: 946684800000
+    Health:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - ready
+    Problem:
+      type: object
+      required:
+      - type
+      - title
+      - status
+      - detail
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+    AppleAuthRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - identityToken
+      - challengeID
+      - installationID
+      - deviceKind
+      properties:
+        identityToken:
+          type: string
+          minLength: 1
+        challengeID:
+          "$ref": "#/components/schemas/UUID"
+        installationID:
+          "$ref": "#/components/schemas/UUID"
+        deviceKind:
+          "$ref": "#/components/schemas/DeviceKind"
+    AppleAuthChallenge:
+      type: object
+      required:
+      - challengeID
+      - nonce
+      - expiresAt
+      properties:
+        challengeID:
+          "$ref": "#/components/schemas/UUID"
+        nonce:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+        expiresAt:
+          type: string
+          format: date-time
+    AuthResponse:
+      type: object
+      required:
+      - accessToken
+      - expiresAt
+      - relayAccountID
+      properties:
+        accessToken:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        relayAccountID:
+          "$ref": "#/components/schemas/UUID"
+    DeviceKind:
+      type: string
+      enum:
+      - iphone
+      - ipad
+      - appletv
+      - mac
+      - android
+      - unknown
+    Device:
+      type: object
+      properties:
+        ID:
+          "$ref": "#/components/schemas/UUID"
+        Kind:
+          "$ref": "#/components/schemas/DeviceKind"
+        CreatedAt:
+          type: string
+          format: date-time
+        LastSeenAt:
+          type: string
+          format: date-time
+        LastSyncAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        RevokedAt:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    PrepareContent:
+      oneOf:
+      - "$ref": "#/components/schemas/PrepareGameContent"
+      - "$ref": "#/components/schemas/PrepareCriticalContent"
+    PrepareGameContent:
+      type: object
+      additionalProperties: false
+      required:
+      - fingerprint
+      - size
+      - storageClass
+      - target
+      properties:
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 600000000000
+        storageClass:
+          const: game
+        target:
+          "$ref": "#/components/schemas/GameContentTarget"
+    PrepareCriticalContent:
+      type: object
+      additionalProperties: false
+      required:
+      - fingerprint
+      - size
+      - storageClass
+      - target
+      properties:
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 600000000000
+        storageClass:
+          const: critical
+        target:
+          oneOf:
+          - "$ref": "#/components/schemas/StateContentTarget"
+          - "$ref": "#/components/schemas/ScreenshotContentTarget"
+          - "$ref": "#/components/schemas/ArtworkContentTarget"
+    GameContentTarget:
+      type: object
+      additionalProperties: false
+      required:
+      - category
+      - ref_type
+      - ref_key
+      - game_fingerprint
+      - generation
+      properties:
+        category:
+          const: games
+        ref_type:
+          const: game_content
+        ref_key:
+          allOf:
+          - "$ref": "#/components/schemas/Fingerprint"
+        game_fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+    StateContentTarget:
+      type: object
+      additionalProperties: false
+      required:
+      - category
+      - ref_type
+      - ref_key
+      - game_fingerprint
+      - generation
+      properties:
+        category:
+          const: saves_states
+        ref_type:
+          type: string
+          enum:
+          - battery_payload
+          - save_state_payload
+        ref_key:
+          "$ref": "#/components/schemas/UUID"
+        game_fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+    ScreenshotContentTarget:
+      type: object
+      additionalProperties: false
+      required:
+      - category
+      - ref_type
+      - ref_key
+      - game_fingerprint
+      - generation
+      properties:
+        category:
+          const: screenshots_other
+        ref_type:
+          type: string
+          enum:
+          - battery_screenshot
+          - save_state_screenshot
+          - session_screenshot
+        ref_key:
+          "$ref": "#/components/schemas/UUID"
+        game_fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+    ArtworkContentTarget:
+      type: object
+      additionalProperties: false
+      required:
+      - category
+      - ref_type
+      - ref_key
+      - game_fingerprint
+      - generation
+      properties:
+        category:
+          const: screenshots_other
+        ref_type:
+          const: game_artwork
+        ref_key:
+          allOf:
+          - "$ref": "#/components/schemas/Fingerprint"
+        game_fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+    PresignedRequest:
+      type: object
+      required:
+      - url
+      - method
+      - headers
+      - expires_at
+      properties:
+        url:
+          type: string
+          format: uri
+        method:
+          type: string
+          enum:
+          - GET
+          - PUT
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+    PreparedUpload:
+      type: object
+      required:
+      - upload_id
+      - mode
+      - expires_at
+      properties:
+        upload_id:
+          "$ref": "#/components/schemas/UUID"
+        mode:
+          type: string
+          enum:
+          - single
+          - multipart
+        part_size:
+          type: integer
+          format: int64
+        part_count:
+          type: integer
+          maximum: 10000
+        upload:
+          "$ref": "#/components/schemas/PresignedRequest"
+        expires_at:
+          type: string
+          format: date-time
+    UploadStatus:
+      type: object
+      required:
+      - upload_id
+      - status
+      - error_code
+      - blob_id
+      properties:
+        upload_id:
+          "$ref": "#/components/schemas/UUID"
+        status:
+          type: string
+          enum:
+          - PREPARED
+          - UPLOADING
+          - VERIFYING
+          - COMPLETE
+          - FAILED
+          - EXPIRED
+        error_code:
+          type:
+          - string
+          - 'null'
+        blob_id:
+          anyOf:
+          - "$ref": "#/components/schemas/UUID"
+          - type: 'null'
+    ProofRange:
+      type: object
+      required:
+      - offset
+      - length
+      properties:
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        length:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 65536
+    ProofChallenge:
+      type: object
+      required:
+      - challenge_id
+      - nonce
+      - ranges
+      - expires_at
+      properties:
+        challenge_id:
+          "$ref": "#/components/schemas/UUID"
+        nonce:
+          "$ref": "#/components/schemas/SHA256Hex"
+        ranges:
+          type: array
+          minItems: 1
+          items:
+            "$ref": "#/components/schemas/ProofRange"
+        expires_at:
+          type: string
+          format: date-time
+    Operation:
+      type: object
+      additionalProperties: false
+      required:
+      - operationId
+      - schema
+      - kind
+      - action
+      - object
+      properties:
+        operationId:
+          "$ref": "#/components/schemas/UUID"
+        schema:
+          type: integer
+          enum:
+          - 2
+          - 3
+        kind:
+          type: string
+          enum:
+          - game
+          - battery_revision
+          - save_state
+          - play_session
+          - tombstone
+          - content_availability
+          - artwork
+        action:
+          type: string
+          enum:
+          - upsert
+          - delete
+        object:
+          oneOf:
+          - "$ref": "#/components/schemas/Game"
+          - "$ref": "#/components/schemas/BatteryRevision"
+          - "$ref": "#/components/schemas/SaveState"
+          - "$ref": "#/components/schemas/PlaySession"
+          - "$ref": "#/components/schemas/Tombstone"
+          - "$ref": "#/components/schemas/ContentAvailability"
+          - "$ref": "#/components/schemas/Artwork"
+    PushRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - operations
+      properties:
+        operations:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            "$ref": "#/components/schemas/Operation"
+    OperationResult:
+      type: object
+      required:
+      - operationId
+      - status
+      properties:
+        operationId:
+          "$ref": "#/components/schemas/UUID"
+        status:
+          type: string
+          enum:
+          - applied
+          - duplicate
+          - ignored
+          - deferred
+          - rejected
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        error:
+          type: string
+        missingKeys:
+          type: array
+          items:
+            type: string
+    PushResponse:
+      type: object
+      required:
+      - results
+      properties:
+        results:
+          type: array
+          items:
+            "$ref": "#/components/schemas/OperationResult"
+    Change:
+      type: object
+      required:
+      - sequence
+      - kind
+      - objectKey
+      - operation
+      - object
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+        objectKey:
+          type: string
+        operation:
+          type: string
+          enum:
+          - upsert
+          - delete
+        object:
+          type: object
+    ChangesResponse:
+      type: object
+      required:
+      - schema
+      - changes
+      - nextCursor
+      - hasMore
+      properties:
+        schema:
+          type: integer
+          enum:
+          - 2
+          - 3
+        changes:
+          type: array
+          items:
+            "$ref": "#/components/schemas/Change"
+        nextCursor:
+          type: integer
+          format: int64
+          minimum: 0
+        hasMore:
+          type: boolean
+    HeadsResponse:
+      type: object
+      required:
+      - schema
+      - fingerprint
+      - generation
+      - heads
+      - conflict
+      - hasMore
+      - snapshotSequence
+      properties:
+        schema:
+          type: integer
+          enum:
+          - 2
+          - 3
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        heads:
+          type: array
+          items:
+            "$ref": "#/components/schemas/UUID"
+        conflict:
+          type: boolean
+        nextCursor:
+          anyOf:
+          - "$ref": "#/components/schemas/UUID"
+          - type: 'null'
+        hasMore:
+          type: boolean
+        snapshotSequence:
+          type: integer
+          format: int64
+          minimum: 0
+    Game:
+      type: object
+      additionalProperties: false
+      required:
+      - fingerprint
+      - generation
+      - systemID
+      - title
+      - isFavorite
+      - addedAt
+      - updatedAt
+      properties:
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        systemID:
+          type: string
+          pattern: "^[a-z0-9-]{1,32}$"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        isFavorite:
+          type: boolean
+        addedAt:
+          "$ref": "#/components/schemas/Milliseconds"
+        updatedAt:
+          allOf:
+          - "$ref": "#/components/schemas/Milliseconds"
+    BatteryRevision:
+      type: object
+      additionalProperties: false
+      required:
+      - revisionID
+      - fingerprint
+      - generation
+      - parentIDs
+      - createdAt
+      - dataFingerprint
+      - dataSize
+      - installationID
+      - deviceKind
+      properties:
+        revisionID:
+          "$ref": "#/components/schemas/UUID"
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        parentIDs:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            "$ref": "#/components/schemas/UUID"
+        createdAt:
+          "$ref": "#/components/schemas/Milliseconds"
+        dataFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        dataSize:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 8388608
+        installationID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+        deviceKind:
+          "$ref": "#/components/schemas/DeviceKind"
+        screenshotFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+    SaveState:
+      type: object
+      additionalProperties: false
+      required:
+      - stateID
+      - fingerprint
+      - generation
+      - stateKind
+      - coreID
+      - coreVersion
+      - stateCompatibilityVersion
+      - formatVersion
+      - createdAt
+      - payloadFingerprint
+      - payloadSize
+      - installationID
+      - deviceKind
+      properties:
+        stateID:
+          "$ref": "#/components/schemas/UUID"
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        stateKind:
+          type: string
+          enum:
+          - manual
+          - quick
+          - auto
+        coreID:
+          type: string
+          pattern: "^[A-Za-z0-9_.-]{1,64}$"
+        coreVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        stateCompatibilityVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        formatVersion:
+          type: integer
+          minimum: 1
+        createdAt:
+          "$ref": "#/components/schemas/Milliseconds"
+        payloadFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        payloadSize:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 268435456
+        batteryRevisionID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+        installationID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+        deviceKind:
+          "$ref": "#/components/schemas/DeviceKind"
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+        screenshotFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+    PlaySession:
+      type: object
+      additionalProperties: false
+      required:
+      - sessionID
+      - fingerprint
+      - generation
+      - installationID
+      - deviceKind
+      - coreID
+      - startedAt
+      - pausedMs
+      properties:
+        sessionID:
+          "$ref": "#/components/schemas/UUID"
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        installationID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+        deviceKind:
+          "$ref": "#/components/schemas/DeviceKind"
+        coreID:
+          type: string
+          pattern: "^[A-Za-z0-9_.-]{1,64}$"
+        startedAt:
+          "$ref": "#/components/schemas/Milliseconds"
+        endedAt:
+          allOf:
+          - "$ref": "#/components/schemas/Milliseconds"
+        pausedMs:
+          type: integer
+          format: int64
+          minimum: 0
+        screenshotFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+    Tombstone:
+      oneOf:
+      - "$ref": "#/components/schemas/GameTombstone"
+      - "$ref": "#/components/schemas/StateTombstone"
+    GameTombstone:
+      type: object
+      additionalProperties: false
+      required:
+      - targetKind
+      - targetKey
+      - fingerprint
+      - generation
+      - deletedAt
+      - installationID
+      properties:
+        targetKind:
+          const: game
+        targetKey:
+          "$ref": "#/components/schemas/Fingerprint"
+        fingerprint:
+          allOf:
+          - "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          allOf:
+          - "$ref": "#/components/schemas/Generation"
+        deletedAt:
+          allOf:
+          - "$ref": "#/components/schemas/Milliseconds"
+        installationID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+    StateTombstone:
+      type: object
+      additionalProperties: false
+      required:
+      - targetKind
+      - targetKey
+      - generation
+      - deletedAt
+      - installationID
+      properties:
+        targetKind:
+          const: state
+        targetKey:
+          "$ref": "#/components/schemas/UUID"
+        fingerprint:
+          allOf:
+          - "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          allOf:
+          - "$ref": "#/components/schemas/Generation"
+        deletedAt:
+          allOf:
+          - "$ref": "#/components/schemas/Milliseconds"
+        installationID:
+          allOf:
+          - "$ref": "#/components/schemas/UUID"
+    ContentAvailability:
+      type: object
+      additionalProperties: false
+      required:
+      - fingerprint
+      - generation
+      - stored
+      properties:
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        stored:
+          type: boolean
+        payloadFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+    Artwork:
+      type: object
+      additionalProperties: false
+      required:
+      - fingerprint
+      - generation
+      - updatedAt
+      - installationID
+      properties:
+        fingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        generation:
+          "$ref": "#/components/schemas/Generation"
+        artworkFingerprint:
+          "$ref": "#/components/schemas/Fingerprint"
+        artworkSize:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1048576
+        updatedAt:
+          type: integer
+          format: int64
+        installationID:
+          "$ref": "#/components/schemas/UUID"

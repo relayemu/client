@@ -1,0 +1,9 @@
+# CI has moved to GitHub Actions — see .github/workflows/
+# This file exists only to satisfy the Azure DevOps webhook until it is disconnected.
+pool:
+  vmImage: 'ubuntu-latest'
+
+jobs:
+- job: Deprecated
+  steps:
+  - script: echo "CI moved to GitHub Actions. Disconnect Azure DevOps integration."

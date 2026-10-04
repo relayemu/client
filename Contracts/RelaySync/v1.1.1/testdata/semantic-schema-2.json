@@ -1,0 +1,517 @@
+{
+  "schema": 2,
+  "nowMs": 1788520060000,
+  "requestHeaders": {
+    "X-Relay-Sync-Schema": "2"
+  },
+  "note": "Synthetic deterministic fixture timestamps; each case uses an isolated account. Do not register sourceInstallationID merely to satisfy provenance. Objects are actual wire operation bodies.",
+  "cases": [
+    {
+      "name": "foreign-source-provenance",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-000000000065",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000066",
+          "schema": 2,
+          "kind": "play_session",
+          "action": "upsert",
+          "object": {
+            "sessionID": "40000000-0000-4000-8000-000000000001",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "installationID": "30000000-0000-4000-8000-000000000001",
+            "deviceKind": "mac",
+            "coreID": "mgba",
+            "startedAt": 1788520001000,
+            "endedAt": 1788520002000,
+            "pausedMs": 0
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied"
+      ],
+      "expected": {
+        "sourceInstallationID": "30000000-0000-4000-8000-000000000001",
+        "submittingInstallationID": "30000000-0000-4000-8000-000000000002",
+        "sessionID": "40000000-0000-4000-8000-000000000001",
+        "activeGeneration": 0
+      }
+    },
+    {
+      "name": "classification-is-immutable",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-000000000067",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000068",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "nes",
+            "title": "Conflicting title",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520006000
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "rejected"
+      ],
+      "expected": {
+        "canonicalSystemID": "gba",
+        "title": "Example Game",
+        "activeGeneration": 0
+      }
+    },
+    {
+      "name": "auto-retention-permanent-uuid-suppression",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006a",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006b",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "state",
+            "targetKey": "50000000-0000-4000-8000-000000000002",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520005000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000069",
+          "schema": 2,
+          "kind": "save_state",
+          "action": "upsert",
+          "object": {
+            "stateID": "50000000-0000-4000-8000-000000000002",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "stateKind": "auto",
+            "coreID": "mgba",
+            "coreVersion": "1.0",
+            "stateCompatibilityVersion": "1",
+            "formatVersion": 1,
+            "createdAt": 1788520010000,
+            "payloadFingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "payloadSize": 32768,
+            "installationID": "30000000-0000-4000-8000-000000000001",
+            "deviceKind": "mac"
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied",
+        "ignored"
+      ],
+      "expected": {
+        "stateID": "50000000-0000-4000-8000-000000000002",
+        "stateAbsent": true,
+        "activeGeneration": 0
+      }
+    },
+    {
+      "name": "quick-retention-permanent-uuid-suppression",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006d",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006e",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "state",
+            "targetKey": "50000000-0000-4000-8000-000000000003",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520005000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006c",
+          "schema": 2,
+          "kind": "save_state",
+          "action": "upsert",
+          "object": {
+            "stateID": "50000000-0000-4000-8000-000000000003",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "stateKind": "quick",
+            "coreID": "mgba",
+            "coreVersion": "1.0",
+            "stateCompatibilityVersion": "1",
+            "formatVersion": 1,
+            "createdAt": 1788520010000,
+            "payloadFingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "payloadSize": 32768,
+            "installationID": "30000000-0000-4000-8000-000000000001",
+            "deviceKind": "mac"
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied",
+        "ignored"
+      ],
+      "expected": {
+        "stateID": "50000000-0000-4000-8000-000000000003",
+        "stateAbsent": true,
+        "activeGeneration": 0
+      }
+    },
+    {
+      "name": "reimport-keeps-old-work-retired",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-00000000006f",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000070",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "game",
+            "targetKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520005000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000071",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000072",
+          "schema": 2,
+          "kind": "play_session",
+          "action": "upsert",
+          "object": {
+            "sessionID": "40000000-0000-4000-8000-000000000004",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "installationID": "30000000-0000-4000-8000-000000000001",
+            "deviceKind": "mac",
+            "coreID": "mgba",
+            "startedAt": 1788520015000,
+            "endedAt": 1788520016000,
+            "pausedMs": 0
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000073",
+          "schema": 2,
+          "kind": "play_session",
+          "action": "upsert",
+          "object": {
+            "sessionID": "40000000-0000-4000-8000-000000000005",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "installationID": "30000000-0000-4000-8000-000000000001",
+            "deviceKind": "mac",
+            "coreID": "mgba",
+            "startedAt": 1788520001000,
+            "endedAt": 1788520002000,
+            "pausedMs": 0
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000074",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "game",
+            "targetKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520020000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied",
+        "applied",
+        "ignored",
+        "applied",
+        "ignored"
+      ],
+      "expected": {
+        "activeGeneration": 1,
+        "retiredThrough": 0,
+        "absentSessionIDs": [
+          "40000000-0000-4000-8000-000000000004"
+        ],
+        "presentSessionIDs": [
+          "40000000-0000-4000-8000-000000000005"
+        ]
+      }
+    },
+    {
+      "name": "same-barrier-reimport-alpha-first",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-000000000075",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000076",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "game",
+            "targetKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520005000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000077",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "systemID": "gba",
+            "title": "Alpha",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-000000000078",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "systemID": "gba",
+            "title": "Zulu",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied",
+        "applied",
+        "applied"
+      ],
+      "expected": {
+        "activeGeneration": 1,
+        "retiredThrough": 0,
+        "title": "Zulu",
+        "canonicalSystemID": "gba"
+      },
+      "concurrentGroups": [
+        [
+          2,
+          3
+        ]
+      ]
+    },
+    {
+      "name": "same-barrier-reimport-zulu-first",
+      "authenticatedInstallationID": "30000000-0000-4000-8000-000000000002",
+      "operations": [
+        {
+          "operationId": "10000000-0000-4000-8000-000000000079",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "systemID": "gba",
+            "title": "Example Game",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000007a",
+          "schema": 2,
+          "kind": "tombstone",
+          "action": "upsert",
+          "object": {
+            "targetKind": "game",
+            "targetKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 0,
+            "deletedAt": 1788520005000,
+            "installationID": "30000000-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000007b",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "systemID": "gba",
+            "title": "Zulu",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        },
+        {
+          "operationId": "10000000-0000-4000-8000-00000000007c",
+          "schema": 2,
+          "kind": "game",
+          "action": "upsert",
+          "object": {
+            "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation": 1,
+            "systemID": "gba",
+            "title": "Alpha",
+            "isFavorite": false,
+            "addedAt": 1788520000000,
+            "updatedAt": 1788520000000
+          }
+        }
+      ],
+      "expectedStatuses": [
+        "applied",
+        "applied",
+        "applied",
+        "duplicate"
+      ],
+      "expected": {
+        "activeGeneration": 1,
+        "retiredThrough": 0,
+        "title": "Zulu",
+        "canonicalSystemID": "gba"
+      },
+      "concurrentGroups": [
+        [
+          2,
+          3
+        ]
+      ]
+    }
+  ]
+}

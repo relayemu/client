@@ -1,0 +1,475 @@
+diff --git a/Vendor/Provenance/Cores/mGBA/Package.swift b/Vendor/Provenance/Cores/mGBA/Package.swift
+index 9e2508374..5276bda45 100644
+--- a/Vendor/Provenance/Cores/mGBA/Package.swift
++++ b/Vendor/Provenance/Cores/mGBA/Package.swift
+@@ -20,9 +20,7 @@ let libmGBACSettings: [PackageDescription.CSetting] = [
+     .define("M_CORE_GBA", to: "1"),
+     .define("M_CORE_GB", to: "1"),
+ 
+-    // RetroAchievements: enable mGBA's built-in rcheevos wrapper (achievements.c)
+-    // Requires src/third-party/rcheevos/ sources to also be compiled (see mGBASources).
+-    .define("USE_ACHIEVEMENTS", to: "1"),
++    // Relay owns the single pinned achievement runtime in Vendor/rcheevos.
+     .define("HAVE_CHEATS", to: "1"),
+ 
+     .define("ENABLE_VFS", to: "1"),
+@@ -38,7 +36,7 @@ let package = Package(
+         .iOS(.v17),
+         .tvOS(.v17),
+         .watchOS(.v9),
+-        .macOS(.v13),
++        .macOS(.v14),
+         .macCatalyst(.v17),
+         .visionOS(.v1)
+     ],
+@@ -55,6 +53,11 @@ let package = Package(
+             name: "PVCoremGBA-Static",
+             type: .static,
+             targets: ["PVmGBACore"]),
++        // Relay: exposes the ObjC bridge so the Relay emulation adapter can reach the
++        // in-memory state serializer directly (see UPSTREAM_PROVENANCE.md).
++        .library(
++            name: "PVmGBABridge",
++            targets: ["PVmGBABridge"]),
+     ],
+     dependencies: [
+         .package(path: "../../PVCoreBridge"),
+@@ -66,10 +69,12 @@ let package = Package(
+         .package(path: "../../PVLogging"),
+         .package(path: "../../PVObjCUtils"),
+         .package(name: "PVPrimitives", path: "../../PVPrimitives/"),
+-        .package(path: "../../PVNetplay"),
++        // Relay: PVNetplay dropped. Relay never offers netplay; the package
++        // carried a lobby URL into every Relay binary. The +Netplay extensions are excluded below.
+         .package(path: "../../PVPatching"),
+-
+-        .package(url: "https://github.com/Provenance-Emu/SwiftGenPlugin.git", from: "1.1.3"),
++        // Relay: SwiftGenPlugin removed. Its only output here, CorePlist-Generated.swift,
++        // is committed next to CorePlist.swift (as upstream already does for FCEU), so the
++        // build no longer depends on a remote binary plugin (UPSTREAM_PROVENANCE.md).
+     ],
+     targets: [
+         // MARK: ============ Core =============
+@@ -84,16 +89,14 @@ let package = Package(
+                 "PVCoreObjCBridge",
+                 "PVPlists",
+                 "PVPrimitives",
+-                "PVNetplay",
+                 "PVPatching",
+                 "libmGBA",
+                 "PVmGBABridge"
+             ],
++            exclude: ["PVmGBACore+PVNetplayCapable.swift", "PVmGBACore+RetroAchievements.swift"],
+             resources: [
+                 .process("Resources/Core.plist")
+-            ],
+-            plugins: [
+-                .plugin(name: "SwiftGenPlugin", package: "SwiftGenPlugin")]),
++            ]),
+         // MARK: ============ Bridge =============
+         .target(
+             name: "PVmGBABridge",
+@@ -105,6 +108,7 @@ let package = Package(
+                 "PVObjCUtils",
+                 "libmGBA"
+             ],
++            exclude: ["PVmGBAGameCoreBridge+Netplay.mm", "PVmGBAGameCoreBridge+Netplay.h"],
+             publicHeadersPath: "include",
+             cSettings: libmGBACSettings + [
+                 .headerSearchPath("../libmGBA/include"),
+@@ -185,26 +189,38 @@ let mGBASources: [String] = [
+         "src/core/thread.c",
+         "src/core/tile-cache.c",
+         "src/core/timing.c",
+-        // RetroAchievements: mGBA's built-in rcheevos wrapper
+-        "src/core/achievements.c",
+-        // rcheevos sources bundled with mGBA (src/third-party/rcheevos/)
+-        "src/third-party/rcheevos/src/rc_client.c",
+-        "src/third-party/rcheevos/src/rc_client_external.c",
+-        "src/third-party/rcheevos/src/rc_api_common.c",
+-        "src/third-party/rcheevos/src/rc_api_runtime.c",
+-        "src/third-party/rcheevos/src/rc_api_user.c",
+-        "src/third-party/rcheevos/src/rc_url.c",
+-        "src/third-party/rcheevos/src/rc_util.c",
+-        "src/third-party/rcheevos/src/rcheevos/alloc.c",
+-        "src/third-party/rcheevos/src/rcheevos/format.c",
+-        "src/third-party/rcheevos/src/rcheevos/lboard.c",
+-        "src/third-party/rcheevos/src/rcheevos/operand.c",
+-        "src/third-party/rcheevos/src/rcheevos/rc_validate.c",
+-        "src/third-party/rcheevos/src/rcheevos/richpresence.c",
+-        "src/third-party/rcheevos/src/rcheevos/runtime.c",
+-        "src/third-party/rcheevos/src/rcheevos/runtime_progress.c",
+-        "src/third-party/rcheevos/src/rcheevos/trigger.c",
+-        "src/third-party/rcheevos/src/rcheevos/value.c",
++        // Relay: the Game Boy / Game Boy Color board and its SM83 CPU. libmGBA
++        // already defined M_CORE_GB, but none of these files were compiled, so
++        // GBCoreCreate() had nothing behind it. File list mirrors upstream's
++        // src/gb/CMakeLists.txt and src/sm83/CMakeLists.txt (SOURCE_FILES plus
++        // the serial-link files the core references); debugger, extra and test
++        // groups stay excluded exactly as they are for the Advance.
++        "src/gb/audio.c",
++        "src/gb/cheats.c",
++        "src/gb/core.c",
++        "src/gb/gb.c",
++        "src/gb/input.c",
++        "src/gb/io.c",
++        "src/gb/mbc.c",
++        "src/gb/mbc/huc-3.c",
++        "src/gb/mbc/licensed.c",
++        "src/gb/mbc/mbc.c",
++        "src/gb/mbc/pocket-cam.c",
++        "src/gb/mbc/tama5.c",
++        "src/gb/mbc/unlicensed.c",
++        "src/gb/memory.c",
++        "src/gb/overrides.c",
++        "src/gb/renderers/cache-set.c",
++        "src/gb/renderers/software.c",
++        "src/gb/serialize.c",
++        "src/gb/sio.c",
++        "src/gb/sio/lockstep.c",
++        "src/gb/sio/printer.c",
++        "src/gb/timer.c",
++        "src/gb/video.c",
++        "src/sm83/decoder.c",
++        "src/sm83/isa-sm83.c",
++        "src/sm83/sm83.c",
+         "src/gba/audio.c",
+         "src/gba/bios.c",
+         "src/gba/cheats/codebreaker.c",
+diff --git a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/include/module.modulemap b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/include/module.modulemap
+index c872e082f..f13934d1a 100644
+--- a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/include/module.modulemap
++++ b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/include/module.modulemap
+@@ -1,6 +1,5 @@
+ module PVmGBABridge {
+     header "../mGBAGameCoreBridge.h"
+     header "../mGBAGameCoreBridge+Achievements.h"
+-    header "../PVmGBAGameCoreBridge+Netplay.h"
+     export *
+ }
+diff --git a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.h b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.h
+index ca4539289..da022a6ef 100644
+--- a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.h
++++ b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.h
+@@ -14,6 +14,15 @@ typedef enum PVGBAButton: NSInteger PVGBAButton;
+ + (instancetype)sharedInstance;
+ - (instancetype)init NS_DESIGNATED_INITIALIZER;
+ 
++/// Relay-owned observation boundary. Set/clear under the bridge monitor;
++/// callbacks run on the emulation thread under that same monitor.
++@property (nonatomic, copy, nullable) void (^relayFrameHandler)(void);
++@property (nonatomic, copy, nullable) void (^relayResetHandler)(void);
++/// Native regions: 0 bus peek, 1 work RAM, 2 internal RAM, 3 cartridge RAM.
++/// Valid only under the bridge monitor. Short reads represent unavailable RAM.
++- (NSUInteger)relayReadMemoryRegion:(uint32_t)region offset:(uint32_t)offset
++                             buffer:(void * _Nonnull)buffer count:(NSUInteger)count;
++
+ @end
+ 
+ #pragma clang diagnostic push
+@@ -32,3 +41,21 @@ typedef enum PVGBAButton: NSInteger PVGBAButton;
+ - (void)resetCheatCodes;
+ 
+ @end
++
++/// In-memory save-state serialization. Implemented in mGBAGameCoreBridge.m since
++/// upstream; declared here so Swift callers (the Relay emulation adapter) can use it
++/// without the file-based path. Callers must hold `@synchronized(bridge)` (the monitor
++/// the emulation loop takes around `executeFrame`) when the core may be running.
++@interface PVmGBAGameCoreBridge (StateSerialization)
++
++- (NSData * _Nullable)serializeStateWithError:(NSError * _Nullable * _Nullable)outError;
++- (BOOL)deserializeState:(NSData * _Nonnull)state withError:(NSError * _Nullable * _Nullable)outError;
++
++/// A copy of the game's current battery save (SRAM/flash/EEPROM) straight from the
++/// core's memory (`mCore.savedataClone`), independent of when the core flushes its
++/// save file. Nil when the game has no save data. Added for Relay: the on-disk save
++/// file lags the emulated memory by the core's clean-up interval, so Relay snapshots
++/// the bytes themselves at safe points. Hold `@synchronized(bridge)` while calling.
++- (NSData * _Nullable)relay_cloneBatterySave;
++
++@end
+diff --git a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.m b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.m
+index b64cd19f3..d2af042c3 100644
+--- a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.m
++++ b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBABridge/mGBAGameCoreBridge.m
+@@ -43,6 +43,7 @@
+ #include <mgba/core/cheats.h>
+ #include <mgba/core/serialize.h>
+ #include <mgba/gba/core.h>
++#include <mgba/gb/core.h>
+ #include <mgba/internal/gba/cheats.h>
+ #include <mgba/internal/gba/input.h>
+ #include <mgba-util/audio-buffer.h>
+@@ -51,7 +52,7 @@
+ #include <mgba-util/vfs.h>
+ #include <mgba-util/audio-resampler.h>
+ 
+-#define SAMPLES_PER_FRAME_MOVING_AVG_ALPHA (1.0f / 180.0f)
++static const unsigned RelayAudioOutputRate = 32768;
+ static void _audioLowPassFilter(int16_t* buffer, int count);
+ 
+ static int32_t audioLowPassRange = (60 * 0x10000) / 100;
+@@ -85,7 +86,6 @@ const char* const projectVersion = "3.0.0";
+     int16_t *audioBuffer;
+     unsigned width, height;
+     struct mAVStream stream;
+-    float audioSamplesPerFrameAvg;
+     BOOL audioLowPassEnabled;
+ }
+ @end
+@@ -130,9 +130,23 @@ static struct mLogger logger = { .log = _log };
+ #pragma mark - Execution
+ 
+ 
++/// Relay: libmGBA is built with both M_CORE_GBA and M_CORE_GB, so the same
++/// core package runs the Game Boy and Game Boy Color as well as the Game Boy
++/// Advance. The frontend says which system it asked for; upstream only ever
++/// created the Advance core. Key codes are shared: GB_KEY_* and GBA_KEY_* have
++/// the same values for the eight buttons a Game Boy has, so GBAMap is correct
++/// for both and the Advance-only L/R bits are simply never sent.
++- (struct mCore *)relay_createCoreForCurrentSystem {
++    NSString *system = self.systemIdentifier ?: @"";
++    if ([system isEqualToString:@"com.provenance.gb"] || [system isEqualToString:@"com.provenance.gbc"]) {
++        return GBCoreCreate();
++    }
++    return GBACoreCreate();
++}
++
+ -(void)initialize {
+     [super initialize];
+-    core = GBACoreCreate();
++    core = [self relay_createCoreForCurrentSystem];
+     mCoreInitConfig(core, nil);
+ 
+     struct mCoreOptions opts = {
+@@ -151,18 +165,16 @@ static struct mLogger logger = { .log = _log };
+     outputBuffer = malloc(width * height * BYTES_PER_PIXEL);
+     core->setVideoBuffer(core, outputBuffer, width);
+ 
+-    // GBA-specific audio setup
+-    size_t audioSamplesPerFrame = (size_t)((float)core->audioSampleRate(core) * (float)core->frameCycles(core) /
+-                                          (float)core->frequency(core));
+-    audioBufferSize = ceil(audioSamplesPerFrame) * 2;
+-    audioBuffer = malloc(audioBufferSize * sizeof(int16_t));
+-    audioSamplesPerFrameAvg = (float)audioSamplesPerFrame;
+-
+-    size_t internalAudioBufferSize = audioSamplesPerFrame * 2;
+-    if (internalAudioBufferSize > 0x4000) {
+-        internalAudioBufferSize = 0x4000;
+-    }
+-    core->setAudioBufferSize(core, internalAudioBufferSize);
++    // Relay: SOUNDBIAS lets a GBA game change its native rate from 32768
++    // through 262144 Hz; GB uses 131072 Hz. Convert native samples to the
++    // stable rate advertised to the frontend, as mGBA's SDL frontend does.
++    // The source capacity covers a full frame at the highest hardware rate.
++    core->setAudioBufferSize(core, 0x4000);
++    mAudioBufferInit(&intermediateAudio, 2048, 2);
++    mAudioResamplerInit(&resampler, mINTERPOLATOR_SINC);
++    mAudioResamplerSetDestination(&resampler, &intermediateAudio, RelayAudioOutputRate);
++    audioBufferSize = 2048 * sizeof(int16_t) * 2;
++    audioBuffer = malloc(audioBufferSize);
+ 
+     audioLowPassEnabled = YES;
+     cheatSets = [[NSMutableDictionary alloc] init];
+@@ -193,37 +205,62 @@ static struct mLogger logger = { .log = _log };
+     return YES;
+ }
+ 
++// Relay native memory reads. No RA address or service concept crosses this bridge.
++- (NSUInteger)relayReadMemoryRegion:(uint32_t)region offset:(uint32_t)offset
++                             buffer:(void *)buffer count:(NSUInteger)count {
++    if (!core || !buffer || count == 0) { return 0; }
++    BOOL gb = core->platform(core) == mPLATFORM_GB;
++    if (region == 0 && gb) {
++        if (offset >= 0x10000 || count > 0x10000 - offset) { return 0; }
++        uint8_t *out = buffer;
++        for (NSUInteger i = 0; i < count; ++i) { out[i] = core->rawRead8(core, offset + (uint32_t)i, -1); }
++        return count;
++    }
++    size_t blockID;
++    if (region == 1) { blockID = gb ? 0x0C : 0x02; }
++    else if (region == 2 && !gb) { blockID = 0x03; }
++    // GBA 0x0F exposes physical savedata, including the first flash bank,
++    // independently of the bank currently mapped into the bus at 0x0E.
++    else if (region == 3) { blockID = gb ? 0x0A : 0x0F; }
++    else { return 0; }
++    size_t size = 0;
++    const uint8_t *bytes = core->getMemoryBlock(core, blockID, &size);
++    if (!bytes || offset >= size) { return 0; }
++    size_t length = MIN(count, size - offset);
++    memcpy(buffer, bytes + offset, length);
++    return length;
++}
++
+ - (void)executeFrame {
+     core->runFrame(core);
++    if (_relayFrameHandler) { _relayFrameHandler(); }
+ 
+     struct mAudioBuffer *buffer = core->getAudioBuffer(core);
+-    int samplesAvail = mAudioBufferAvailable(buffer);
+-
+-    if (samplesAvail > 0) {
+-        // Update running average using leaky integrator
+-        audioSamplesPerFrameAvg = (SAMPLES_PER_FRAME_MOVING_AVG_ALPHA * (float)samplesAvail) +
+-                ((1.0f - SAMPLES_PER_FRAME_MOVING_AVG_ALPHA) * audioSamplesPerFrameAvg);
+-
+-        size_t samplesToRead = (size_t)(audioSamplesPerFrameAvg);
+-
+-        // Ensure buffer size is correct (stereo Int16 samples)
+-        if (audioBufferSize < (samplesToRead * sizeof(int16_t) * 2)) {
+-            audioBufferSize = (samplesToRead * sizeof(int16_t) * 2);
+-            audioBuffer = realloc(audioBuffer, audioBufferSize);
+-        }
+-
+-        int produced = mAudioBufferRead(buffer, audioBuffer, samplesToRead);
+-        if (produced > 0) {
+-            if (audioLowPassEnabled) {
+-                _audioLowPassFilter(audioBuffer, produced);
+-            }
+-            [[self ringBufferAtIndex:0] write:audioBuffer size:produced * sizeof(int16_t) * 2];
++    unsigned sourceRate = core->audioSampleRate(core);
++    if (sourceRate == 0) { return; }
++    #if DEBUG
++    if (resampler.sourceRate != sourceRate &&
++        [[NSProcessInfo processInfo].arguments containsObject:@"--relay-skins-share-qualification"]) {
++        NSLog(@"RELAY-AUDIO nativeRate=%u outputRate=%u", sourceRate, RelayAudioOutputRate);
++    }
++    #endif
++    mAudioResamplerSetSource(&resampler, buffer, sourceRate, true);
++    mAudioResamplerProcess(&resampler);
++    size_t produced = mAudioBufferRead(&intermediateAudio, audioBuffer,
++                                      audioBufferSize / (sizeof(int16_t) * 2));
++    if (produced > 0) {
++        if (audioLowPassEnabled) {
++            _audioLowPassFilter(audioBuffer, (int)produced);
+         }
++        [[self ringBufferAtIndex:0] write:audioBuffer size:produced * sizeof(int16_t) * 2];
+     }
+ }
+ 
+ - (void)resetEmulation {
+     core->reset(core);
++    mAudioBufferClear(&intermediateAudio);
++    resampler.timestamp = 0;
++    if (_relayResetHandler) { _relayResetHandler(); }
+ }
+ 
+ - (void)setupEmulation {
+@@ -233,7 +270,14 @@ static struct mLogger logger = { .log = _log };
+ #pragma mark - Video
+ 
+ - (CGSize)aspectSize {
+-    return CGSizeMake(3, 2);
++    // Relay: the Game Boy draws 160x144 and the Advance 240x160. Both have
++    // square pixels, so the buffer's own ratio is the display ratio; upstream
++    // returned the Advance's 3:2 for every game.
++    core->currentVideoSize(core, &width, &height);
++    if (width == 0 || height == 0) {
++        return CGSizeMake(3, 2);
++    }
++    return CGSizeMake(width, height);
+ }
+ 
+ - (CGRect)screenRect {
+@@ -283,7 +327,7 @@ static struct mLogger logger = { .log = _log };
+ }
+ 
+ - (double)audioSampleRate {
+-    return 32768.0; // GBA native sample rate
++    return RelayAudioOutputRate;
+ }
+ 
+ - (NSUInteger)audioBitDepth {
+@@ -331,6 +375,8 @@ static struct mLogger logger = { .log = _log };
+         return NO;
+     }
+     vf->close(vf);
++    mAudioBufferClear(&intermediateAudio);
++    resampler.timestamp = 0;
+     return YES;
+ }
+ 
+@@ -380,6 +426,18 @@ static struct mLogger logger = { .log = _log };
+     vf->close(vf);
+ }
+ 
++- (NSData *)relay_cloneBatterySave {
++    void* sram = NULL;
++    size_t size = core->savedataClone(core, &sram);
++    if (!size || !sram) {
++        if (sram) {
++            free(sram);
++        }
++        return nil;
++    }
++    return [NSData dataWithBytesNoCopy:sram length:size freeWhenDone:YES];
++}
++
+ #pragma mark - Input
+ 
+ - (oneway void)didPushGBAButton:(PVGBAButton)button forPlayer:(NSUInteger)player {
+@@ -420,7 +478,10 @@ static struct mLogger logger = { .log = _log };
+     int codeType = GBA_CHEAT_AUTODETECT;
+     NSArray *codeSet = [code componentsSeparatedByString:@"+"];
+     for (id c in codeSet) {
+-        mCheatAddLine(cheatSet, [c UTF8String], codeType);
++        if (!mCheatAddLine(cheatSet, [c UTF8String], codeType)) {
++            mCheatSetDeinit(cheatSet);
++            return NO;
++        }
+     }
+     cheatSet->enabled = enabled;
+     [cheatSets setObject:[NSValue valueWithPointer:cheatSet] forKey:codeId];
+diff --git a/Vendor/Provenance/Cores/mGBA/Sources/PVmGBACore/CorePlist-Generated.swift b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBACore/CorePlist-Generated.swift
+new file mode 100644
+index 000000000..7611c01b2
+--- /dev/null
++++ b/Vendor/Provenance/Cores/mGBA/Sources/PVmGBACore/CorePlist-Generated.swift
+@@ -0,0 +1,46 @@
++// Relay: generated once by SwiftGen (core-inline-swift6.stencil) from Resources/Core.plist
++// and committed so the build needs no plugin. Regenerate by hand if Core.plist changes.
++// swiftlint:disable all
++// Generated using SwiftGen — https://github.com/SwiftGen/SwiftGen
++
++import Foundation
++
++#if canImport(PVCoreBridge)
++@_exported import PVCoreBridge
++@_exported import PVPlists
++#endif
++
++// swiftlint:disable superfluous_disable_command
++// swiftlint:disable file_length
++
++// MARK: - Plist Files
++
++// swiftlint:disable identifier_name line_length number_separator type_body_length
++public enum CorePlist {
++  public static let pvCapabilities: [String] = ["highAccuracy", "rumble", "rewind", "runAhead"]
++  public static let pvCopyright: String = "Copyright © 2013-2024 Jeffrey Pfau"
++  public static let pvCoreIdentifier: String = "com.provenance.core.mGBA"
++  public static let pvLicenseName: String = "MPL-2.0"
++  public static let pvLicenseURL: String = "https://github.com/mgba-emu/mgba/blob/HEAD/LICENSE"
++  public static let pvPrincipleClass: String = "PVmGBACore.PVmGBACore"
++  public static let pvProjectName: String = "mGBA"
++  public static let pvProjectURL: String = "https://mgba.io/"
++  public static let pvProjectVersion: String = "0.10.3"
++  public static let pvSupportedCheatTypes: [String] = ["Game Shark", "Code Breaker", "Pro Action Replay"]
++  public static let pvSupportedSystems: [String] = ["com.provenance.gba"]
++
++  #if canImport(PVCoreBridge)
++    public static var corePlist: EmulatorCoreInfoPlist {
++        .init(
++            identifier: CorePlist.pvCoreIdentifier,
++            principleClass: CorePlist.pvPrincipleClass,
++            supportedSystems: CorePlist.pvSupportedSystems,
++            projectName: CorePlist.pvProjectName,
++            projectURL: CorePlist.pvProjectURL,
++            projectVersion: CorePlist.pvProjectVersion)
++    }
++
++    public var corePlist: EmulatorCoreInfoPlist { Self.corePlist }
++  #endif
++}
++// swiftlint:enable identifier_name line_length number_separator type_body_length

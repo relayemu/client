@@ -1,0 +1,191 @@
+{
+  "identifier": "08360A1B-1BE7-45C4-974D-ED4EB9332377",
+  "nonRenewingSubscriptions": [],
+  "products": [
+    {
+      "displayPrice": "9.99",
+      "familyShareable": false,
+      "internalID": "544120F9-B52D-49BA-A8BC-36DCC4CF501E",
+      "localizations": [
+        {
+          "description": "Play on Mac. Make the controls your own.",
+          "displayName": "Relay Pro Once",
+          "locale": "en_US"
+        },
+        {
+          "description": "Joue sur Mac. Personnalise tes commandes.",
+          "displayName": "Relay Pro Once",
+          "locale": "fr_FR"
+        }
+      ],
+      "productID": "app.relayemu.relay.pro.lifetime",
+      "referenceName": "Relay Pro Once",
+      "type": "NonConsumable"
+    }
+  ],
+  "settings": {
+    "_failTransactionsEnabled": false,
+    "_locale": "en_US",
+    "_storeKitErrors": [],
+    "_storefront": "USA"
+  },
+  "subscriptionGroups": [
+    {
+      "id": "7011114F-5845-4148-B9D5-BA68229CF236",
+      "localizations": [
+        {
+          "description": "Choose your Relay plan.",
+          "displayName": "Relay Membership",
+          "locale": "en_US"
+        },
+        {
+          "description": "Choisis ton abonnement Relay.",
+          "displayName": "Abonnement Relay",
+          "locale": "fr_FR"
+        }
+      ],
+      "name": "Relay Membership",
+      "subscriptions": [
+        {
+          "adHocOffers": [],
+          "codeOffers": [],
+          "displayPrice": "1.99",
+          "familyShareable": false,
+          "groupNumber": 3,
+          "internalID": "49217DBD-B4DC-4B53-ABFD-64628AD06B0F",
+          "introductoryOffer": null,
+          "localizations": [
+            {
+              "description": "Play on Mac. Make the controls your own.",
+              "displayName": "Relay Pro Monthly",
+              "locale": "en_US"
+            },
+            {
+              "description": "Joue sur Mac. Personnalise tes commandes.",
+              "displayName": "Relay Pro Mensuel",
+              "locale": "fr_FR"
+            }
+          ],
+          "productID": "app.relayemu.relay.pro.monthly",
+          "recurringSubscriptionPeriod": "P1M",
+          "referenceName": "Relay Pro Monthly",
+          "subscriptionGroupID": "7011114F-5845-4148-B9D5-BA68229CF236",
+          "type": "RecurringSubscription",
+          "winBackOffers": []
+        },
+        {
+          "adHocOffers": [],
+          "codeOffers": [],
+          "displayPrice": "4.99",
+          "familyShareable": false,
+          "groupNumber": 2,
+          "internalID": "0A5B3343-525A-4676-84BB-49D86F87289F",
+          "introductoryOffer": null,
+          "localizations": [
+            {
+              "locale": "en_US",
+              "displayName": "Relay Sync Monthly",
+              "description": "100 GB storage. Relay Pro included."
+            },
+            {
+              "locale": "fr_FR",
+              "displayName": "Relay Sync Mensuel",
+              "description": "100 Go de stockage. Relay Pro inclus."
+            }
+          ],
+          "productID": "app.relayemu.relay.sync.monthly",
+          "recurringSubscriptionPeriod": "P1M",
+          "referenceName": "Relay Sync Monthly",
+          "subscriptionGroupID": "7011114F-5845-4148-B9D5-BA68229CF236",
+          "type": "RecurringSubscription",
+          "winBackOffers": []
+        },
+        {
+          "adHocOffers": [],
+          "codeOffers": [],
+          "displayPrice": "49.99",
+          "familyShareable": false,
+          "groupNumber": 2,
+          "internalID": "21E28A60-5506-4DE3-8ABC-EC103E16BBD1",
+          "introductoryOffer": null,
+          "localizations": [
+            {
+              "locale": "en_US",
+              "displayName": "Relay Sync Yearly",
+              "description": "100 GB storage. Relay Pro included."
+            },
+            {
+              "locale": "fr_FR",
+              "displayName": "Relay Sync Annuel",
+              "description": "100 Go de stockage. Relay Pro inclus."
+            }
+          ],
+          "productID": "app.relayemu.relay.sync.yearly",
+          "recurringSubscriptionPeriod": "P1Y",
+          "referenceName": "Relay Sync Yearly",
+          "subscriptionGroupID": "7011114F-5845-4148-B9D5-BA68229CF236",
+          "type": "RecurringSubscription",
+          "winBackOffers": []
+        },
+        {
+          "adHocOffers": [],
+          "codeOffers": [],
+          "displayPrice": "11.99",
+          "familyShareable": false,
+          "groupNumber": 1,
+          "internalID": "192863DD-5B8E-409F-8423-5043BCDEFDC4",
+          "introductoryOffer": null,
+          "localizations": [
+            {
+              "locale": "en_US",
+              "displayName": "Relay Sync+ Monthly",
+              "description": "500 GB storage. Relay Pro included."
+            },
+            {
+              "locale": "fr_FR",
+              "displayName": "Relay Sync+ Mensuel",
+              "description": "500 Go de stockage. Relay Pro inclus."
+            }
+          ],
+          "productID": "app.relayemu.relay.syncplus.monthly",
+          "recurringSubscriptionPeriod": "P1M",
+          "referenceName": "Relay Sync+ Monthly",
+          "subscriptionGroupID": "7011114F-5845-4148-B9D5-BA68229CF236",
+          "type": "RecurringSubscription",
+          "winBackOffers": []
+        },
+        {
+          "adHocOffers": [],
+          "codeOffers": [],
+          "displayPrice": "119.99",
+          "familyShareable": false,
+          "groupNumber": 1,
+          "internalID": "3D603D13-330F-4493-8A61-C6CAD2A30FB3",
+          "introductoryOffer": null,
+          "localizations": [
+            {
+              "locale": "en_US",
+              "displayName": "Relay Sync+ Yearly",
+              "description": "500 GB storage. Relay Pro included."
+            },
+            {
+              "locale": "fr_FR",
+              "displayName": "Relay Sync+ Annuel",
+              "description": "500 Go de stockage. Relay Pro inclus."
+            }
+          ],
+          "productID": "app.relayemu.relay.syncplus.yearly",
+          "recurringSubscriptionPeriod": "P1Y",
+          "referenceName": "Relay Sync+ Yearly",
+          "subscriptionGroupID": "7011114F-5845-4148-B9D5-BA68229CF236",
+          "type": "RecurringSubscription",
+          "winBackOffers": []
+        }
+      ]
+    }
+  ],
+  "version": {
+    "major": 4,
+    "minor": 0
+  }
+}

@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Maiko BOSSUYT
+// SPDX-License-Identifier: GPL-3.0-or-later
+module RelayDataChannel {
+    header "rtc/rtc.h"
+    link "c++"
+    export *
+}

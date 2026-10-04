@@ -1,0 +1,11 @@
+{
+  "upstream": "https://github.com/notaz/pcsx_rearmed",
+  "commit": "da2cb8ecd17fd0932ab6d94774c0522beebce6e3",
+  "committedAt": "2026-08-01T23:31:02Z",
+  "archive": "https://codeload.github.com/notaz/pcsx_rearmed/tar.gz/da2cb8ecd17fd0932ab6d94774c0522beebce6e3",
+  "archiveSHA256": "ff191a349aa88b7156f2c40ae32b7144884eec921542f07508d88715105d175e",
+  "retrievedOn": "2026-09-11",
+  "license": "GPL-2.0-or-later",
+  "mechanism": "vendored-archive",
+  "note": "Exact unmodified upstream archive. Relay additions are Package.swift, RELAY_VENDOR.json and RelayBridge/. Interpreter only (DRC_DISABLE); TVOS guard on every Apple target removes upstream ptrace call. No JIT, foreign frontend, host CD access, shared cards, or proprietary BIOS. See RelayBridge/README.md."
+}

@@ -1,0 +1,11 @@
+{
+  "artifact": "Relay Sync Protocol v1",
+  "apiMajor": 1,
+  "semanticSchema": 3,
+  "semanticSchemas": [
+    2,
+    3
+  ],
+  "artifactRevision": "1.2.0",
+  "status": "frozen"
+}

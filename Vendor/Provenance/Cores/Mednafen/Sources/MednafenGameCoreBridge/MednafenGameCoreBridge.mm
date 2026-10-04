@@ -1,0 +1,2010 @@
+/*
+ Copyright (c) 2013, OpenEmu Team
+
+
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ * Redistributions of source code must retain the above copyright
+ notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright
+ notice, this list of conditions and the following disclaimer in the
+ documentation and/or other materials provided with the distribution.
+ * Neither the name of the OpenEmu Team nor the
+ names of its contributors may be used to endorse or promote products
+ derived from this software without specific prior written permission.
+
+ THIS SOFTWARE IS PROVIDED BY OpenEmu Team ''AS IS'' AND ANY
+ EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ DISCLAIMED. IN NO EVENT SHALL OpenEmu Team BE LIABLE FOR ANY
+ DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
+#import "MednafenGameCoreBridge.h"
+#include <zlib.h>
+
+@import MednafenGameCoreC;
+@import MednafenGameCoreOptions;
+@import mednafen;
+
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+#import <OpenGLES/gltypes.h>
+#import <OpenGLES/ES3/gl.h>
+#import <OpenGLES/ES3/glext.h>
+#import <OpenGLES/EAGL.h>
+#else
+#import <OpenGL/OpenGL.h>
+#import <GLUT/GLUT.h>
+#endif
+
+
+#import <Foundation/Foundation.h>
+#import <string.h>
+@import PVSupport;
+@import PVCoreBridge;
+@import PVEmulatorCore;
+@import PVLoggingObjC;
+@import PVObjCUtils;
+@import PVAudio;
+
+//#import <mednafen/mednafen-driver.h>
+//#import <PVMednafen/PVMednafen-Swift.h>
+//#import <PVMednafenGameCoreC/PVMednafenGameCoreC.h>
+
+#define GET_CURRENT_OR_RETURN(...) __strong __typeof__(_current) current = _current; if(current == nil) return __VA_ARGS__;
+
+// MultiDisc game databases are on MednafenGameCoreOptions (Swift @objc methods).
+// Accessed as [MednafenGameCoreOptions multiDiscPSXGames] etc.
+
+// MultiTap/MultiDisc game databases are now on MednafenGameCoreOptions (Swift @objc methods).
+// They are accessed as [MednafenGameCoreOptions multiTapPSXGames] etc. — no bridge category needed.
+
+/// Compute CRC32 of a ROM file, stripping any 512-byte SMC header if present.
+static uint32_t computeROMCRC32(NSString *filePath) {
+    NSData *data = [NSData dataWithContentsOfFile:filePath];
+    if (!data) return 0;
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger length = data.length;
+    // Strip 512-byte header when (file size & 0x7FFF) == 512 (SMC format, matches Mednafen)
+    if (length > 512 && (length & 0x7FFF) == 512) {
+        bytes += 512;
+        length -= 512;
+    }
+    return (uint32_t)crc32(0, bytes, (uInt)length);
+}
+
+static Mednafen::MDFNGI *game;
+static Mednafen::MDFN_Surface *backBufferSurf;
+static Mednafen::MDFN_Surface *frontBufferSurf;
+static bool s_mednafenInitialized = false;
+
+#if WANT_VB_EMU
+namespace MDFN_IEN_VB
+{
+//extern void VIP_SetParallaxDisable(bool disabled);
+//extern void VIP_SetAnaglyphColors(uint32 lcolor, uint32 rcolor);
+int mednafenCurrentDisplayMode = 1;
+}
+#endif
+
+@interface MednafenGameCoreBridge ()
+{
+    OEIntSize mednafenCoreAspect;
+
+    Mednafen::EmulateSpecStruct spec;
+//    uint32_t *inputBuffer[13];
+}
+
+@end
+
+// Forward-declare LightGun category methods used in this translation unit.
+@interface MednafenGameCoreBridge (LightGun)
+- (void)resetLightGunState;
+@end
+
+static __weak MednafenGameCoreBridge *_current;
+
+@implementation MednafenGameCoreBridge
+@dynamic audioSampleRate;
+-(const void *)getGame {
+    return (const void *)game;
+}
+
+//-(uint32_t*) getInputBuffer:(int)bufferId
+//{
+//    return inputBuffer[bufferId];
+//}
+
+// Ensure Mednafen global/static state is fully reset between loads (especially on iOS where
+// dyld may not truly unload globals between plugin reloads).
+static void mednafen_reset_state()
+{
+    // Delete any existing framebuffers first.
+    if (backBufferSurf) { delete backBufferSurf; backBufferSurf = NULL; }
+    if (frontBufferSurf) { delete frontBufferSurf; frontBufferSurf = NULL; }
+
+    // Close any loaded game if applicable.
+    // MDFNI_CloseGame() is safe to call if no game is loaded; it will no-op.
+    Mednafen::MDFNI_CloseGame();
+
+    // Kill Mednafen to reset Settings, system lists, and static globals.
+    Mednafen::MDFNI_Kill();
+
+    game = NULL;
+    s_mednafenInitialized = false;
+}
+
+// Count non-empty, non-comment entries in an M3U file.
+// Lines beginning with '#' or ';' are treated as comments; whitespace-only lines are ignored.
+static NSInteger PVCountM3UEntriesAtPath(NSString *m3uPath)
+{
+    NSError *readErr = nil;
+    NSString *contents = [NSString stringWithContentsOfFile:m3uPath encoding:NSUTF8StringEncoding error:&readErr];
+    if (!contents) {
+        ILOG(@"Mednafen: M3U read failed (%@): %@", m3uPath.lastPathComponent, readErr.localizedDescription);
+        return 0;
+    }
+    __block NSInteger count = 0;
+    NSCharacterSet *wsnl = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    [contents enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:wsnl];
+        if (trimmed.length == 0) return;
+        unichar c = [trimmed characterAtIndex:0];
+        if (c == '#' || c == ';') return;
+        count++;
+    }];
+    return count;
+}
+
+static void mednafen_init(MednafenGameCoreBridge* current)
+{
+    NSString* batterySavesDirectory = current.batterySavesPath;
+    NSString* biosPath = current.BIOSPath;
+
+    // Defensively reset any lingering global state from a previous session before re-init.
+    if (s_mednafenInitialized) {
+        mednafen_reset_state();
+    }
+
+    Mednafen::MDFNI_Init();
+
+    std::vector<Mednafen::MDFNSetting> settings;
+    // Finalizes settings, and sets the base directory.
+    // Call once, after MDFNI_Init() and any MDFNI_AddSetting() calls.
+    // Returns 'false' on error.
+    BOOL success = Mednafen::MDFNI_InitFinalize([biosPath UTF8String]);
+    if(!success) {
+        ELOG(@"MDFNI_InitFinalize failed");
+    }
+    else {
+        s_mednafenInitialized = true;
+    }
+
+    // Set bios/system file and memcard save paths
+    Mednafen::MDFNI_SetSetting("pce.cdbios", [[[biosPath stringByAppendingPathComponent:@"syscard3"] stringByAppendingPathExtension:@"pce"] UTF8String]); // PCE CD BIOS
+    Mednafen::MDFNI_SetSetting("pce_fast.cdbios", [[[biosPath stringByAppendingPathComponent:@"syscard3"] stringByAppendingPathExtension:@"pce"] UTF8String]); // PCE CD BIOS
+    Mednafen::MDFNI_SetSetting("pcfx.bios", [[[biosPath stringByAppendingPathComponent:@"pcfx"] stringByAppendingPathExtension:@"rom"] UTF8String]); // PCFX BIOS
+
+    Mednafen::MDFNI_SetSetting("psx.bios_jp", [[[biosPath stringByAppendingPathComponent:@"scph5500"] stringByAppendingPathExtension:@"bin"] UTF8String]); // JP SCPH-5500 BIOS
+    Mednafen::MDFNI_SetSetting("psx.bios_na", [[[biosPath stringByAppendingPathComponent:@"scph5501"] stringByAppendingPathExtension:@"bin"] UTF8String]); // NA SCPH-5501 BIOS
+    Mednafen::MDFNI_SetSetting("psx.bios_eu", [[[biosPath stringByAppendingPathComponent:@"scph5502"] stringByAppendingPathExtension:@"bin"] UTF8String]); // EU SCPH-5502 BIOS
+
+    Mednafen::MDFNI_SetSetting("ss.bios_jp", [[[biosPath stringByAppendingPathComponent:@"sega_101"] stringByAppendingPathExtension:@"bin"] UTF8String]); // JP SS BIOS
+    Mednafen::MDFNI_SetSetting("ss.bios_na_eu", [[[biosPath stringByAppendingPathComponent:@"mpr-17933"] stringByAppendingPathExtension:@"bin"] UTF8String]); // NA/EU SS BIOS
+
+    NSString *gbaBIOSPath = [[biosPath stringByAppendingPathComponent:@"GBA"] stringByAppendingPathExtension:@"BIOS"];
+
+    if ([[NSFileManager defaultManager] fileExistsAtPath:gbaBIOSPath]) {
+        Mednafen::MDFNI_SetSetting("gba.bios", [[[biosPath stringByAppendingPathComponent:@"GBA"] stringByAppendingPathExtension:@"BIOS"] UTF8String]); //
+    }
+
+    Mednafen::MDFNI_SetSetting("filesys.path_sav", [batterySavesDirectory UTF8String]); // Memcards
+
+    // MARK: Global settings
+
+    // Enable time synchronization(waiting) for frame blitting.
+    // Disable to reduce latency, at the cost of potentially increased video "juddering", with the maximum reduction in latency being about 1 video frame's time.
+    // Will work best with emulated systems that are not very computationally expensive to emulate, combined with running on a relatively fast CPU.
+    // Default: 1
+//    BOOL video_blit_timesync = current.video_blit_timesync;
+//    Mednafen::MDFNI_SetSettingUI("video.blit_timesync", video_blit_timesync);
+
+    // Cache cd's to memory
+    BOOL cd_image_memcache = MednafenGameCoreOptions.cd_image_memcache;
+    Mednafen::MDFNI_SetSettingB("cd.image_memcache", cd_image_memcache);
+
+    // MARK: Sound
+    // TODO: Read from device?
+//    Mednafen::MDFNI_SetSettingUI("sound.rate", "44100");
+
+    // MARK: VirtualBoy
+
+    // VB defaults. dox http://mednafen.sourceforge.net/documentation/09x/vb.html
+    Mednafen::MDFNI_SetSetting("vb.disable_parallax", "1");       // Disable parallax for BG and OBJ rendering
+    Mednafen::MDFNI_SetSetting("vb.anaglyph.preset", "disabled"); // Disable anaglyph preset
+    Mednafen::MDFNI_SetSetting("vb.anaglyph.lcolor", "0xFF0000"); // Anaglyph l color
+    Mednafen::MDFNI_SetSetting("vb.anaglyph.rcolor", "0x000000"); // Anaglyph r color
+
+    Mednafen::MDFNI_SetSetting("vb.default_color", "0xFF0000"); // Anaglyph r color
+
+    //MDFNI_SetSetting("vb.allow_draw_skip", "1");      // Allow draw skipping
+
+    // Display latency reduction hack.
+    // Reduces latency in games by displaying the framebuffer 20ms earlier. This hack has some potential of causing graphical glitches, so it is disabled by default.
+    BOOL vb_instant_display_hack = MednafenGameCoreOptions.vb_instant_display_hack;
+    Mednafen::MDFNI_SetSettingB("vb.instant_display_hack", vb_instant_display_hack); // Display latency reduction hack
+
+    const char* vb_sidebyside = MednafenGameCoreOptions.vb_sidebyside ? "sidebyside" : "anaglyph";
+    Mednafen::MDFNI_SetSetting("vb.3dmode", vb_sidebyside);
+
+    // This setting refers to pixels before vb.xscale(fs) scaling is taken into consideration. For example, a value of "100" here will result in a separation of 300 screen pixels if vb.xscale(fs) is set to "3".
+//    int seperation = current.vb_sidebyside_seperation;
+//    Mednafen::MDFNI_SetSetting("vb.sidebyside.separation", seperation);
+    // Mednafen::MDFNI_SetSetting("vb.sidebyside.separation", [NSString stringWithFormat:@"%i", seperation].UTF8String);
+
+    // MARK: SNES Faust settings
+    BOOL snes_faust_spex = MednafenGameCoreOptions.mednafen_snesFast_spex;
+    Mednafen::MDFNI_SetSettingB("snes_faust.spex", snes_faust_spex);
+    // Enable 1-frame speculative execution for video output.
+    // Hack to reduce input.output video latency by 1 frame. Enabling will increase CPU usage,
+    // and may cause video glitches(such as "jerkiness") in some oddball games, but most commercially-released games should be fine.
+    // Default 0
+
+    //	MDFNI_SetSetting("snes_faust->special", "nn2x");
+
+    // MARK: Sega Saturn Settings
+    // https://mednafen.github.io/documentation/ss.html
+    BOOL ss_h_overscan = MednafenGameCoreOptions.ss_h_overscan;
+    Mednafen::MDFNI_SetSettingB("ss.h_overscan", ss_h_overscan); // Show horizontal overscan area. 1 default
+
+    const char* ss_cart_autodefault;
+    switch (MednafenGameCoreOptions.ss_cart_autodefault) {
+        case 0:
+            ss_cart_autodefault = "none";
+            break;
+        case 1:
+            ss_cart_autodefault = "backup";
+            break;
+        case 2:
+            ss_cart_autodefault = "extram1";
+            break;
+        case 3:
+            ss_cart_autodefault = "extram4";
+            break;
+        case 4:
+            ss_cart_autodefault = "cs1ram16";
+            break;
+        default:
+            ss_cart_autodefault = "backup";
+            break;
+    }
+    Mednafen::MDFNI_SetSetting("ss.cart.auto_default", ss_cart_autodefault);
+
+    const char* ss_region_default;
+    switch (MednafenGameCoreOptions.ss_region_default) {
+        case 0:
+            ss_region_default = "jp";
+            break;
+        case 1:
+            ss_region_default = "na";
+            break;
+        case 2:
+            ss_region_default = "eu";
+            break;
+        case 3:
+            ss_region_default = "kr";
+            break;
+        case 4:
+            ss_region_default = "tw";
+            break;
+        case 5:
+            ss_region_default = "as";
+            break;
+        case 6:
+            ss_region_default = "br";
+            break;
+        case 7:
+            ss_region_default = "la";
+            break;
+        default:
+            ss_region_default = "jp";
+            break;
+    }
+    Mednafen::MDFNI_SetSetting("ss.region_default", ss_region_default);
+
+    // MARK: NES Settings
+
+    Mednafen::MDFNI_SetSettingUI("nes.clipsides", 1); // Clip left+right 8 pixel columns. 0 default
+    Mednafen::MDFNI_SetSettingB("nes.correct_aspect", true); // Correct the aspect ratio. 0 default
+
+
+    // MARK: PSX Settings
+    BOOL psx_h_overscan = MednafenGameCoreOptions.psx_h_overscan;
+    Mednafen::MDFNI_SetSettingB("psx.h_overscan", psx_h_overscan); // Show horizontal overscan area. 1 default
+    // Set default region used when auto-detect fails. Configurable so EU/PAL users can set "eu"
+    // to get correct PAL timing and aspect ratio for discs without clear region markers.
+    const char* psx_region_default;
+    switch (MednafenGameCoreOptions.psx_region_default) {
+        case 0:  psx_region_default = "jp"; break;
+        case 2:  psx_region_default = "eu"; break;
+        default: psx_region_default = "na"; break;
+    }
+    Mednafen::MDFNI_SetSetting("psx.region_default", psx_region_default);
+
+    Mednafen::MDFNI_SetSettingB("psx.input.analog_mode_ct", false); // Enable Analog mode toggle
+    /*
+     0x0001=SELECT
+     0x0002=L3
+     0x0004=R3
+     0x0008=START
+     0x0010=D-Pad Up
+     0x0020=D-Pad Right
+     0x0040=D-Pad Down
+     0x0080=D-Pad Left
+     0x0100=L2
+     0x0200=R2
+     0x0400=L1
+     0x0800=R1
+     0x1000=△
+     0x2000=○
+     0x4000=x
+     0x8000=□
+     */
+    // Analog/Digital Toggle
+    uint64 amct =
+    ((1 << PSXMap[PVPSXButtonL1]) | (1 << PSXMap[PVPSXButtonR1]) | (1 << PSXMap[PVPSXButtonL2]) | (1 << PSXMap[PVPSXButtonR2]) | (1 << PSXMap[PVPSXButtonCircle])) |
+    ((1 << PSXMap[PVPSXButtonL1]) | (1 << PSXMap[PVPSXButtonR1]) | (1 << PSXMap[PVPSXButtonCircle]));
+    Mednafen::MDFNI_SetSettingUI("psx.input.analog_mode_ct.compare", amct);
+
+    // MARK: PCE Settings
+    //	MDFNI_SetSetting("pce.disable_softreset", "1"); // PCE: To prevent soft resets due to accidentally hitting RUN and SEL at the same time.
+    //	MDFNI_SetSetting("pce.adpcmextraprec", "1"); // PCE: Enabling this option causes the MSM5205 ADPCM predictor to be outputted with full precision of 12-bits,
+    //												 // rather than only outputting 10-bits of precision(as an actual MSM5205 does).
+    //												 // Enable this option to reduce whining noise during ADPCM playback.
+    Mednafen::MDFNI_SetSetting("pce.slstart", "0"); // PCE: First rendered scanline 4 default
+    Mednafen::MDFNI_SetSetting("pce.slend", "239"); // PCE: Last rendered scanline 235 default, 241 max
+    Mednafen::MDFNI_SetSetting("pce.h_overscan", "1"); // PCE: Show horizontal overscan are, default 0. Needed for correctly displaying the system aspect ratio.
+    Mednafen::MDFNI_SetSetting("pce.resamp_quality", "5"); // PCE: Audio resampler quality, default 3 Higher values correspond to better SNR and better preservation of higher frequencies("brightness"), at the cost of increased computational complexity and a negligible increase in latency. Higher values will also slightly increase the probability of sample clipping(relevant if Mednafen's volume control settings are set too high), due to increased (time-domain) ringing.
+    Mednafen::MDFNI_SetSetting("pce.resamp_rate_error", "0.0000001"); // PCE: Sound output rate tolerance. Lower values correspond to better matching of the output rate of the resampler to the actual desired output rate, at the expense of increased RAM usage and poorer CPU cache utilization. default 0.0000009
+    Mednafen::MDFNI_SetSetting("pce.cdpsgvolume", "62"); // PCE: PSG volume when playing a CD game. Setting this volume control too high may cause sample clipping. default 100
+
+    // MARK: PCE_Fast settings
+
+    Mednafen::MDFNI_SetSetting("pce_fast.cdspeed", "4"); // PCE: CD-ROM data transfer speed multiplier. Default is 1
+    //      MDFNI_SetSetting("pce_fast.disable_softreset", "1"); // PCE: To prevent soft resets due to accidentally hitting RUN and SEL at the same time
+    Mednafen::MDFNI_SetSetting("pce_fast.slstart", "0"); // PCE: First rendered scanline
+    Mednafen::MDFNI_SetSetting("pce_fast.slend", "239"); // PCE: Last rendered scanline
+
+    // MARK: PC-FX Settings
+    Mednafen::MDFNI_SetSetting("pcfx.cdspeed", "8"); // PCFX: Emulated CD-ROM speed. Setting the value higher than 2, the default, will decrease loading times in most games by some degree.
+    //	MDFNI_SetSetting("pcfx.input.port1.multitap", "1"); // PCFX: EXPERIMENTAL emulation of the unreleased multitap. Enables ports 3 4 5.
+    Mednafen::MDFNI_SetSetting("pcfx.nospritelimit", "1"); // PCFX: Remove 16-sprites-per-scanline hardware limit.
+    Mednafen::MDFNI_SetSetting("pcfx.slstart", "4"); // PCFX: First rendered scanline 4 default
+    Mednafen::MDFNI_SetSetting("pcfx.slend", "235"); // PCFX: Last rendered scanline 235 default, 239max
+
+    // MARK: Lynx Settings
+
+    Mednafen::MDFNI_SetSettingB("lynx.lowpass", true); // Low pass filter
+    Mednafen::MDFNI_SetSettingB("lynx.rotateinput", false); // Rotate dpad input
+
+    // MARK: Cheats
+    Mednafen::MDFNI_SetSetting("cheats", "1");       //
+
+    // MARK: HUD
+    // Enable FPS
+#if DEBUG
+//    Mednafen::MDFNI_SetSettingUI("fps.autoenable", 1);
+#endif
+
+    //	NSString *cfgPath = [[current BIOSPath] stringByAppendingPathComponent:@"mednafen-export.cfg"];
+    //    Mednafen::MDFN_SaveSettings(cfgPath.UTF8String);
+}
+
+- (id)init {
+    if((self = [super init])) {
+        _current = self;
+
+        self->multiTapPlayerCount = 2;
+
+        for(unsigned i = 0; i < 13; i++) {
+            inputBuffer[i] = (uint32_t *) calloc(9, sizeof(uint32_t));
+        }
+
+        GBAMap[PVGBAButtonRight] 	= 4;
+        GBAMap[PVGBAButtonLeft]     = 5;
+        GBAMap[PVGBAButtonUp]       = 6;
+        GBAMap[PVGBAButtonDown]     = 7;
+
+        GBAMap[PVGBAButtonA]        = 0;
+        GBAMap[PVGBAButtonB] 		= 1;
+
+        GBAMap[PVGBAButtonSelect]	= 2;
+        GBAMap[PVGBAButtonStart] 	= 3;
+
+        GBAMap[PVGBAButtonR]        = 8;
+        GBAMap[PVGBAButtonL] 		= 9;
+
+        // Gameboy + Color Map
+        GBMap[PVGBButtonRight] 	= 4;
+        GBMap[PVGBButtonLeft]   = 5;
+        GBMap[PVGBButtonUp]     = 6;
+        GBMap[PVGBButtonDown]   = 7;
+
+        GBMap[PVGBButtonA]      = 0;
+        GBMap[PVGBButtonB] 		= 1;
+        GBMap[PVGBButtonSelect]	= 2;
+        GBMap[PVGBButtonStart] 	= 3;
+
+        // SNES Map
+        SNESMap[PVSNESButtonUp]           = 4;
+        SNESMap[PVSNESButtonDown]         = 5;
+        SNESMap[PVSNESButtonLeft]         = 6;
+        SNESMap[PVSNESButtonRight]        = 7;
+
+        SNESMap[PVSNESButtonA]            = 8;
+        SNESMap[PVSNESButtonB]            = 0;
+        SNESMap[PVSNESButtonX]            = 9;
+        SNESMap[PVSNESButtonY]            = 1;
+
+        SNESMap[PVSNESButtonTriggerLeft]  = 10;
+        SNESMap[PVSNESButtonTriggerRight] = 11;
+
+        SNESMap[PVSNESButtonSelect]       = 2;
+        SNESMap[PVSNESButtonStart]        = 3;
+
+        //  { 6, 7, 4, 5, 0, 1, 3, 2 };
+//        LynxMap[PVLynxButtonUp] = 6;
+//        LynxMap[PVLynxButtonDown] = 7;
+//        LynxMap[PVLynxButtonLeft] = 4;
+//        LynxMap[PVLynxButtonRight] = 5;
+//        LynxMap[PVLynxButtonA] = 0;
+//        LynxMap[PVLynxButtonB] = 1;
+//        LynxMap[PVLynxButtonOption1] = 3;
+//        LynxMap[PVLynxButtonOption2] = 2;
+//        LynxMap[PVLynxButtonPause] = 8;
+
+        // NES Map
+//        NESMap[PVNESButtonUp]           = 4;
+//        NESMap[PVNESButtonDown]         = 5;
+//        NESMap[PVNESButtonLeft]         = 6;
+//        NESMap[PVNESButtonRight]        = 7;
+//
+//        NESMap[PVNESButtonA]            = 0;
+//        NESMap[PVNESButtonB]            = 1;
+//
+//        NESMap[PVNESButtonSelect]       = 2;
+//        NESMap[PVNESButtonStart]        = 3;
+
+        // PCE Map
+        PCEMap[PVPCEButtonUp]       = 4;
+        PCEMap[PVPCEButtonRight]    = 5;
+        PCEMap[PVPCEButtonDown]     = 6;
+        PCEMap[PVPCEButtonLeft]     = 7;
+
+        PCEMap[PVPCEButtonButton1]  = 0;
+        PCEMap[PVPCEButtonButton2]  = 1;
+        PCEMap[PVPCEButtonButton3]  = 8;
+        PCEMap[PVPCEButtonButton4]  = 9;
+        PCEMap[PVPCEButtonButton5]  = 10;
+        PCEMap[PVPCEButtonButton6]  = 11;
+
+        PCEMap[PVPCEButtonSelect]   = 2;
+        PCEMap[PVPCEButtonRun]      = 3;
+        PCEMap[PVPCEButtonMode]     = 12;
+
+        // PCFX Map
+        PCFXMap[PVPCFXButtonUp]         = 8;
+        PCFXMap[PVPCFXButtonRight]      = 9;
+        PCFXMap[PVPCFXButtonDown]       = 10;
+        PCFXMap[PVPCFXButtonLeft]       = 11;
+
+        PCFXMap[PVPCFXButtonButton1]    = 0;
+        PCFXMap[PVPCFXButtonButton2]    = 1;
+        PCFXMap[PVPCFXButtonButton3]    = 2;
+        PCFXMap[PVPCFXButtonButton4]    = 3;
+        PCFXMap[PVPCFXButtonButton5]    = 4;
+        PCFXMap[PVPCFXButtonButton6]    = 5;
+
+        PCFXMap[PVPCFXButtonSelect]     = 6;
+        PCFXMap[PVPCFXButtonRun]        = 7;
+        PCFXMap[PVPCFXButtonMode]       = 12;
+
+        // Saturn SS map
+        // static const int SSMap[]   = { 4, 5, 6, 7, 10, 8, 9, 2, 1, 0, 15, 3, 11 };
+        /* IDIISG IODevice_Gamepad_IDII =
+         {
+          IDIIS_Button("z", "Z", 10),
+          IDIIS_Button("y", "Y", 9),
+          IDIIS_Button("x", "X", 8),
+          IDIIS_Button("rs", "Right Shoulder", 12),
+
+          IDIIS_Button("up", "UP ↑", 0, "down"),
+          IDIIS_Button("down", "DOWN ↓", 1, "up"),
+          IDIIS_Button("left", "LEFT ←", 2, "right"),
+          IDIIS_Button("right", "RIGHT →", 3, "left"),
+
+          IDIIS_Button("b", "B", 6),
+          IDIIS_Button("c", "C", 7),
+          IDIIS_Button("a", "A", 5),
+          IDIIS_Button("start", "START", 4),
+
+          IDIIS_Padding<1>(),
+          IDIIS_Padding<1>(),
+          IDIIS_Padding<1>(),
+          IDIIS_Button("ls", "Left Shoulder", 11),
+         };
+         */
+        SSMap[PVSaturnButtonUp]    = 4;
+        SSMap[PVSaturnButtonDown]  = 5;
+        SSMap[PVSaturnButtonLeft]  = 6;
+        SSMap[PVSaturnButtonRight] = 7;
+
+        SSMap[PVSaturnButtonStart] = 3;
+
+        SSMap[PVSaturnButtonA]     = 10;
+        SSMap[PVSaturnButtonB]     = 8;
+        SSMap[PVSaturnButtonC]     = 9;
+        SSMap[PVSaturnButtonX]     = 2;
+        SSMap[PVSaturnButtonY]     = 1;
+        SSMap[PVSaturnButtonZ]     = 0;
+
+        SSMap[PVSaturnButtonL]     = 11;
+        SSMap[PVSaturnButtonR]     = 12;
+    }
+
+//    [MednafenGameCoreOptions boolForOption:@""];
+//    [self parseOptions];
+
+    return self;
+}
+
+- (void)dealloc {
+//    for(unsigned i = 0; i < 13; i++) {
+//        free(inputBuffer[i]);
+//    }
+
+    if (_current == self) {
+        _current = nil;
+        delete backBufferSurf;
+        delete frontBufferSurf;
+    }
+}
+
+# pragma mark - Execution
+
+static void emulation_run(BOOL skipFrame) {
+    GET_CURRENT_OR_RETURN();
+
+    if(game == NULL) {
+        return;
+    }
+
+    static int16_t sound_buf[0x10000];
+//    int32 rects[game->fb_height];
+    int32 *rects = new int32[game->fb_height];
+//    (int32 *)malloc(sizeof(int32) * game->fb_height);
+    memset(rects, 0, game->fb_height*sizeof(int32));
+    rects[0] = ~0;
+
+    // TODO: Test if this is ok and why this doesn't work anymore
+    // probably because used to be a pointer type?
+//    current->spec = {0};
+    current->spec = Mednafen::EmulateSpecStruct();
+    current->spec.surface = backBufferSurf;
+    current->spec.SoundRate = current->sampleRate;
+    current->spec.SoundBuf = sound_buf;
+    current->spec.LineWidths = rects;
+    current->spec.SoundBufMaxSize = sizeof(sound_buf) / 2;
+    current->spec.SoundBufSize = 0;
+    current->spec.SoundVolume = 1.0;
+    current->spec.soundmultiplier = 1.0;
+    current->spec.skip = skipFrame;
+
+    MDFNI_Emulate(&current->spec);
+
+    current->mednafenCoreTiming = current->masterClock / current->spec.MasterCycles;
+
+    // Fix for game stutter. mednafenCoreTiming flutters on init before settling so
+    // now we reset the game speed each frame to make sure current.gameInterval
+    // is up to date while respecting the current game speed setting
+    if(!skipFrame) {
+        [current setGameSpeed:[current gameSpeed]];
+    }
+
+    current->videoOffsetX = current->spec.DisplayRect.x;
+    current->videoOffsetY = current->spec.DisplayRect.y;
+    if(game->multires || current.systemType == MednaSystemPSX) {
+        current->videoWidth = rects[current->spec.DisplayRect.y];
+    }
+    else if(current.systemType == MednaSystemPCE || current.systemType == MednaSystemPCFX) {
+        /// For NEC systems (PCE, PCE CD, PCFX), use the actual rendered width from LineWidths array
+        /// or fall back to fb_width, as DisplayRect.w contains the nominal aspect ratio width (1365)
+        /// which is not the actual pixel width
+        int32_t actualWidth = rects[current->spec.DisplayRect.y];
+        if(actualWidth > 0) {
+            current->videoWidth = actualWidth;
+        } else {
+            current->videoWidth = game->fb_width;
+        }
+    }
+    else {
+        current->videoWidth = current->spec.DisplayRect.w ?: rects[current->spec.DisplayRect.y];
+    }
+    current->videoHeight  = current->spec.DisplayRect.h;
+
+    update_audio_batch(current->spec.SoundBuf, current->spec.SoundBufSize);
+}
+
+- (BOOL)loadFileAtPath:(NSString *)path error:(NSError**)error {
+
+//    if( [[path pathExtension].lowercaseString isEqualToString:@"chd"]) {
+//        if (error) {
+//            NSDictionary *userInfo = @{
+//                NSLocalizedDescriptionKey: @"Failed to CHD game.",
+//                NSLocalizedFailureReasonErrorKey: @"Mednafen does not support CHD files.",
+//                NSLocalizedRecoverySuggestionErrorKey: @"CHD is not supported in Mednafen. Use bin/cue or ISO."
+//            };
+//
+//            NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+//                                                    code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+//                                                userInfo:userInfo];
+//
+//            *error = newError;
+//        }
+//        return NO;
+//    }
+
+    [[NSFileManager defaultManager] createDirectoryAtPath:[self batterySavesPath] withIntermediateDirectories:YES attributes:nil error:NULL];
+
+    if([[self systemIdentifier] isEqualToString:@"com.provenance.apple2"])
+    {
+        self.systemType = MednaSystemApple2;
+
+        self->mednafenCoreModule = @"apple2";
+        //mednafenCoreAspect = OEIntSizeMake(80, 51);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.lynx"])
+    {
+        self.systemType = MednaSystemLynx;
+
+        self->mednafenCoreModule = @"lynx";
+        //mednafenCoreAspect = OEIntSizeMake(80, 51);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.nes"] || [[self systemIdentifier] isEqualToString:@"com.provenance.fds"])
+    {
+        self.systemType = MednaSystemNES;
+
+        self->mednafenCoreModule = @"nes";
+        //mednafenCoreAspect = OEIntSizeMake(4, 3);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.snes"])
+    {
+        self.systemType = MednaSystemSNES;
+
+        self->mednafenCoreModule = MednafenGameCoreOptions.mednafen_snesFast ? @"snes_faust" : @"snes";
+
+        //mednafenCoreAspect = OEIntSizeMake(4, 3);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.gb"]
+            || [[self systemIdentifier] isEqualToString:@"com.provenance.gbc"])
+    {
+        self.systemType = MednaSystemGB;
+
+        self->mednafenCoreModule = @"gb";
+        //mednafenCoreAspect = OEIntSizeMake(10, 9);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.gba"])
+    {
+        self.systemType = MednaSystemGBA;
+
+        self->mednafenCoreModule = @"gba";
+        //mednafenCoreAspect = OEIntSizeMake(3, 2);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 44100;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.genesis"]) // Genesis aka Megaddrive
+    {
+        self.systemType = MednaSystemMD;
+
+        self->mednafenCoreModule = @"md";
+        //mednafenCoreAspect = OEIntSizeMake(4, 3);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.mastersystem"])
+    {
+        self.systemType = MednaSystemSMS;
+
+        self->mednafenCoreModule = @"sms";
+        //mednafenCoreAspect = OEIntSizeMake(256 * (8.0/7.0), 192);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.ngp"]
+            || [[self systemIdentifier] isEqualToString:@"com.provenance.ngpc"])
+    {
+        self.systemType = MednaSystemNeoGeo;
+
+        self->mednafenCoreModule = @"ngp";
+        //mednafenCoreAspect = OEIntSizeMake(20, 19);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 44100;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.pce"]
+            || [[self systemIdentifier] isEqualToString:@"com.provenance.pcecd"]
+            || [[self systemIdentifier] isEqualToString:@"com.provenance.sgfx"])
+    {
+        self.systemType = MednaSystemPCE;
+
+
+        self->mednafenCoreModule = MednafenGameCoreOptions.mednafen_pceFast ? @"pce_fast" : @"pce";
+        //mednafenCoreAspect = OEIntSizeMake(256 * (8.0/7.0), 240);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.pcfx"])
+    {
+        self.systemType = MednaSystemPCFX;
+
+        self->mednafenCoreModule = @"pcfx";
+        //mednafenCoreAspect = OEIntSizeMake(4, 3);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.saturn"])
+    {
+        self.systemType = MednaSystemSS;
+
+        self->mednafenCoreModule = @"ss";
+        //mednafenCoreAspect = OEIntSizeMake(4, 3);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 44100;
+        // [CTRL-DIAG] Confirm which Mednafen module actually loaded for Saturn.
+        // If the tester reports "all 4 shoulders map to Start" we want to be 100% sure
+        // we're in the Saturn (ss) bridge path and not some other system.
+        ILOG(@"[CTRL-DIAG] Mednafen loadFileAtPath: systemIdentifier=%@ systemType=MednaSystemSS module=%@ rom=%@",
+             [self systemIdentifier], self->mednafenCoreModule, [path lastPathComponent]);
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.psx"])
+    {
+        self.systemType = MednaSystemPSX;
+
+        self->mednafenCoreModule = @"psx";
+        // Note: OpenEmu sets this to 4:3, but it's demonstrably wrong. Tested and looked into it myself… the other emulators got this wrong, 3:2 was close, but it's actually 10:7 - Sev
+        //mednafenCoreAspect = OEIntSizeMake(10, 7);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 44100;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.vb"])
+    {
+        self.systemType = MednaSystemVirtualBoy;
+
+        self->mednafenCoreModule = @"vb";
+        //mednafenCoreAspect = OEIntSizeMake(12, 7);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else if([[self systemIdentifier] isEqualToString:@"com.provenance.ws"] || [[self systemIdentifier] isEqualToString:@"com.provenance.wsc"])
+    {
+        self.systemType = MednaSystemWonderSwan;
+
+        self->mednafenCoreModule = @"wswan";
+        //mednafenCoreAspect = OEIntSizeMake(14, 9);
+        //mednafenCoreAspect = OEIntSizeMake(game.nominal_width, game.nominal_height);
+        self->sampleRate         = 48000;
+    }
+    else
+    {
+        NSLog(@"MednafenGameCore loadFileAtPath: Incorrect systemIdentifier");
+        assert(false);
+    }
+
+    assert(_current);
+    mednafen_init(_current);
+    Mednafen::NativeVFS fs = Mednafen::NativeVFS();
+
+    // Cached SNES multitap flags — computed once before load and reused in the SetInput block.
+    BOOL snesIs5Player = NO;
+    BOOL snesIs8Player = NO;
+
+    // Cached Saturn multitap decision — computed before MDFNI_LoadGame and reused post-load.
+    // Saturn reads ss.input.sport*.multitap during its init path so post-load changes have no effect.
+    BOOL ssEnableMultitap = NO;
+    BOOL ssUsePort2 = NO;
+    int ssMaxPlayers = 2;
+
+    // NES/SNES light-gun pre-load detection. Consulted from the post-load SetInput
+    // block to wire port 1 as "zapper" / "superscope" instead of "gamepad" so the
+    // LightGun pause-menu tile drives the actual emulator-side peripheral.
+    // Mednafen-side `gameSupportsLightGun` falls through to LightGunGameRegistry
+    // for these systems — see MednafenGameCoreBridge+LightGun.mm.
+    //
+    // SNES Super Scope is only implemented by the legacy `snes` module
+    // (bSNES-derived). `snes_faust` has no Super Scope driver upstream — guard
+    // the SNES branch on the active mednafenCoreModule.
+    BOOL nesIsZapperGame = NO;
+    BOOL snesIsScopeGame = NO;
+    if (self.systemType == MednaSystemNES || self.systemType == MednaSystemSNES) {
+        NSString *sysID = [self valueForKey:@"systemIdentifier"];
+        NSString *md5 = [self valueForKey:@"romMD5"];
+        NSString *title = self->romName;
+        BOOL gunGame = (sysID.length > 0) &&
+            [PVLightGunGameRegistry gameSupportsLightGunForSystemIdentifier:sysID
+                                                                        md5:md5
+                                                                      title:title];
+        if (gunGame) {
+            if (self.systemType == MednaSystemNES) {
+                nesIsZapperGame = YES;
+                self->_isLightGunGame = YES;
+                self->_lightGunPlayerCount = 1;
+                ILOG(@"Mednafen NES pre-load: Zapper game detected (sysID=%@ md5=%@ title=%@)",
+                     sysID, md5, title);
+            } else { // SNES
+                if ([self->mednafenCoreModule isEqualToString:@"snes_faust"]) {
+                    WLOG(@"Mednafen SNES pre-load: Super Scope game '%@' detected but snes_faust module "
+                         @"has no Super Scope driver — gun input will be ignored. Disable snesFast to "
+                         @"enable Super Scope.", title);
+                } else {
+                    snesIsScopeGame = YES;
+                    self->_isLightGunGame = YES;
+                    self->_lightGunPlayerCount = 1;
+                    ILOG(@"Mednafen SNES pre-load: Super Scope game detected (sysID=%@ md5=%@ title=%@)",
+                         sysID, md5, title);
+                }
+            }
+        }
+    }
+
+    // Apply multitap settings BEFORE MDFNI_LoadGame so the core initialises with the
+    // correct port configuration. Both snes/snes_faust and ss read/cache multitap settings
+    // during their load/init paths — setting them afterwards is too late.
+    if (self.systemType == MednaSystemSNES) {
+        uint32_t romCRC = computeROMCRC32(path);
+        if (romCRC != 0) {
+            NSString *crcStr = [NSString stringWithFormat:@"%08x", romCRC];
+            BOOL is8Player = [[MednafenGameCoreOptions multiTapSNES8PlayerGames] containsObject:crcStr];
+            BOOL is5Player = is8Player || [[MednafenGameCoreOptions multiTapSNESGames] containsObject:crcStr];
+            snesIs8Player = is8Player;
+            snesIs5Player = is5Player;
+            ILOG(@"Mednafen SNES pre-load: multitap crc=%@ 5p=%d 8p=%d module=%@",
+                 crcStr, is5Player, is8Player, self->mednafenCoreModule);
+        } else {
+            WLOG(@"Mednafen SNES pre-load: CRC computation failed for '%@' — skipping multitap detection", path);
+        }
+        NSString *prefix = [self->mednafenCoreModule isEqualToString:@"snes_faust"] ? @"snes_faust" : @"snes";
+        NSString *p1Key = [NSString stringWithFormat:@"%@.input.%@.multitap", prefix,
+                           [prefix isEqualToString:@"snes_faust"] ? @"sport1" : @"port1"];
+        NSString *p2Key = [NSString stringWithFormat:@"%@.input.%@.multitap", prefix,
+                           [prefix isEqualToString:@"snes_faust"] ? @"sport2" : @"port2"];
+        Mednafen::MDFNI_SetSettingB([p1Key UTF8String], snesIs8Player);
+        Mednafen::MDFNI_SetSettingB([p2Key UTF8String], snesIs5Player);
+    } else if (self.systemType == MednaSystemSS) {
+        // Full multitap decision: database → user override → controller count fallback.
+        // All MDFNI_SetSettingB calls must happen here (before MDFNI_LoadGame) because
+        // Saturn's ss.cpp reads and latches these settings during SMPC_SetMultitap().
+        NSString *serial = self.romSerial;
+
+        // Light gun detection — must happen before MDFNI_LoadGame so we can configure
+        // the correct device type in the post-load SetInput block.
+        NSNumber *gunCount = serial ? [MednafenGameCoreOptions saturnLightGunGames][serial] : nil;
+        if (gunCount != nil) {
+            self->_isLightGunGame = YES;
+            self->_lightGunPlayerCount = MAX(1, MIN(2, [gunCount intValue]));
+            ILOG(@"Mednafen Saturn pre-load: light gun game detected, serial=%@ guns=%d",
+                 serial, self->_lightGunPlayerCount);
+        } else {
+            self->_isLightGunGame = NO;
+            self->_lightGunPlayerCount = 0;
+        }
+
+        NSNumber *tapCount = serial ? [MednafenGameCoreOptions multiTapSaturnGames][serial] : nil;
+        BOOL userForcedMultitap = MednafenGameCoreOptions.ss_multitap;
+
+        int connectedControllers = 0;
+        if (self.controller1) connectedControllers++;
+        if (self.controller2) connectedControllers++;
+        if (self.controller3) connectedControllers++;
+        if (self.controller4) connectedControllers++;
+        if (self.controller5) connectedControllers++;
+        if (self.controller6) connectedControllers++;
+        if (self.controller7) connectedControllers++;
+        if (self.controller8) connectedControllers++;
+
+        if (tapCount != nil) {
+            ssMaxPlayers = MAX(2, [tapCount intValue]);
+            ssEnableMultitap = (ssMaxPlayers > 2);
+            ILOG(@"Mednafen Saturn pre-load: serial=%@ players=%d (database)", serial, ssMaxPlayers);
+        } else if (userForcedMultitap) {
+            ssMaxPlayers = 6;
+            ssEnableMultitap = YES;
+            ILOG(@"Mednafen Saturn pre-load: multitap force-enabled by user setting, players=%d", ssMaxPlayers);
+        } else if (connectedControllers > 2) {
+            ssMaxPlayers = 6;
+            ssEnableMultitap = YES;
+            ILOG(@"Mednafen Saturn pre-load: multitap enabled by controller count (%d), players=%d",
+                 connectedControllers, ssMaxPlayers);
+        }
+
+        // Light gun peripherals are incompatible with the TeamTap multitap
+        // (Mednafen's own device description warns about this).  Force multitap
+        // off so the post-load SetInput block can correctly set the "gun" device
+        // type for port 0 (and optionally port 1).
+        if (self->_isLightGunGame && ssEnableMultitap) {
+            WLOG(@"Mednafen Saturn pre-load: disabling multitap — incompatible with light gun peripherals (serial=%@)", serial);
+            ssEnableMultitap = NO;
+            ssMaxPlayers = 2;
+        }
+
+        if (ssEnableMultitap) {
+            ssUsePort2 = serial != nil && [[MednafenGameCoreOptions multiTapSaturnPort2Games] containsObject:serial];
+            Mednafen::MDFNI_SetSettingB("ss.input.sport1.multitap", !ssUsePort2);
+            Mednafen::MDFNI_SetSettingB("ss.input.sport2.multitap", ssUsePort2);
+        } else {
+            Mednafen::MDFNI_SetSettingB("ss.input.sport1.multitap", false);
+            Mednafen::MDFNI_SetSettingB("ss.input.sport2.multitap", false);
+        }
+        ILOG(@"Mednafen Saturn pre-load: enableMultitap=%d usePort2=%d maxPlayers=%d",
+             ssEnableMultitap, ssUsePort2, ssMaxPlayers);
+    }
+
+    // Detailed diagnostics around game load to pinpoint failures (e.g., CHD load issues)
+    const char* module_cstr = [self->mednafenCoreModule UTF8String];
+    const char* path_cstr = [path cStringUsingEncoding:NSUTF8StringEncoding];
+    ILOG(@"Mednafen: MDFNI_LoadGame begin (module=%@, path=%@)", self->mednafenCoreModule, path);
+    try {
+        game = Mednafen::MDFNI_LoadGame(module_cstr, &fs, path_cstr);
+    } catch (const std::exception& e) {
+        ELOG(@"Mednafen: MDFNI_LoadGame threw std::exception: %s", e.what());
+        game = NULL;
+    } catch (...) {
+        ELOG(@"Mednafen: MDFNI_LoadGame threw unknown exception");
+        game = NULL;
+    }
+    if (!game) {
+        BOOL isDir = NO;
+        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir];
+        unsigned long long fsize = 0;
+        if (exists) {
+            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+            fsize = [attrs[NSFileSize] unsignedLongLongValue];
+        }
+        NSString *ext = path.pathExtension.lowercaseString;
+        ELOG(@"Mednafen: MDFNI_LoadGame FAILED (module=%@, ext=%@, exists=%@, isDir=%@, size=%llu bytes)",
+             self->mednafenCoreModule,
+             ext,
+             exists ? @"YES" : @"NO",
+             isDir ? @"YES" : @"NO",
+             fsize);
+    } else {
+        ILOG(@"Mednafen: MDFNI_LoadGame succeeded (module=%@)", self->mednafenCoreModule);
+    }
+//    assert(game);
+
+    if(!game) {
+        if (error) {
+            NSDictionary *userInfo = @{
+                NSLocalizedDescriptionKey: @"Failed to load game.",
+                NSLocalizedFailureReasonErrorKey: @"Mednafen failed to load game.",
+                NSLocalizedRecoverySuggestionErrorKey: @"Check the file isn't corrupt and is a supported Mednafen ROM format."
+            };
+
+            NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                    code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+                                                userInfo:userInfo];
+
+            *error = newError;
+        }
+        return NO;
+    }
+
+    // Uncomment this to set the aspect ratio by the game's render size according to mednafen
+    // is this correct for EU, JP, US? Still testing.
+    mednafenCoreAspect = OEIntSizeMake(game->nominal_width, game->nominal_height);
+
+    // BGRA pixel format
+    Mednafen::MDFN_PixelFormat pix_fmt(Mednafen::MDFN_COLORSPACE_RGB, 4, 0, 8, 16, 24);
+    backBufferSurf = new Mednafen::MDFN_Surface(NULL, game->fb_width, game->fb_height, game->fb_width, pix_fmt);
+    frontBufferSurf = new Mednafen::MDFN_Surface(NULL, game->fb_width, game->fb_height, game->fb_width, pix_fmt);
+
+    self->masterClock = game->MasterClock >> 32;
+    BOOL multiDiscGame = NO;
+
+    if (self.systemType == MednaSystemPCE)
+    {
+        // NOTE: helper-based port-device wiring temporarily reverted to literal
+        // strings while we investigate why it broke touch-skin input for player 1
+        // even though port 0 was unaffected logically. Swift extension + helper
+        // file kept available for re-wire once root cause is understood.
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+        game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+        game->SetInput(2, "gamepad", (uint8_t *)inputBuffer[2]);
+        game->SetInput(3, "gamepad", (uint8_t *)inputBuffer[3]);
+        game->SetInput(4, "gamepad", (uint8_t *)inputBuffer[4]);
+    }
+    else if (self.systemType == MednaSystemPCFX)
+    {
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+        game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+    }
+    else if (self.systemType == MednaSystemVirtualBoy)
+    {
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+        game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+    }
+    else if (self.systemType == MednaSystemSNES)
+    {
+        // Multitap settings were applied before MDFNI_LoadGame; reuse cached flags here.
+        BOOL is8Player = snesIs8Player;
+        BOOL is5Player = snesIs5Player;
+
+        if (is8Player) {
+            self->multiTapPlayerCount = 8;
+            for (int i = 0; i < 8; i++) {
+                game->SetInput(i, "gamepad", (uint8_t *)inputBuffer[i]);
+            }
+        } else if (is5Player) {
+            self->multiTapPlayerCount = 5;
+            for (int i = 0; i < 5; i++) {
+                game->SetInput(i, "gamepad", (uint8_t *)inputBuffer[i]);
+            }
+        } else if (snesIsScopeGame) {
+            // Super Scope game on the legacy `snes` module. Port 0 stays as the
+            // standard player-1 gamepad (menu navigation, two-player titles like
+            // Yoshi's Safari) and port 1 hosts the Super Scope.
+            // String literal is intentional — see commit 313aa94b57; passing a
+            // dynamically-built NSString.UTF8String here broke touch input.
+            self->multiTapPlayerCount = 2;
+            memset(inputBuffer[1], 0, 9 * sizeof(uint32_t));
+            [self resetLightGunState];
+            game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+            game->SetInput(1, "superscope", (uint8_t *)inputBuffer[1]);
+            ILOG(@"Mednafen SNES SetInput: port 0 gamepad, port 1 superscope");
+        } else {
+            self->multiTapPlayerCount = 2;
+            game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+            game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+        }
+    }
+    else if (self.systemType == MednaSystemNES)
+    {
+        // Ports 0 and 1 are standard NES controller ports (players 1 and 2).
+        // Ports 2 and 3 are the NES Four Score ports (players 3 and 4).
+        // NOTE: helper-based per-port wiring reverted while we investigate
+        // why it broke touch-skin input. Revisit alongside the Zapper-on-
+        // port-2 routing once root cause is found.
+        if (nesIsZapperGame) {
+            // The NES Zapper traditionally plugs into the player-2 controller
+            // port (port 1). Player 1 keeps a gamepad so the user can press
+            // Start on Duck Hunt / Hogan's Alley to begin a game.
+            // String literal is intentional — see commit 313aa94b57.
+            memset(inputBuffer[1], 0, 9 * sizeof(uint32_t));
+            [self resetLightGunState];
+            game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+            game->SetInput(1, "zapper",  (uint8_t *)inputBuffer[1]);
+            // Ports 2 and 3 remain wired even though Four Score and Zapper
+            // are mutually exclusive on real hardware — Mednafen tolerates
+            // the extra SetInput calls and stale gamepad state on an unused
+            // port is harmless.
+            game->SetInput(2, "gamepad", (uint8_t *)inputBuffer[2]);
+            game->SetInput(3, "gamepad", (uint8_t *)inputBuffer[3]);
+            ILOG(@"Mednafen NES SetInput: port 0 gamepad, port 1 zapper");
+        } else {
+            game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+            game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+            game->SetInput(2, "gamepad", (uint8_t *)inputBuffer[2]);
+            game->SetInput(3, "gamepad", (uint8_t *)inputBuffer[3]);
+        }
+    }
+    else if (self.systemType == MednaSystemSS) {
+        BOOL hasM3u = [path.pathExtension.lowercaseString isEqualToString:@"m3u"];
+        if (hasM3u) {
+            multiDiscGame = YES;
+            NSInteger discCount = PVCountM3UEntriesAtPath(path);
+            self.maxDiscs = (int)MAX((NSInteger)1, discCount);
+            ILOG(@"Mednafen: Saturn M3U detected, discs=%ld", (long)self.maxDiscs);
+        }
+
+        // Saturn multitap was fully configured (MDFNI_SetSettingB + decision) in the pre-load
+        // block above. Use the cached ssEnableMultitap/ssUsePort2/ssMaxPlayers here only to
+        // call SetInput — do NOT call MDFNI_SetSettingB here (too late; Saturn latches the
+        // setting during MDFNI_LoadGame → SMPC_SetMultitap).
+        if (ssEnableMultitap) {
+            self->multiTapPlayerCount = ssMaxPlayers;
+            // Clear all TeamTap port buffers at load time to prevent stale input state
+            // (phantom button holds) from leaking across sessions.
+            for (int i = 0; i < ssMaxPlayers; i++) {
+                memset(inputBuffer[i], 0, 9 * sizeof(uint32_t));
+            }
+            // When the multitap is on sport1, virtual ports 0-(n-1) are the TeamTap sub-slots.
+            // When the multitap is on sport2, Mednafen maps sport1's single pad to virtual port 0
+            // and the TeamTap sub-slots start at virtual port 1.
+            const int basePortIndex = ssUsePort2 ? 1 : 0;
+            for (int i = 0; i < ssMaxPlayers; i++) {
+                game->SetInput(basePortIndex + i, "gamepad", (uint8_t *)inputBuffer[i]);
+            }
+        } else {
+            // Standard 2-player setup.
+            // Clear Saturn input buffers to avoid leaking state from a prior multitap configuration.
+            int portsToClear = (self->multiTapPlayerCount > 2) ? 6 : 2;
+            for (int port = 0; port < portsToClear; port++) {
+                memset(inputBuffer[port], 0, 9 * sizeof(uint32_t));
+            }
+            self->multiTapPlayerCount = 2;
+
+            if (self->_isLightGunGame) {
+                // Light gun game: configure port 0 as "gun" peripheral.
+                // The gun buffer layout (5 bytes) fits within the existing 36-byte allocation.
+                // Port 1 stays as "gamepad" — the LightGunResponder protocol has no player-index
+                // parameter so all gun events currently route to port 0 only.  Routing P2 gun
+                // input requires a second responder path; until then, configuring port 1 as "gun"
+                // would disable gamepad input there while leaving the gun buffer at defaults.
+                ILOG(@"Mednafen Saturn SetInput: using 'gun' device type for port 0 (game supports %d guns)",
+                     self->_lightGunPlayerCount);
+                [self resetLightGunState];
+                game->SetInput(0, "gun", (uint8_t *)inputBuffer[0]);
+                game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+            } else {
+                game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+                game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+            }
+        }
+    }
+    else if (self.systemType == MednaSystemPSX)
+    {
+        // Detect GunCon light gun games — port 0 is wired as "guncon" AFTER the multitap
+        // block (below) to guarantee the assignment cannot be silently overridden by any
+        // multitap re-initialisation loop.
+        BOOL isLightGunGame = self.gameSupportsLightGun;
+        if (isLightGunGame) {
+            // GunCon uses port 0 (guncon) + port 1 (dualshock); cap player count at 2
+            // so maxNumberPlayers and controller polling don't inherit a stale multitap count.
+            self->multiTapPlayerCount = 2;
+            // Port 1 remains a standard DualShock for menu navigation / 2-player fallback.
+            uint8 *buf1 = (uint8 *)inputBuffer[1];
+            Mednafen::MDFN_en16lsb(&buf1[3],   (uint16) 32767);
+            Mednafen::MDFN_en16lsb(&buf1[3]+2, (uint16) 32767);
+            Mednafen::MDFN_en16lsb(&buf1[3]+4, (uint16) 32767);
+            Mednafen::MDFN_en16lsb(&buf1[3]+6, (uint16) 32767);
+            game->SetInput(1, "dualshock", (uint8_t *)inputBuffer[1]);
+        } else {
+            for(unsigned i = 0; i < self->multiTapPlayerCount; i++) {
+                // Center the Dual Analog Sticks
+                uint8 *buf = (uint8 *)inputBuffer[i];
+                Mednafen::MDFN_en16lsb(&buf[3], (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+2, (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+4, (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+6, (uint16) 32767);
+                // Helper-based per-port wiring reverted while investigating
+                // touch-input regression. Always dualshock for now.
+                game->SetInput(i, "dualshock", (uint8_t *)inputBuffer[i]);
+            }
+        }
+
+        // Multi-Disc check
+        NSNumber *discCount = [MednafenGameCoreOptions multiDiscPSXGames][self.romSerial];
+        if (discCount) {
+            self.maxDiscs = [discCount intValue];
+            multiDiscGame = YES;
+        }
+
+        // PSX: Set multitap configuration if detected by serial.
+        // Skip multitap setup for light-gun games: GunCon occupies port 0 exclusively,
+        // and a dual-serial (e.g. Time Crisis EU / SLES-00284) must not have its port 0
+        // reset to "dualshock" by the multitap re-initialisation loop below.
+        NSString *serial = self.romSerial;
+        NSNumber *multitapCount = !isLightGunGame ? [MednafenGameCoreOptions multiTapPSXGames][serial] : nil;
+        if (multitapCount != nil) {
+            self->multiTapPlayerCount = [multitapCount intValue];
+            ILOG(@"Mednafen PSX: multi-tap serial=%@ players=%d", serial, self->multiTapPlayerCount);
+
+            if ([[MednafenGameCoreOptions multiTap5PlayerPort2] containsObject:serial]) {
+                Mednafen::MDFNI_SetSettingB("psx.input.pport1.multitap", false);
+                Mednafen::MDFNI_SetSettingB("psx.input.pport2.multitap", true); // Enable multitap on PSX port 2
+            } else {
+                Mednafen::MDFNI_SetSettingB("psx.input.pport1.multitap", true); // Enable multitap on PSX port 1
+                if (self->multiTapPlayerCount > 5) {
+                    Mednafen::MDFNI_SetSettingB("psx.input.pport2.multitap", true); // Enable multitap on PSX port 2 for 6-8 players
+                } else {
+                    Mednafen::MDFNI_SetSettingB("psx.input.pport2.multitap", false);
+                }
+            }
+            // Re-setup inputs with updated player count
+            for (unsigned i = 0; i < (unsigned)self->multiTapPlayerCount; i++) {
+                uint8 *buf = (uint8 *)inputBuffer[i];
+                Mednafen::MDFN_en16lsb(&buf[3], (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+2, (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+4, (uint16) 32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+6, (uint16) 32767);
+                // Helper-based per-port wiring reverted while investigating
+                // touch-input regression. Always dualshock for now.
+                game->SetInput(i, "dualshock", (uint8_t *)inputBuffer[i]);
+            }
+        } else {
+            // Explicitly disable multi-tap for non-multi-tap games to prevent bleed from prior loads
+            Mednafen::MDFNI_SetSettingB("psx.input.pport1.multitap", false);
+            Mednafen::MDFNI_SetSettingB("psx.input.pport2.multitap", false);
+        }
+        // Wire port 0 as "guncon" AFTER the multitap block so it cannot be overridden
+        // by the multitap re-initialisation loop above.
+        if (isLightGunGame) {
+            ILOG(@"Mednafen PSX: GunCon game detected (serial=%@), configuring port 0 as guncon", self.romSerial);
+            // Zero out the guncon buffer; coordinates will be written by LightGunResponder callbacks.
+            memset((uint8_t *)inputBuffer[0], 0, 9 * sizeof(uint32_t));
+            game->SetInput(0, "guncon", (uint8_t *)inputBuffer[0]);
+        }
+        // PSX: Check if SBI file is required (LibCrypt copy-protection)
+        if ([MednafenGameCoreOptions sbiRequiredGames][self.romSerial])
+        {
+            self->_isSBIRequired = YES;
+        }
+
+        // Check that required SBI files are present next to their CUE sheets.
+        //
+        // Mednafen automatically loads <disc>.sbi when opening <disc>.cue, but if the file is
+        // absent the LibCrypt check fails silently and the game freezes after the BIOS screen.
+        // Surface a descriptive error early so the user knows exactly what is missing.
+        //
+        // For .cue files  → check for <basename>.sbi in the same directory.
+        // For .m3u files  → parse the m3u, collect .cue entries, check each one's .sbi.
+        if (self->_isSBIRequired) {
+            NSString *pathExt = path.pathExtension.lowercaseString;
+            NSString *romDirectory = path.stringByDeletingLastPathComponent;
+            NSMutableArray<NSString *> *cueBasenames = [NSMutableArray array];
+
+            if ([pathExt isEqualToString:@"cue"]) {
+                [cueBasenames addObject:path.stringByDeletingPathExtension.lastPathComponent];
+            } else if ([pathExt isEqualToString:@"m3u"]) {
+                // Parse m3u – each non-comment line that ends in .cue is a disc
+                NSError *m3uReadErr = nil;
+                NSString *m3uString = [NSString stringWithContentsOfFile:path
+                                                                encoding:NSUTF8StringEncoding
+                                                                   error:&m3uReadErr];
+                if (!m3uString) {
+                    WLOG(@"MednafenGameCoreBridge: Failed to read M3U for SBI check (%@): %@",
+                         path.lastPathComponent, m3uReadErr.localizedDescription);
+                }
+                NSArray<NSString *> *lines = [m3uString componentsSeparatedByCharactersInSet:
+                                              [NSCharacterSet newlineCharacterSet]];
+                for (NSString *line in lines) {
+                    NSString *trimmed = [line stringByTrimmingCharactersInSet:
+                                        [NSCharacterSet whitespaceCharacterSet]];
+                    if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) { continue; }
+                    if ([trimmed.pathExtension.lowercaseString isEqualToString:@"cue"]) {
+                        [cueBasenames addObject:trimmed.stringByDeletingPathExtension.lastPathComponent];
+                    }
+                }
+            }
+
+            if (cueBasenames.count > 0) {
+                NSMutableArray<NSString *> *missingDiscs = [NSMutableArray array];
+                NSFileManager *fm = [NSFileManager defaultManager];
+
+                for (NSString *basename in cueBasenames) {
+                    NSString *sbiPath = [[romDirectory stringByAppendingPathComponent:basename]
+                                         stringByAppendingPathExtension:@"sbi"];
+                    if (![fm fileExistsAtPath:sbiPath]) {
+                        [missingDiscs addObject:basename];
+                        WLOG(@"MednafenGameCoreBridge: Missing SBI file for LibCrypt disc: %@.sbi", basename);
+                    }
+                }
+
+                if (missingDiscs.count > 0 && error) {
+                    NSString *discList = [[missingDiscs valueForKey:@"description"]
+                                          componentsJoinedByString:@"\n"];
+                    BOOL plural = missingDiscs.count > 1;
+                    NSString *title = plural
+                        ? @"Required SBI files missing."
+                        : @"Required SBI file missing.";
+                    NSString *recovery = [NSString stringWithFormat:
+                        @"This game uses Sony LibCrypt copy-protection and requires %@ SBI %@ "
+                        @"to run correctly.\n\n"
+                        @"Missing %@:\n%@\n\n"
+                        @"Drop the .sbi file(s) into the same folder as the .cue file(s) and try again.\n\n"
+                        @"SBI files are available at: https://github.com/Provenance-Emu/Provenance/wiki/SBI-files",
+                        plural ? @"matching" : @"a matching",
+                        plural ? @"files" : @"file",
+                        plural ? @"files" : @"file",
+                        discList];
+
+                    NSDictionary *userInfo = @{
+                        NSLocalizedDescriptionKey:            title,
+                        NSLocalizedRecoverySuggestionErrorKey: recovery
+                    };
+                    *error = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                 code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+                                             userInfo:userInfo];
+                    return NO;
+                }
+            }
+        }
+    } else if (self.systemType == MednaSystemLynx) {
+        // lynx sets all of these in 1 variable, so setting the one we use
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+    } else if (self.systemType == MednaSystemGBA) {
+        // gba sets all of these in 1 variable, so setting the one we use
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+    } else {
+        game->SetInput(0, "gamepad", (uint8_t *)inputBuffer[0]);
+        game->SetInput(1, "gamepad", (uint8_t *)inputBuffer[1]);
+        game->SetInput(2, "gamepad", (uint8_t *)inputBuffer[2]);
+        game->SetInput(3, "gamepad", (uint8_t *)inputBuffer[3]);
+    }
+
+    if (multiDiscGame && ![path.pathExtension.lowercaseString isEqualToString:@"m3u"]) {
+        NSString *m3uPath = [path.stringByDeletingPathExtension stringByAppendingPathExtension:@"m3u"];
+        NSRange rangeOfDocuments = [m3uPath rangeOfString:@"/Documents/" options:NSCaseInsensitiveSearch];
+        if (rangeOfDocuments.location != NSNotFound) {
+            m3uPath = [m3uPath substringFromIndex:rangeOfDocuments.location + 11];
+        }
+
+        if (error) {
+            NSString *message = [NSString stringWithFormat:@"This game requires multiple discs and must be loaded using a m3u file with all %lu discs.\n\nTo enable disc switching and ensure save files load across discs, it cannot be loaded as a single disc.\n\nPlease install a .m3u file with the filename %@.\nSee https://bitly.com/provdiscs", self.maxDiscs, m3uPath];
+
+            NSDictionary *userInfo = @{
+                NSLocalizedDescriptionKey: @"Failed to load game.",
+                NSLocalizedFailureReasonErrorKey: @"Missing required m3u file.",
+                NSLocalizedRecoverySuggestionErrorKey: message
+            };
+
+            NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                    code:PVEmulatorCoreErrorCodeMissingM3U
+                                                userInfo:userInfo];
+
+            *error = newError;
+        }
+        return NO;
+    }
+
+    if (self.maxDiscs > 1) {
+        // Parse number of discs in m3u
+        NSString *m3uString = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@".cue|.ccd" options:NSRegularExpressionCaseInsensitive error:nil];
+        NSUInteger numberOfMatches = [regex numberOfMatchesInString:m3uString options:0 range:NSMakeRange(0, [m3uString length])];
+
+        ILOG(@"Loaded m3u containing %lu cue sheets or ccd",numberOfMatches);
+    }
+
+    //    BOOL success =
+    Mednafen::MDFNI_SetMedia(0, 2, 0, 0); // Disc selection API
+    //    if (!success) {
+    //        NSString *message = [NSString stringWithFormat:@"MDFNI_SetMedia returned 0. Check your m3u or other file paths."];
+    //
+    //        NSDictionary *userInfo = @{
+    //                                   NSLocalizedDescriptionKey: @"Failed to load game.",
+    //                                   NSLocalizedFailureReasonErrorKey: @"MDFNI_SetMedia returned 0",
+    //                                   NSLocalizedRecoverySuggestionErrorKey: message
+    //                                   };
+    //
+    //        NSError *newError = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+    //                                                code:PVEmulatorCoreErrorCodeMissingM3U
+    //                                            userInfo:userInfo];
+    //
+    //        *error = newError;
+    //        return NO;
+    //    }
+
+    emulation_run(NO);
+
+    return YES;
+}
+
+//-(void)setMedia:(BOOL)open forDisc:(NSUInteger)disc {
+//    Mednafen::MDFNI_SetMedia(0, open ? 0 : 2, (uint32) disc, 0);
+//}
+
+-(NSUInteger)maxNumberPlayers {
+    NSUInteger maxPlayers = 2;
+    switch (self.systemType) {
+        case MednaSystemPSX:
+        case MednaSystemSS:
+        case MednaSystemSNES:
+            maxPlayers = self->multiTapPlayerCount;
+            break;
+        case MednaSystemPCE:
+            maxPlayers = 5;
+            break;
+        case MednaSystemMD:
+        case MednaSystemSMS:
+        case MednaSystemNES:
+        case MednaSystemPCFX:
+            maxPlayers = 2;
+            break;
+        case MednaSystemGB:
+        case MednaSystemGBA:
+        case MednaSystemNeoGeo:
+        case MednaSystemLynx:
+        case MednaSystemVirtualBoy:
+        case MednaSystemGG:
+        case MednaSystemWonderSwan:
+            maxPlayers = 1;
+            break;
+    }
+
+    return maxPlayers;
+}
+
+- (void)pollControllers {
+    unsigned maxValue = 0;
+    const int*map = nullptr;
+    switch (self.systemType) {
+        case MednaSystemGBA:
+            maxValue = PVGBAButtonCount;
+            map = GBAMap;
+            break;
+        case MednaSystemGB:
+            maxValue = PVGBButtonCount;
+            map = GBMap;
+            break;
+        case MednaSystemPSX:
+            maxValue = PVPSXButtonCount;
+            map = PSXMap;
+            break;
+        case MednaSystemNeoGeo:
+            maxValue = PVNGPButtonCount;
+            map = NeoMap;
+            break;
+        case MednaSystemLynx:
+            maxValue = PVLynxButtonCount;
+            map = LynxMap;
+            break;
+        case MednaSystemSNES:
+            maxValue = PVSNESButtonCount;
+            map = SNESMap;
+            break;
+        case MednaSystemNES:
+            maxValue = PVNESButtonCount;
+            map = NESMap;
+            break;
+        case MednaSystemPCE:
+            maxValue = PVPCEButtonCount;
+            map = PCEMap;
+            break;
+        case MednaSystemPCFX:
+            maxValue = PVPCFXButtonCount;
+            map = PCFXMap;
+            break;
+        case MednaSystemSS:
+            maxValue = PVSaturnButtonCount;
+            map = SSMap;
+            break;
+        case MednaSystemVirtualBoy:
+            maxValue = PVVBButtonCount;
+            map = VBMap;
+            break;
+        case MednaSystemWonderSwan:
+            maxValue = PVWSButtonCount;
+            map = WSMap;
+            break;
+        case MednaSystemGG:
+            return;
+            break;
+        case MednaSystemMD:
+            return;
+            break;
+        case MednaSystemSMS:
+            return;
+            break;
+    }
+
+    NSUInteger maxNumberPlayers = MIN([self maxNumberPlayers], 8);
+
+    for (NSInteger playerIndex = 0; playerIndex < maxNumberPlayers; playerIndex++) {
+        GCController *controller = nil;
+        switch (playerIndex) {
+            case 0: controller = self.controller1; break;
+            case 1: controller = self.controller2; break;
+            case 2: controller = self.controller3; break;
+            case 3: controller = self.controller4; break;
+            case 4: controller = self.controller5; break;
+            case 5: controller = self.controller6; break;
+            case 6: controller = self.controller7; break;
+            case 7: controller = self.controller8; break;
+            default: break;
+        }
+
+        // Skip per-frame gamepad polling for Saturn ports configured as light guns.
+        // The LightGunResponder path owns inputBuffer[0] for gun games; writing
+        // gamepad bitfields into word 0 would corrupt the X/Y coordinate bytes.
+        if (self.systemType == MednaSystemSS && self->_isLightGunGame && playerIndex == 0) {
+            continue;
+        }
+
+        if (controller) {
+            uint8 *d8 = (uint8 *)inputBuffer[playerIndex];
+            bool analogMode = (d8[2] & 0x02);
+
+            for (unsigned i=0; i<maxValue; i++) {
+
+                if (self.systemType != MednaSystemPSX || i < PVPSXButtonLeftAnalogUp) {
+                    uint32_t value = (uint32_t)[self controllerValueForButtonID:i forPlayer:playerIndex withAnalogMode:analogMode];
+
+                    if(value > 0) {
+                        inputBuffer[playerIndex][0] |= 1 << map[i];
+                    } else {
+                        inputBuffer[playerIndex][0] &= ~(1 << map[i]);
+                    }
+                } else if (analogMode) {
+                    float analogValue = [self PSXAnalogControllerValueForButtonID:i forController:controller];
+                    [self didMovePSXJoystickDirection:(PVPSXButton)i
+                                            withValue:analogValue
+                                            forPlayer:playerIndex];
+                }
+            }
+        } else if (!(self.systemType == MednaSystemSS && self->_isLightGunGame && playerIndex == 0)) {
+            // No controller present — reset the input buffer to a safe neutral state
+            // to prevent phantom button holds from leaking when a controller disconnects.
+            // (Gun ports are excluded: the LightGunResponder path owns their buffers.)
+            if (self.systemType == MednaSystemPSX) {
+                // PSX DualShock buffer: clear buttons then re-center analog axes.
+                // Zeroing the whole buffer would pin analog axes to 0 instead of center.
+                memset(inputBuffer[playerIndex], 0, 9 * sizeof(uint32_t));
+                uint8 *buf = (uint8 *)inputBuffer[playerIndex];
+                Mednafen::MDFN_en16lsb(&buf[3],   (uint16)32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+2, (uint16)32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+4, (uint16)32767);
+                Mednafen::MDFN_en16lsb(&buf[3]+6, (uint16)32767);
+            } else {
+                // Non-PSX: the relevant state is just the button bitfield in word 0.
+                inputBuffer[playerIndex][0] = 0;
+            }
+        }
+    }
+}
+
+- (void)executeFrameSkippingFrame: (BOOL) skip {
+    // Should we be using controller callbacks instead?
+    if (!skip) {
+        [self pollControllers];
+    }
+
+    if(self.isRunning && game != NULL){
+        emulation_run(skip);
+    }
+}
+
+- (void)executeFrame {
+    [self executeFrameSkippingFrame:NO];
+}
+
+- (void)resetEmulation {
+    Mednafen::MDFNI_Reset();
+}
+
+- (void)stopEmulation {
+    // Stop emulation loop first to prevent race conditions during shutdown
+    [super stopEmulation];
+
+    // Close any loaded content and kill Mednafen to reset global/static state
+    Mednafen::MDFNI_CloseGame();
+    Mednafen::MDFNI_Kill();
+
+    // Reset Saturn light gun state so the next session starts clean.
+    [self resetLightGunState];
+
+    // Clear pointers and local static state
+    if (backBufferSurf) { delete backBufferSurf; backBufferSurf = NULL; }
+    if (frontBufferSurf) { delete frontBufferSurf; frontBufferSurf = NULL; }
+    game = NULL;
+    s_mednafenInitialized = false;
+}
+
+- (NSTimeInterval)frameInterval {
+    return self->mednafenCoreTiming ?: 60;
+}
+
+# pragma mark - Video
+
+- (CGRect)screenRect {
+    return CGRectMake(self->videoOffsetX, self->videoOffsetY, self->videoWidth, self->videoHeight);
+}
+
+- (CGSize)bufferSize {
+    if ( game == NULL ) {
+        return CGSizeMake(0, 0);
+    } else {
+        return CGSizeMake(game->fb_width, game->fb_height);
+    }
+}
+
+- (CGSize)aspectSize {
+    return CGSizeMake(mednafenCoreAspect.width, mednafenCoreAspect.height);
+}
+
+- (const void *)videoBuffer {
+    if ( frontBufferSurf == NULL ) {
+        return NULL;
+    } else {
+        return frontBufferSurf->pixels;
+    }
+}
+
+- (GLenum)pixelFormat {
+    return GL_RGBA;
+}
+
+- (GLenum)pixelType {
+    return GL_UNSIGNED_BYTE;
+}
+
+- (GLenum)internalPixelFormat {
+    return GL_RGBA;
+}
+
+- (BOOL)isDoubleBuffered {
+    return YES;
+}
+
+- (void)swapBuffers {
+    Mednafen::MDFN_Surface *tempSurf = backBufferSurf;
+    backBufferSurf = frontBufferSurf;
+    frontBufferSurf = tempSurf;
+}
+
+- (BOOL)rendersToOpenGL {
+    return NO;
+}
+
+#pragma mark - Audio
+
+static size_t update_audio_batch(const int16_t *data, size_t frames)
+{
+    GET_CURRENT_OR_RETURN(frames);
+
+    [[current ringBufferAtIndex:0] write:data size:frames * [current channelCount] * 2];
+    return frames;
+}
+
+- (double)audioSampleRate
+{
+    return self->sampleRate ? self->sampleRate : 48000;
+}
+
+- (NSUInteger)channelCount
+{
+    if(game == nil) { return 2; }
+    return game->soundchan;
+}
+
+# pragma mark - Save States
+
+- (BOOL)saveStateToFileAtPath:(NSString *)fileName error:(NSError**)error   {
+    if (game != nil ) {
+        BOOL success = Mednafen::MDFNI_SaveState(fileName.fileSystemRepresentation, "", NULL, NULL, NULL);
+        if (!success) {
+            if (error) {
+                NSDictionary *userInfo = @{
+                    NSLocalizedDescriptionKey: @"Failed to save state.",
+                    NSLocalizedFailureReasonErrorKey: @"Core failed to create save state.",
+                    NSLocalizedRecoverySuggestionErrorKey: @""
+                };
+
+                NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                        code:PVEmulatorCoreErrorCodeCouldNotSaveState
+                                                    userInfo:userInfo];
+
+                *error = newError;
+            }
+        }
+        return success;
+    } else {
+        if (error) {
+            NSDictionary *userInfo = @{
+                NSLocalizedDescriptionKey: @"Failed to save state.",
+                NSLocalizedFailureReasonErrorKey: @"Core failed to create save state because no game is loaded.",
+                NSLocalizedRecoverySuggestionErrorKey: @""
+            };
+
+            NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                    code:PVEmulatorCoreErrorCodeCouldNotSaveState
+                                                userInfo:userInfo];
+
+            *error = newError;
+        }
+        return NO;
+    }
+}
+
+- (BOOL)loadStateFromFileAtPath:(NSString *)fileName error:(NSError**)error   {
+    if (game != nil ) {
+        // Ensure emulation loop is paused while loading state
+        [self setPauseEmulation:YES];
+        // Load state via Mednafen
+        BOOL success = Mednafen::MDFNI_LoadState(fileName.fileSystemRepresentation, "");
+        if (success) {
+            // Force event/timing and video state to be consistent after load
+            // Reset display rect widths to ensure Mednafen fills them next frame
+            __strong MednafenGameCoreBridge *strongCurrent = _current;
+            if (strongCurrent) {
+                if (strongCurrent->spec.LineWidths) {
+                    memset((void*)strongCurrent->spec.LineWidths, 0, game->fb_height * sizeof(int32));
+                    strongCurrent->spec.LineWidths[0] = ~0;
+                }
+            }
+            // Run one skipped frame to rebuild internal render state safely
+            emulation_run(YES);
+        }
+        [self setPauseEmulation:NO];
+        if (!success) {
+            if (error) {
+                NSDictionary *userInfo = @{
+                    NSLocalizedDescriptionKey: @"Failed to save state.",
+                    NSLocalizedFailureReasonErrorKey: @"Core failed to load save state.",
+                    NSLocalizedRecoverySuggestionErrorKey: @""
+                };
+
+                NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                        code:PVEmulatorCoreErrorCodeCouldNotLoadState
+                                                    userInfo:userInfo];
+
+                *error = newError;
+            }
+        }
+        return success;
+    } else {
+        if (error) {
+            NSDictionary *userInfo = @{
+                NSLocalizedDescriptionKey: @"Failed to load state.",
+                NSLocalizedFailureReasonErrorKey: @"Core failed to load save state because no game is loaded.",
+                NSLocalizedRecoverySuggestionErrorKey: @""
+            };
+
+            NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+                                                     code:PVEmulatorCoreErrorCodeCouldNotLoadState
+                                                 userInfo:userInfo];
+
+            *error = newError;
+        }
+        return NO;
+    }
+}
+
+- (NSData *)serializeStateWithError:(NSError **)outError
+{
+    Mednafen::MemoryStream stream(65536, false);
+    MDFNSS_SaveSM(&stream, true);
+    size_t length = stream.map_size();
+    void *bytes = stream.map();
+
+    if(length) {
+        return [NSData dataWithBytes:bytes length:length];
+    }
+
+    if(outError) {
+        assert(false);
+        // TODO: "fix error log"
+        //        *outError = [NSError errorWithDomain:OEGameCoreErrorDomain code:OEGameCoreCouldNotSaveStateError  userInfo:@{
+        //            NSLocalizedDescriptionKey : @"Save state data could not be written",
+        //            NSLocalizedRecoverySuggestionErrorKey : @"The emulator could not write the state data."
+        //        }];
+    }
+
+    return nil;
+}
+
+- (BOOL)deserializeState:(NSData *)state withError:(NSError **)outError {
+    NSError *error;
+    const void *bytes = [state bytes];
+    size_t length = [state length];
+
+    Mednafen::MemoryStream stream(length, -1);
+    memcpy(stream.map(), bytes, length);
+    MDFNSS_LoadSM(&stream, true);
+    size_t serialSize = stream.map_size();
+
+    if(serialSize != length)
+    {
+        // TODO: "fix error log"
+        //        error = [NSError errorWithDomain:OEGameCoreErrorDomain
+        //                                    code:OEGameCoreStateHasWrongSizeError
+        //                                userInfo:@{
+        //                                           NSLocalizedDescriptionKey : @"Save state has wrong file size.",
+        //                                           NSLocalizedRecoverySuggestionErrorKey : [NSString stringWithFormat:@"The size of the save state does not have the right size, %lu expected, got: %ld.", serialSize, [state length]],
+        //                                        }];
+    }
+
+    if(error) {
+        if(outError) {
+            *outError = error;
+        }
+        return false;
+    } else {
+        return true;
+    }
+}
+
+#if WANT_VB_EMU
+- (void)changeDisplayMode
+{
+    if (self.systemType == MednaSystemVirtualBoy)
+    {
+        switch (MDFN_IEN_VB::mednafenCurrentDisplayMode)
+        {
+            case 0: // (2D) red/black
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x000000);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 1: // (2D) white/black
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFFFFFF, 0x000000);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 2: // (2D) purple/black
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF00FF, 0x000000);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 3: // (3D) red/blue
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x0000FF);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 4: // (3D) red/cyan
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00B7EB);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 5: // (3D) red/electric cyan
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00FFFF);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 6: // (3D) red/green
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00FF00);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 7: // (3D) green/red
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0x00FF00, 0xFF0000);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode++;
+                break;
+
+            case 8: // (3D) yellow/blue
+                MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFFFF00, 0x0000FF);
+                MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+                MDFN_IEN_VB::mednafenCurrentDisplayMode = 0;
+                break;
+
+            default:
+                return;
+                break;
+        }
+    }
+}
+
+- (NSInteger)currentVBDisplayModeIndex {
+    if (self.systemType == MednaSystemVirtualBoy) {
+        return (NSInteger)MDFN_IEN_VB::mednafenCurrentDisplayMode;
+    }
+    return 0;
+}
+
+/// Apply a VB display mode directly by index.
+/// Mode table (matches changeDisplayMode's cycle order):
+///  0 – (2D) red / black
+///  1 – (2D) white / black
+///  2 – (2D) purple / black
+///  3 – (3D) red / blue
+///  4 – (3D) red / cyan
+///  5 – (3D) red / electric cyan
+///  6 – (3D) red / green
+///  7 – (3D) green / red
+///  8 – (3D) yellow / blue
+- (void)selectVBDisplayModeAtIndex:(NSInteger)index {
+    if (self.systemType != MednaSystemVirtualBoy) { return; }
+    if (index < 0 || index > 8) { return; }
+
+    switch (index) {
+        case 0:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x000000);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+            break;
+        case 1:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFFFFFF, 0x000000);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+            break;
+        case 2:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF00FF, 0x000000);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(true);
+            break;
+        case 3:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x0000FF);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        case 4:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00B7EB);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        case 5:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00FFFF);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        case 6:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFF0000, 0x00FF00);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        case 7:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0x00FF00, 0xFF0000);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        case 8:
+            MDFN_IEN_VB::VIP_SetAnaglyphColors(0xFFFF00, 0x0000FF);
+            MDFN_IEN_VB::VIP_SetParallaxDisable(false);
+            break;
+        default:
+            return;
+    }
+    MDFN_IEN_VB::mednafenCurrentDisplayMode = (int)index;
+}
+#endif
+@end
+
+// -- Sanity checks
+static_assert(sizeof(uint8) == 1, "unexpected size");
+static_assert(sizeof(int8) == 1, "unexpected size");
+
+static_assert(sizeof(uint16) == 2, "unexpected size");
+static_assert(sizeof(int16) == 2, "unexpected size");
+
+static_assert(sizeof(uint32) == 4, "unexpected size");
+static_assert(sizeof(int32) == 4, "unexpected size");
+
+static_assert(sizeof(uint64) == 8, "unexpected size");
+static_assert(sizeof(int64) == 8, "unexpected size");
+
+static_assert(sizeof(char) == 1, "unexpected size");
+static_assert(sizeof(int) == 4, "unexpected size");
+
+static_assert(sizeof(short) >= 2, "unexpected size");
+static_assert(sizeof(long) >= 4, "unexpected size");
+static_assert(sizeof(long long) >= 8, "unexpected size");
+static_assert(sizeof(size_t) >= 4, "unexpected size");
+
+static_assert(sizeof(float) >= 4, "unexpected size");
+static_assert(sizeof(double) >= 8, "unexpected size");
+static_assert(sizeof(long double) >= 8, "unexpected size");
+
+static_assert(sizeof(void*) >= 4, "unexpected size");
+//static_assert(sizeof(void*) >= sizeof(void (*)(void)), "unexpected size");
+static_assert(sizeof(uintptr_t) >= sizeof(void*), "unexpected size");
+
+//static_assert(sizeof(char) == SIZEOF_CHAR, "unexpected size");
+//static_assert(sizeof(short) == SIZEOF_SHORT, "unexpected size");
+//static_assert(sizeof(int) == SIZEOF_INT, "unexpected size");
+//static_assert(sizeof(long) == SIZEOF_LONG, "unexpected size");
+//static_assert(sizeof(long long) == SIZEOF_LONG_LONG, "unexpected size");
+//
+//static_assert(sizeof(off_t) == SIZEOF_OFF_T, "unexpected size");
+//static_assert(sizeof(ptrdiff_t) == SIZEOF_PTRDIFF_T, "unexpected size");
+//static_assert(sizeof(size_t) == SIZEOF_SIZE_T, "unexpected size");
+//static_assert(sizeof(void*) == SIZEOF_VOID_P, "unexpected size");
+//
+//static_assert(sizeof(double) == SIZEOF_DOUBLE, "unexpected size");
+
+// Make sure the "char" type is signed(pass -fsigned-char to gcc).  New code in Mednafen shouldn't be written with the
+// assumption that "char" is signed, but there likely is at least some code that does.
+static_assert((char)255 == -1, "char type is not signed 8-bit");

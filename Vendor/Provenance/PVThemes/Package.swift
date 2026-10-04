@@ -1,0 +1,67 @@
+// swift-tools-version:6.0
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+import PackageDescription
+
+let package = Package(
+    name: "PVThemes",
+    platforms: [
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v9),
+        .macOS(.v14),
+        .macCatalyst(.v17),
+        .visionOS(.v1)
+    ],
+    products: [
+        .library(
+            name: "PVThemes",
+            targets: ["PVThemes"]),
+         .library(
+             name: "PVThemes-Dynamic",
+             type: .dynamic,
+             targets: ["PVThemes"]),
+         .library(
+             name: "PVThemes-Static",
+             type: .static,
+             targets: ["PVThemes"])
+    ],
+
+    dependencies: [
+        .package(path: "../PVLogging"),
+        .package(path: "../PVSettings"),
+
+        /// Macros
+
+        /// Local fork aligned with swift-syntax 600.x
+        .package(path: "../Dependencies/HexColors"),
+    ],
+
+    // MARK: - Targets
+    targets: [
+        // MARK: - PVThemes
+        .target(
+            name: "PVThemes",
+            dependencies: [
+                "PVLogging",
+                "PVSettings",
+                "HexColors",
+            ],
+            resources: [.copy("PrivacyInfo.xcprivacy")],
+            linkerSettings: [
+                .linkedFramework("UIKit"),
+                .linkedFramework("SwiftUI")
+            ]
+        ),
+
+        // MARK: - Tests
+        .testTarget(
+            name: "PVThemesTests",
+            dependencies: [
+                "PVThemes"
+            ]
+        )
+    ],
+    swiftLanguageModes: [.v5, .v6],
+    cLanguageStandard: .gnu11,
+    cxxLanguageStandard: .gnucxx20
+)

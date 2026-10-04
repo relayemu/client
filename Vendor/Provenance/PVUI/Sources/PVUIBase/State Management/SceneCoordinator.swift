@@ -1,0 +1,1556 @@
+//
+//  SceneCoordinator.swift
+//  PVUI
+//
+//  Created on 2025-03-25.
+//  Copyright © 2025 Provenance Emu. All rights reserved.
+//
+
+import Foundation
+import UIKit
+import SwiftUI
+import GameController
+import PVCoreBridge
+import PVFeatureFlags
+import PVLogging
+import PVLibrary
+import PVPrimitives
+import PVFileSystem
+import PVRealm
+import PVSettings
+import Combine
+import Defaults
+
+// DeltaSkinManager already "conforms" to but does not
+// know about SkinImporterServicing, since that's in PVLibrary
+// and we don't want to require that dependency
+extension DeltaSkinManager: SkinImporterServicing {
+
+}
+
+/// Coordinator for managing scene transitions in the app
+@MainActor
+// SceneCoordinator's class body is far over the 600-line limit, and already was
+// on develop — verified by linting develop's own copy, which fails identically.
+// The desktop-input work added 44 lines to it; it did not create the debt.
+// Splitting scene coordination into focused collaborators is a separate change.
+// Remove this disable when that split happens.
+// swiftlint:disable:next type_body_length
+public class SceneCoordinator: ObservableObject {
+    public static let shared = SceneCoordinator()
+
+    // Track whether we should show the emulator
+    @Published public var showEmulator: Bool = false
+
+    /// Guards against concurrent `launchGameWithValidation` tasks.
+    /// When non-nil, a launch is already in progress and new calls are dropped.
+    /// Cancel this task to abort an in-progress launch (e.g. when the user taps Cancel).
+    private var activeLaunchTask: Task<Void, Never>?
+    private var launchTimeoutTask: Task<Void, Never>?
+
+    // Cancellables for observation
+    private var cancellables = Set<AnyCancellable>()
+
+    // Track BIOS downloads requested during preflight so we can notify when they finish
+    private var pendingBIOSDownloads = Set<String>()
+    private var completedBIOSDownloadsWhileInEmulator = [String]()
+
+    // Sync status manager for showing progress during game launch
+    @Published public var syncStatusManager = GameSyncStatusManager()
+
+    // Alert state for showing RetroWave styled alerts
+    @Published public var alertState = RetroAlertState()
+
+    // Navigation stack for multi-step alert flows (core selection, save selection, etc.)
+    @Published public var alertNavigationStack = RetroAlertNavigationStack()
+
+    // Pre-launch Transfer Pak setup sheet.
+    // preLaunchTransferPakGame is the single source of truth: non-nil shows the sheet, nil hides it.
+    @Published public var preLaunchTransferPakGame: PVGame? = nil
+    private var _preLaunchContinuation: CheckedContinuation<Void, Never>? = nil
+
+    public enum Scenes {
+        case main
+        case emulator
+    }
+
+    // Published property to track which scene should be shown
+    @Published public var currentScene: Scenes = .main
+
+    private init() {
+        // Observe the EmulationUIState for changes to currentGame
+        AppState.shared.$emulationUIState
+            .map { $0.currentGame != nil }
+            .removeDuplicates()
+            .sink { [weak self] hasGame in
+                guard let self = self else { return }
+                if hasGame {
+                    ILOG("SceneCoordinator: Game detected in EmulationUIState, showing emulator scene")
+                    self.showEmulator = true
+                    self.currentScene = .emulator
+                } else {
+                    ILOG("SceneCoordinator: No game detected in EmulationUIState, returning to main scene")
+                    self.showEmulator = false
+                    self.currentScene = .main
+                }
+            }
+            .store(in: &cancellables)
+
+        // Observe BIOS downloads completing
+        NotificationCenter.default.addObserver(
+            forName: .BIOSFileFound,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            self.handleBIOSFileDownloaded(notification)
+        }
+    }
+
+    public func open(scene: Scenes) {
+        switch scene {
+        case .main:
+            openMainScene()
+        case .emulator:
+            openEmulatorScene()
+        }
+    }
+
+    public func openMainScene() {
+        guard let url = URL(string: "provenance://main") else {
+            ELOG("Failed to create URL for main scene")
+            return
+        }
+
+        ILOG("skins: Setting SkinImporterInjector service to DeltaSkinManager.shared in SceneCoordinator")
+        SkinImporterInjector.shared.service = DeltaSkinManager.shared
+        ILOG("skins: SkinImporterInjector service set in SceneCoordinator")
+
+        ILOG("SceneCoordinator: Opening main scene")
+//        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        ILOG("SceneCoordinator: Setting currentScene = .main and showEmulator = false")
+        currentScene = .main
+        showEmulator = false
+        ILOG("SceneCoordinator: Main scene state updated - currentScene: \(currentScene), showEmulator: \(showEmulator)")
+
+        // If there were BIOS downloads completed while in emulator, surface them now
+        flushCompletedBIOSDownloadAlerts()
+    }
+
+    /// Cancel any in-progress game launch so new launches can proceed.
+    /// Called when the user taps Cancel on the sync status overlay.
+    public func cancelActiveLaunch() {
+        if let task = activeLaunchTask {
+            ILOG("SceneCoordinator: Cancelling active launch task")
+            task.cancel()
+            activeLaunchTask = nil
+        }
+        launchTimeoutTask?.cancel()
+        launchTimeoutTask = nil
+        syncStatusManager.hide()
+    }
+
+    /// Safety net: if a launch task runs longer than 60 seconds, cancel it so the
+    /// user isn't permanently locked out of launching games.
+    private func scheduleActiveLaunchTimeout() {
+        launchTimeoutTask?.cancel()
+        launchTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 60_000_000_000) // 60 seconds
+            guard !Task.isCancelled else { return }
+            if self?.activeLaunchTask != nil {
+                WLOG("SceneCoordinator: Launch task timed out after 60s — clearing to unblock taps")
+                self?.cancelActiveLaunch()
+                PVToastManager.post("Game launch timed out", type: .warning, duration: 3.0, icon: "exclamationmark.triangle")
+            }
+        }
+    }
+
+    /// Opens the emulator scene with the current game from AppState
+    public func openEmulatorScene() {
+//        guard let url = URL(string: "provenance://emulator") else {
+//            ELOG("Failed to create URL for emulator scene")
+//            return
+//        }
+//
+//        ILOG("SceneCoordinator: Opening emulator scene")
+//        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        ILOG("SceneCoordinator: Opening emulator scene")
+        currentScene = .emulator
+        showEmulator = true
+        launchTimeoutTask?.cancel()
+        launchTimeoutTask = nil
+
+        /// Pause all background services via the central registry
+        BackgroundServiceRegistry.shared.pauseAll(reason: .emulation)
+    }
+
+    /// Launch a specific game with error handling and sync validation
+    public func launchGame(_ game: PVGame) {
+        guard activeLaunchTask == nil else {
+            ILOG("SceneCoordinator: Ignoring launchGame — launch already in progress")
+            PVToastManager.post("Game launch already in progress", type: .info, duration: 2.0, icon: "hourglass")
+            return
+        }
+        ILOG("SceneCoordinator: Launching game: \(game.title) (ID: \(game.id))")
+
+        activeLaunchTask = Task { @MainActor [weak self] in
+            defer {
+                self?.activeLaunchTask = nil
+                self?.syncStatusManager.hide()
+            }
+            await self?.launchGameWithValidation(game)
+        }
+        // Safety net: if the launch hangs, clear the task so taps aren't permanently blocked
+        scheduleActiveLaunchTimeout()
+    }
+
+    /// Launch a save state with sync validation for game ROM, BIOS, and save state
+    public func launchSaveState(_ saveState: PVSaveState, core: PVCore? = nil) {
+        guard activeLaunchTask == nil else {
+            ILOG("SceneCoordinator: Ignoring launchSaveState — launch already in progress")
+            PVToastManager.post("Game launch already in progress", type: .info, duration: 2.0, icon: "hourglass")
+            return
+        }
+        guard let game = saveState.game else {
+            showGameLaunchError(
+                title: "Cannot Launch Save State",
+                message: "No game found for this save state. The save state may be corrupted or misconfigured."
+            )
+            return
+        }
+
+        ILOG("SceneCoordinator: Launching save state: \(saveState.id) for game: \(game.title)")
+
+        activeLaunchTask = Task { @MainActor [weak self] in
+            defer {
+                self?.activeLaunchTask = nil
+                self?.syncStatusManager.hide()
+            }
+            await self?.launchSaveStateWithValidation(saveState, game: game, core: core)
+        }
+        scheduleActiveLaunchTimeout()
+    }
+
+    /// Launch a game with optional core (bypasses core selection if core is provided)
+    public func launchGame(_ game: PVGame, core: PVCore?) {
+        guard activeLaunchTask == nil else {
+            ILOG("SceneCoordinator: Ignoring launchGame(core:) — launch already in progress")
+            PVToastManager.post("Game launch already in progress", type: .info, duration: 2.0, icon: "hourglass")
+            return
+        }
+        ILOG("SceneCoordinator: Launching game: \(game.title) (ID: \(game.id)) with core: \(core?.projectName ?? "auto")")
+
+        activeLaunchTask = Task { @MainActor [weak self] in
+            defer {
+                self?.activeLaunchTask = nil
+                self?.syncStatusManager.hide()
+            }
+            await self?.launchGameWithValidation(game, core: core)
+        }
+        scheduleActiveLaunchTimeout()
+    }
+
+    /// Launch a game with disc path (for multi-disc games)
+    public func launchGame(_ game: PVGame, discPath: String, core: PVCore?, saveState: PVSaveState?) {
+        guard activeLaunchTask == nil else {
+            ILOG("SceneCoordinator: Ignoring launchGame(discPath:) — launch already in progress")
+            PVToastManager.post("Game launch already in progress", type: .info, duration: 2.0, icon: "hourglass")
+            return
+        }
+        ILOG("SceneCoordinator: Launching game: \(game.title) with disc path: \(discPath)")
+
+        // Create a temporary game object with the disc path
+        var tempGame = game
+        tempGame.selectedDiscFilename = (discPath as NSString).lastPathComponent
+
+        // If there's a save state, launch that instead
+        if let saveState = saveState {
+            launchSaveState(saveState, core: core)
+        } else {
+            launchGame(tempGame, core: core)
+        }
+    }
+
+    /// Launch game with sync validation
+    private func launchGameWithValidation(_ game: PVGame, core: PVCore? = nil) async {
+        // Pause background sync so on-demand downloads get full CloudKit bandwidth
+        // and background BIOS processing doesn't interfere with targeted downloads.
+        CloudSyncManager.shared.pause(reason: .gameLaunch)
+        defer { CloudSyncManager.shared.resume(reason: .gameLaunch) }
+
+        guard let system = game.system else {
+            showGameLaunchError(
+                title: "Cannot Launch Game",
+                message: "No system found for this game. The game may be corrupted or misconfigured."
+            )
+            return
+        }
+
+        // Contentless placeholder games intentionally have no ROM file; skip file/sync validation.
+        if game.contentless {
+            syncStatusManager.hide()
+            AppState.shared.emulationUIState.currentGame = game
+            if let core = core {
+                AppState.shared.emulationUIState.currentCore = core
+            }
+            openEmulatorScene()
+            return
+        }
+
+        // Fast path: check if the game file physically exists on disk.
+        // Use FileLocationResolver for consistent local-first file checking.
+        // Also checks system ROMs directory for files that were moved between systems.
+        let fileExistsLocally: Bool = {
+            // Check 1: FileLocationResolver (local Documents/Caches + iCloud Drive)
+            if let partialPath = game.file?.partialPath, !partialPath.isEmpty {
+                if FileLocationResolver.shared.resolve(partialPath) != .notFound {
+                    return true
+                }
+            }
+            // Check 2: resolved URL fallback (handles edge cases)
+            if let fileURL = game.file?.url,
+               FileManager.default.fileExists(atPath: fileURL.path) {
+                return true
+            }
+            // Check 3: current system ROMs directory (file may have been moved between systems)
+            let filename = game.file?.fileName
+                ?? (game.romPath.isEmpty ? nil : URL(fileURLWithPath: game.romPath).lastPathComponent)
+            if let filename = filename, !filename.isEmpty {
+                let systemRomsDir = Paths.romsPath(forSystemIdentifier: system.identifier)
+                let expectedURL = systemRomsDir.appendingPathComponent(filename)
+                if FileManager.default.fileExists(atPath: expectedURL.path) {
+                    ILOG("SceneCoordinator: Found file at system ROMs path (stale partialPath): \(expectedURL.lastPathComponent)")
+                    // Fix the stale partialPath in the database
+                    if let liveGame = RomDatabase.sharedInstance.game(withMD5: game.md5Hash),
+                       let file = liveGame.file {
+                        let correctPartialPath = "\(system.identifier)/\(filename)"
+                        if file.partialPath != correctPartialPath {
+                            do {
+                                try RomDatabase.sharedInstance.writeTransaction {
+                                    file.partialPath = correctPartialPath
+                                    liveGame.isDownloaded = true
+                                }
+                                ILOG("SceneCoordinator: Fixed stale partialPath → \(correctPartialPath)")
+                            } catch {
+                                ELOG("SceneCoordinator: Failed to fix partialPath: \(error)")
+                            }
+                        }
+                    }
+                    return true
+                }
+            }
+            return false
+        }()
+
+        if fileExistsLocally {
+            ILOG("SceneCoordinator: Game file exists locally, skipping cloud validation: \(game.file?.url?.lastPathComponent ?? game.title)")
+            // Still need to validate BIOS if required
+            if system.requiresBIOS {
+                syncStatusManager.show(
+                    gameTitle: game.title,
+                    statusMessage: "Validating requirements...",
+                    onCancel: { [weak self] in
+                        self?.cancelActiveLaunch()
+                    }
+                )
+            }
+        } else if !game.isDownloaded || !(game.file?.online ?? true) {
+            // Show sync status overlay early if we need to validate (may download BIOS)
+            syncStatusManager.show(
+                gameTitle: game.title,
+                statusMessage: "Validating requirements...",
+                onCancel: { [weak self] in
+                    self?.cancelActiveLaunch()
+                }
+            )
+
+            let validation = await validatePreDownloadRequirements(for: game, system: system)
+
+            guard !Task.isCancelled else {
+                ILOG("SceneCoordinator: Launch cancelled during pre-download validation")
+                return
+            }
+
+            if !validation.canProceed {
+                // Hide status overlay before showing warning
+                syncStatusManager.hide()
+
+                // Show warning and let user choose
+                let shouldContinue = await showPreDownloadWarning(validation: validation)
+                if !shouldContinue {
+                    ILOG("SceneCoordinator: User cancelled download due to missing requirements")
+                    return
+                }
+                ILOG("SceneCoordinator: User chose to continue download despite missing requirements")
+
+                // Re-show status overlay after user chooses to continue
+                syncStatusManager.show(
+                    gameTitle: game.title,
+                    statusMessage: "Downloading game file...",
+                    onCancel: { [weak self] in
+                        self?.cancelActiveLaunch()
+                    }
+                )
+            } else {
+                // Validation passed, update status
+                syncStatusManager.update(statusMessage: "Downloading game file...")
+            }
+
+            // Bail early if the user already cancelled
+            guard !Task.isCancelled else {
+                ILOG("SceneCoordinator: Launch cancelled before sync validation")
+                return
+            }
+
+            // Cloud validation is only needed when the file is NOT local
+            let validator: GameSyncValidator?
+            if Defaults[.iCloudSync] {
+                validator = GameSyncValidator(cloudSyncManager: CloudSyncManager.shared)
+            } else {
+                validator = nil
+            }
+
+            if let validator = validator {
+                // Cloud validation timeout. iCloud cold-connection + large ROM
+                // download can legitimately take ~60s — anything tighter fires
+                // false "game not available" errors while the download is still
+                // making progress.
+                let isValid = await withTaskGroup(of: Bool.self) { group in
+                    group.addTask {
+                        await validator.ensureGameReady(game) { [weak self] progressMessage in
+                            Task { @MainActor in
+                                self?.syncStatusManager.update(statusMessage: progressMessage)
+                            }
+                            ILOG("Game sync progress: \(progressMessage)")
+                        }
+                    }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: 60_000_000_000)
+                        return false
+                    }
+                    let result = await group.next() ?? false
+                    group.cancelAll()
+                    return result
+                }
+
+                guard !Task.isCancelled else {
+                    ILOG("SceneCoordinator: Launch cancelled during sync validation")
+                    return
+                }
+
+                if isValid {
+                    syncStatusManager.complete()
+                } else {
+                    syncStatusManager.error("Game file is not available. Please ensure iCloud sync is enabled and the game is synced.")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        self?.syncStatusManager.hide()
+                        self?.showGameLaunchError(
+                            title: "Cannot Launch Game",
+                            message: "The game file is not available on this device.\n\nTo fix this:\n1. Make sure iCloud sync is enabled in Settings\n2. Wait for the game to finish syncing (check the cloud icon)\n3. Try launching again\n\nIf the problem persists, try removing and re-importing the game."
+                        )
+                    }
+                    return
+                }
+            } else {
+                // No cloud sync and file doesn't exist locally
+                syncStatusManager.hide()
+                showGameLaunchError(
+                    title: "Game File Not Found",
+                    message: "The game file could not be found on your device.\n\nThis can happen if:\n• The file was deleted\n• The file was moved\n• There's a storage issue\n\nTry removing the game from your library and re-importing it."
+                )
+                return
+            }
+
+            // Small delay to show completion status after download
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        } else {
+            // File is marked as downloaded but can't be found on disk
+            syncStatusManager.hide()
+
+            if game.hasCloudAssets {
+                showCloudSyncEnablePrompt(for: game, core: core)
+            } else {
+                showGameLaunchError(
+                    title: "Game File Not Found",
+                    message: "The game file could not be found on your device.\n\nThis can happen if:\n• The file was deleted\n• The file was moved\n• There's a storage issue\n\nTry removing the game from your library and re-importing it."
+                )
+            }
+            return
+        }
+
+        // Check cancellation after the delay
+        guard !Task.isCancelled else {
+            ILOG("SceneCoordinator: Launch cancelled after sync completed")
+            return
+        }
+
+        // ALWAYS validate BIOS and core requirements before launching (not just for cloud downloads)
+        // Show status for BIOS validation if system requires BIOS
+        if system.requiresBIOS {
+            syncStatusManager.update(statusMessage: "Validating BIOS requirements...")
+        }
+
+        let validation = await validatePreDownloadRequirements(for: game, system: system)
+
+        // Hide sync status after validation
+        syncStatusManager.hide()
+
+        if !validation.canProceed {
+            // Show error and stay in main scene - don't launch emulator
+            var errorTitle = "Cannot Launch Game"
+            var errorMessage = ""
+#if os(iOS)
+            /// Populated only for the missing-BIOS case, which is the one error here
+            /// the user can actually fix by following a guide.
+            var guideButtonTitle: String?
+            var guideAction: (() -> Void)?
+#endif
+
+            if !validation.hasAvailableCores {
+                errorTitle = "No Compatible Core"
+                errorMessage = "There are no compatible emulator cores available for \(system.name).\n\n"
+                if AppState.shared.isAppStore {
+                    errorMessage += "Some cores may be unavailable in the App Store version. Enable 'Unsupported Cores' in Settings to see more options."
+                } else {
+                    errorMessage += "Please ensure the required core is installed and enabled."
+                }
+            } else if !validation.missingBIOSFiles.isEmpty {
+                errorTitle = "Missing BIOS Files"
+                PVEmulatorConfiguration.createBIOSDirectory(forSystemIdentifier: system.enumValue)
+                let missingFiles = validation.missingBIOSFiles.joined(separator: "\n• ")
+                // Use platform-aware path (Documents on iOS, Caches on tvOS)
+                let rootDirName = RelativeRoot.platformDefault == .caches ? "Caches" : "Documents"
+                let biosPath = "\(rootDirName)/BIOS/\(system.identifier)/"
+                errorMessage = "\(system.name) requires BIOS files to run games.\n\nMissing files:\n• \(missingFiles)\n\nPlease add these files to:\n\(biosPath)"
+#if os(iOS)
+                errorMessage += "\n\n\(BIOSGuideLink.messageHint)"
+                guideButtonTitle = BIOSGuideLink.actionTitle
+                guideAction = { Task { @MainActor in BIOSGuideLink.open() } }
+#endif
+            }
+
+            WLOG("SceneCoordinator: Cannot launch game - \(errorTitle)")
+#if os(iOS)
+            showGameLaunchError(title: errorTitle,
+                                message: errorMessage,
+                                actionButtonTitle: guideButtonTitle,
+                                action: guideAction)
+#else
+            showGameLaunchError(title: errorTitle, message: errorMessage)
+#endif
+            return
+        }
+
+        /// Rehydrate the game after async sync work so launch does not use stale/frozen snapshots.
+        let gameForLaunch = refreshedGameForLaunch(from: game)
+
+        /// Pull this game's battery/SRAM data before the core starts. Cores read
+        /// their battery file at boot, so this has to happen before launch — but
+        /// it must never gate it. Applied on both the plain-game and save-state
+        /// launch paths, since a save-state launch needs the cartridge save just
+        /// as much.
+        await downloadBatterySavesIfNeeded(for: gameForLaunch)
+
+        // Set the current game and core in EmulationUIState
+        AppState.shared.emulationUIState.currentGame = gameForLaunch
+        if let core = core {
+            AppState.shared.emulationUIState.currentCore = core
+        }
+
+        // Verify the game was set correctly
+        if let currentGame = AppState.shared.emulationUIState.currentGame {
+            ILOG("SceneCoordinator: Successfully set current game in EmulationUIState: \(currentGame.title) (ID: \(currentGame.id))")
+            if let core = core {
+                ILOG("SceneCoordinator: Core set: \(core.projectName)")
+            }
+
+            // Load per-game / per-system controller profiles for all connected controllers.
+            loadControllerProfiles(for: gameForLaunch, core: core)
+
+            // Show pre-launch Transfer Pak setup sheet for known N64 Transfer Pak titles
+            // when the feature is enabled and no slots have been configured yet.
+            await maybePromptTransferPakSetup(for: gameForLaunch)
+
+            // Open the emulator scene - errors will be handled by PVEmulatorViewController
+            openEmulatorScene()
+        } else {
+            ELOG("SceneCoordinator: Failed to set current game in EmulationUIState")
+            // Show error and stay in main scene
+            showGameLaunchError(
+                title: "Failed to Launch Game",
+                message: "Could not prepare the game for launch. This may be due to:\n\n• Missing or corrupted game file\n• Core not available or failed to load\n• Insufficient memory\n\nTry restarting the app, or remove and re-import the game if the problem persists."
+            )
+        }
+    }
+
+    // MARK: - Controller Profile Loading
+
+    /// Load the best-matching controller profile for every connected controller
+    /// before launching `game`.  Profiles are scoped (game → system+core → system → global).
+    private func loadControllerProfiles(for game: PVGame, core: PVCore? = nil) {
+        let systemIdentifier = game.systemIdentifier.isEmpty ? nil : game.systemIdentifier
+        let coreIdentifier = core?.identifier.isEmpty == false ? core?.identifier : nil
+        let gameID = game.md5Hash.isEmpty ? nil : game.md5Hash
+
+        for controller in PVControllerManager.shared.controllers {
+            let wrapper = getRemappableControllerWrapper(for: controller)
+            wrapper.loadActiveProfile(systemIdentifier: systemIdentifier, coreIdentifier: coreIdentifier, gameID: gameID)
+        }
+        ILOG("SceneCoordinator: Loaded controller profiles for \(PVControllerManager.shared.controllers.count) controller(s)")
+    }
+
+    /// Returns the freshest game row for launch, falling back to the provided object.
+    private func refreshedGameForLaunch(from game: PVGame) -> PVGame {
+        guard !game.md5Hash.isEmpty else {
+            return game
+        }
+        return RomDatabase.sharedInstance.game(withMD5: game.md5Hash) ?? game
+    }
+
+    // MARK: - Pre-Download Validation
+
+    /// Result of pre-download validation
+    public struct PreDownloadValidation {
+        let canProceed: Bool
+        let missingBIOSFiles: [String]
+        let hasAvailableCores: Bool
+        let systemName: String
+
+        var warningMessage: String {
+            var messages: [String] = []
+
+            if !hasAvailableCores {
+                messages.append("• No compatible emulator cores are available for \(systemName)")
+            }
+
+            if !missingBIOSFiles.isEmpty {
+                let biosFiles = missingBIOSFiles.prefix(3).joined(separator: ", ")
+                let moreCount = missingBIOSFiles.count - 3
+                if moreCount > 0 {
+                    messages.append("• Missing BIOS files: \(biosFiles) and \(moreCount) more")
+                } else {
+                    messages.append("• Missing BIOS files: \(biosFiles)")
+                }
+            }
+
+            return messages.joined(separator: "\n\n")
+        }
+    }
+
+    /// Validates requirements before downloading a cloud ROM
+    private func validatePreDownloadRequirements(for game: PVGame, system: PVSystem) async -> PreDownloadValidation {
+        // Check for available cores
+        let unsupportedCores = Defaults[.unsupportedCores]
+        let availableCores = system.cores.filter {
+            (!$0.disabled || unsupportedCores) &&
+            $0.hasCoreClass &&
+            !(AppState.shared.isAppStore && $0.appStoreDisabled)
+        }
+        let hasAvailableCores = !availableCores.isEmpty
+
+        // Check for missing BIOS files
+        var missingBIOSFiles: [String] = []
+        /// Optional BIOS that are absent locally. Never affects `canProceed`.
+        var missingOptionalBIOS: [(filename: String, md5: String)] = []
+
+        if system.requiresBIOS {
+            // Snapshot BIOS entries to an Array to avoid iterating live Realm collections across awaits
+            let biosEntries = Array(system.bioses)
+            let biosDirectory = system.biosDirectory
+
+            // Get existing BIOS files
+            var existingFiles: Set<String>
+            if let contents = try? FileManager.default.contentsOfDirectory(
+                at: biosDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                existingFiles = Set(contents.map { $0.lastPathComponent.lowercased() })
+            } else {
+                existingFiles = []
+            }
+
+            // Check each required BIOS and try to download missing ones from CloudKit
+            for bios in biosEntries {
+                var expectedFilename = bios.expectedFilename
+                if expectedFilename.contains("|") {
+                    expectedFilename = expectedFilename.components(separatedBy: "|")[0]
+                }
+
+                /// Optional BIOS are gathered rather than skipped outright. They must
+                /// never gate a launch, so they stay out of `missingBIOSFiles`, but
+                /// silently ignoring them meant a user with optional files sitting in
+                /// iCloud was never offered them. Handled after both loops.
+                if bios.optional {
+                    if !existingFiles.contains(expectedFilename.lowercased()) {
+                        missingOptionalBIOS.append((filename: expectedFilename, md5: bios.expectedMD5))
+                    }
+                    continue
+                }
+
+                if !existingFiles.contains(expectedFilename.lowercased()) {
+                    // BIOS not found locally - attempt CloudKit download if sync is enabled
+                    if Defaults[.iCloudSync] {
+                        // Show status update for BIOS download
+                        await MainActor.run {
+                            syncStatusManager.update(statusMessage: "Downloading BIOS: \(expectedFilename)...")
+                        }
+
+                        ILOG("[BIOS ON-DEMAND] Missing BIOS \(expectedFilename), attempting CloudKit download...")
+                        let downloaded = await tryDownloadBIOSFromCloud(
+                            filename: expectedFilename,
+                            expectedMD5: bios.expectedMD5,
+                            system: system
+                        )
+
+                        if downloaded {
+                            ILOG("[BIOS ON-DEMAND] ✓ Successfully downloaded BIOS from CloudKit: \(expectedFilename)")
+                            existingFiles.insert(expectedFilename.lowercased())
+                            // Don't add to missingBIOSFiles - we got it!
+                        } else {
+                            WLOG("[BIOS ON-DEMAND] CloudKit download failed for BIOS: \(expectedFilename)")
+                            missingBIOSFiles.append(expectedFilename)
+                        }
+                    } else {
+                        // CloudKit sync disabled - mark as missing
+                        DLOG("[BIOS] CloudKit sync disabled, BIOS marked as missing: \(expectedFilename)")
+                        missingBIOSFiles.append(expectedFilename)
+                    }
+                }
+            }
+        }
+
+        /// BIOS files required by this specific title rather than by the whole
+        /// system (arcade ROM sets — see `PerGameBIOSSupport.swift`). Not covered
+        /// by the loop above: those systems are all `PVRequiresBIOS = false`, and
+        /// the files are registered as optional so they can't gate every game.
+        for requirement in PerGameBIOS.missingRequirements(forGame: game) where !requirement.optional {
+            let filename = requirement.canonicalFilename
+            guard Defaults[.iCloudSync] else {
+                missingBIOSFiles.append(filename)
+                continue
+            }
+            await MainActor.run {
+                syncStatusManager.update(statusMessage: "Downloading BIOS: \(filename)...")
+            }
+            let downloaded = await tryDownloadBIOSFromCloud(filename: filename,
+                                                            expectedMD5: requirement.expectedMD5 ?? "",
+                                                            system: system)
+            if !downloaded {
+                missingBIOSFiles.append(filename)
+            }
+        }
+
+        /// Offer optional BIOS (never blocks: `canProceed` ignores them entirely).
+        await handleMissingOptionalBIOS(missingOptionalBIOS, system: system)
+
+        let canProceed = hasAvailableCores && missingBIOSFiles.isEmpty
+
+        return PreDownloadValidation(
+            canProceed: canProceed,
+            missingBIOSFiles: missingBIOSFiles,
+            hasAvailableCores: hasAvailableCores,
+            systemName: system.name
+        )
+    }
+
+    /// Offer to fetch optional BIOS files that are missing locally.
+    ///
+    /// Optional BIOS are excluded from the required-BIOS preflight on purpose —
+    /// they must never prevent a game from booting. But the preflight used to
+    /// `continue` straight past them, so a user whose iCloud library held optional
+    /// files was never offered them at all. This closes that gap without ever
+    /// gating a launch:
+    ///
+    /// * System already opted in — download inline, best effort, result ignored.
+    /// * System previously declined — do nothing.
+    /// * Never asked — prompt, and let *this* launch proceed regardless.
+    ///
+    /// The prompt is deliberately non-blocking. Optional files aren't needed to
+    /// boot, and a modal awaited in the launch path is exactly what made the
+    /// required-BIOS flow stall for minutes in earlier tester reports (see the
+    /// comment on `tryDownloadBIOSFromCloud`). The answer takes effect from the
+    /// next launch of that system.
+    ///
+    /// - Parameters:
+    ///   - missing: Optional BIOS absent from the system's BIOS directory.
+    ///   - system: The system being launched.
+    @MainActor
+    private func handleMissingOptionalBIOS(_ missing: [(filename: String, md5: String)],
+                                           system: PVSystem) async {
+        guard !missing.isEmpty, Defaults[.iCloudSync] else { return }
+
+        /// Capture value types — this outlives the Realm object via the alert closures.
+        let systemID = system.identifier
+        let systemName = system.name
+
+        if Defaults[.optionalBIOSDeclinedSystems].contains(systemID) { return }
+
+        if Defaults[.optionalBIOSAutoDownloadSystems].contains(systemID) {
+            for item in missing {
+                let ok = await CloudSyncManager.shared.downloadSingleBIOS(
+                    filename: item.filename,
+                    expectedMD5: item.md5,
+                    systemIdentifier: systemID
+                )
+                ILOG("[BIOS OPTIONAL] \(ok ? "✓" : "✗") \(item.filename) for \(systemID)")
+            }
+            return
+        }
+
+        let names = missing.map(\.filename).prefix(3).joined(separator: ", ")
+        let more = missing.count > 3 ? " and \(missing.count - 3) more" : ""
+        let items = missing
+
+        alertState.show(
+            title: "Optional BIOS Available",
+            message: "\(systemName) has optional BIOS files in your iCloud library "
+                + "(\(names)\(more)).\n\nThey aren't needed to play, but some games "
+                + "are more accurate with them. Download in the background?",
+            type: .standard,
+            primaryButtonTitle: "Download",
+            primaryAction: {
+                Defaults[.optionalBIOSAutoDownloadSystems].insert(systemID)
+                Task.detached {
+                    for item in items {
+                        let ok = await CloudSyncManager.shared.downloadSingleBIOS(
+                            filename: item.filename,
+                            expectedMD5: item.md5,
+                            systemIdentifier: systemID
+                        )
+                        ILOG("[BIOS OPTIONAL] background \(ok ? "✓" : "✗") \(item.filename)")
+                    }
+                }
+            },
+            secondaryButtonTitle: "Not Now",
+            secondaryAction: {
+                /// Remembered so this isn't asked on every boot of the system. The
+                /// user can still get these via a full BIOS sync in Settings.
+                Defaults[.optionalBIOSDeclinedSystems].insert(systemID)
+            }
+        )
+    }
+
+    /// Seconds to wait for a game's battery saves before launching anyway.
+    ///
+    /// Deliberately short. Battery data is a nice-to-have at boot; a slow cloud
+    /// round trip must not reproduce the "launch UI hung for minutes" symptom that
+    /// forced the BIOS path off its full-sync fallback.
+    private static let batterySaveFetchTimeoutSeconds: UInt64 = 8
+
+    /// Restore this game's battery/SRAM data from CloudKit before the core boots.
+    ///
+    /// Never blocks or fails the launch: a missing battery file means the game
+    /// starts without its in-cartridge save, not that it cannot run. If the fetch
+    /// exceeds `batterySaveFetchTimeoutSeconds` it is abandoned and the launch
+    /// proceeds; the files are picked up by the next launch or the background sync.
+    private func downloadBatterySavesIfNeeded(for game: PVGame) async {
+        guard Defaults[.iCloudSync] else { return }
+        guard let romURL = game.file?.url else { return }
+        /// Matches `Paths.batterySavesPath(forROM:)`, which is what actually
+        /// determines the on-disk folder the core will read.
+        let romName = romURL.deletingPathExtension().lastPathComponent
+        guard !romName.isEmpty else { return }
+        let gameTitle = game.title
+
+        /// Cheap local short-circuit, and the most important guard here: if this
+        /// game already has battery data on disk, a launch-time fetch has nothing
+        /// useful to do and must not pay for a CloudKit query at all. Without
+        /// this, launching an already-local game ran a paged query across the
+        /// whole `Battery States` directory and visibly stalled the launch —
+        /// which then made every retry report "launch already in progress".
+        let localDirectory = Paths.batterySavesPath.appendingPathComponent(romName, isDirectory: true)
+        if let contents = try? FileManager.default.contentsOfDirectory(atPath: localDirectory.path),
+           !contents.isEmpty {
+            DLOG("[BATTERY ON-DEMAND] \(romName) already has local battery data — skipping cloud query")
+            return
+        }
+
+        /// Unstructured on purpose so the timeout below can abandon it.
+        let work = Task.detached { await CloudSyncManager.shared.downloadBatterySaves(forROMNamed: romName) }
+
+        await MainActor.run {
+            syncStatusManager.show(gameTitle: gameTitle,
+                                   statusMessage: "Restoring cloud saves...",
+                                   onCancel: { work.cancel() })
+        }
+
+        let downloaded: Int = await withTaskGroup(of: Int?.self) { group in
+            group.addTask { await work.value }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: Self.batterySaveFetchTimeoutSeconds * 1_000_000_000)
+                /// Cancelling the real work is what makes this timeout mean
+                /// anything: a task group awaits EVERY child before it returns,
+                /// and cancellation is cooperative. The first version raced a
+                /// sleeper against the fetch and called `cancelAll()`, but the
+                /// syncer never checked `Task.isCancelled`, so the group still sat
+                /// waiting for the full query — the timeout was cosmetic and the
+                /// launch hung. `downloadBatterySaves` now checks cancellation
+                /// between pages and downloads.
+                work.cancel()
+                return nil
+            }
+            let winner = await group.next() ?? nil
+            group.cancelAll()
+            return winner ?? 0
+        }
+
+        await MainActor.run { syncStatusManager.hide() }
+
+        if downloaded > 0 {
+            ILOG("[BATTERY ON-DEMAND] Restored \(downloaded) battery-save file(s) for \(romName)")
+        }
+    }
+
+    /// Queue a BIOS download in the background and notify the user in library views
+    private func queueBackgroundBIOSDownload(filename: String) {
+        let key = filename.lowercased()
+        guard !pendingBIOSDownloads.contains(key) else { return }
+        pendingBIOSDownloads.insert(key)
+
+        Task.detached {
+            await CloudSyncManager.shared.forceBIOSDownload()
+        }
+
+        // Inform the user only when in library scenes to avoid interrupting emulation
+        if currentScene == .main {
+            alertState.show(
+                title: "Downloading BIOS",
+                message: "Required BIOS '\(filename)' will download in the background. You'll be notified when it's ready.",
+                type: .standard
+            )
+        }
+    }
+
+    /// Handle BIOS download completion notifications
+    private func handleBIOSFileDownloaded(_ notification: Notification) {
+        guard let url = notification.object as? URL else { return }
+        let name = url.lastPathComponent.lowercased()
+
+        guard pendingBIOSDownloads.contains(name) else { return }
+        pendingBIOSDownloads.remove(name)
+
+        // Use non-blocking toasts instead of modal alerts so downloads completing
+        // during a launch flow don't interrupt core selection or other UI.
+        PVToastManager.post(
+            "BIOS ready: \(url.lastPathComponent)",
+            type: .success,
+            duration: 3.5,
+            icon: "internaldrive.fill"
+        )
+    }
+
+    /// Show any BIOS download completions that happened while in emulator, once back in library
+    private func flushCompletedBIOSDownloadAlerts() {
+        guard currentScene == .main, !completedBIOSDownloadsWhileInEmulator.isEmpty else { return }
+        let names = completedBIOSDownloadsWhileInEmulator
+        completedBIOSDownloadsWhileInEmulator.removeAll()
+
+        let list = names.joined(separator: ", ")
+        PVToastManager.post(
+            "BIOS ready: \(list)",
+            type: .success,
+            duration: 4.0,
+            icon: "internaldrive.fill"
+        )
+    }
+
+    /// Attempt to download a missing BIOS file from CloudKit on-demand (with timeout)
+    /// - Parameters:
+    ///   - filename: The expected BIOS filename
+    ///   - expectedMD5: The expected MD5 hash
+    ///   - system: The system requiring the BIOS
+    /// - Returns: True if the BIOS was successfully downloaded
+    func tryDownloadBIOSFromCloud(filename: String, expectedMD5: String, system: PVSystem) async -> Bool {
+        let systemIdentifier = system.identifier
+
+        // First, check if file already exists (might have been downloaded by another process)
+        let biosPath = system.biosDirectory.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: biosPath.path) {
+            ILOG("[BIOS ON-DEMAND] File already exists at: \(biosPath.path)")
+            return true
+        }
+
+        ILOG("[BIOS ON-DEMAND] Starting fast targeted download for: \(filename)")
+
+        // Fast targeted download with a strict timeout. The previous fallback to
+        // `forceBIOSDownload()` (a full library-wide BIOS sync) had no internal
+        // timeout and held the launch UI for minutes when the BIOS was not in
+        // CloudKit at all — the exact symptom in tester reports.
+        // Background `BIOSSyncing` already handles the bulk case asynchronously,
+        // so we no longer fall through to a synchronous full sync here.
+        let downloadTask = Task.detached { () -> Bool in
+            let ok = await CloudSyncManager.shared.downloadSingleBIOS(
+                filename: filename,
+                expectedMD5: expectedMD5,
+                systemIdentifier: systemIdentifier
+            )
+            if ok && FileManager.default.fileExists(atPath: biosPath.path) {
+                ILOG("[BIOS ON-DEMAND] ✓ Fast download succeeded: \(filename)")
+                return true
+            }
+            WLOG("[BIOS ON-DEMAND] Fast download miss for \(filename); not falling through to full sync.")
+            return false
+        }
+
+        let timeoutTask = Task {
+            try await Task.sleep(nanoseconds: 15_000_000_000) // 15s — fast path only
+            downloadTask.cancel()
+            WLOG("[BIOS ON-DEMAND] Download timed out for: \(filename)")
+        }
+
+        do {
+            let result = try await downloadTask.value
+            timeoutTask.cancel()
+            return result
+        } catch is CancellationError {
+            WLOG("[BIOS ON-DEMAND] Download was cancelled (timeout) for: \(filename)")
+            return false
+        } catch {
+            ELOG("[BIOS ON-DEMAND] Download failed for \(filename): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Shows a warning alert and returns true if user wants to continue
+    private func showPreDownloadWarning(validation: PreDownloadValidation) async -> Bool {
+        // Use a flag to ensure continuation is only resumed once
+        var hasResumed = false
+
+        return await withCheckedContinuation { continuation in
+            var title = "Download Warning"
+            var message = "This game may not be playable after downloading:\n\n\(validation.warningMessage)\n\nDo you want to download anyway?"
+
+            if !validation.hasAvailableCores {
+                title = "No Compatible Core"
+                message = "There are no compatible emulator cores available for \(validation.systemName).\n\n"
+                if AppState.shared.isAppStore {
+                    message += "Some cores may be unavailable in the App Store version. Enable 'Unsupported Cores' in Settings to see more options.\n\n"
+                }
+                message += "Download this ROM anyway? You won't be able to play it until a compatible core is available."
+            } else if !validation.missingBIOSFiles.isEmpty {
+                title = "Missing BIOS Files"
+                message = "\(validation.systemName) requires BIOS files to run games.\n\n\(validation.warningMessage)\n\nDownload this ROM anyway? You'll need to add the BIOS files before playing."
+            }
+
+            alertState.show(
+                title: title,
+                message: message,
+                type: .warning,
+                primaryButtonTitle: "Download Anyway",
+                primaryAction: {
+                    guard !hasResumed else { return }
+                    hasResumed = true
+                    continuation.resume(returning: true)
+                },
+                secondaryButtonTitle: "Cancel",
+                secondaryAction: {
+                    guard !hasResumed else { return }
+                    hasResumed = true
+                    continuation.resume(returning: false)
+                },
+                onDismiss: {
+                    // Handle case where alert is dismissed via Menu button on tvOS
+                    guard !hasResumed else { return }
+                    hasResumed = true
+                    continuation.resume(returning: false)
+                }
+            )
+        }
+    }
+
+    /// Launch save state with sync validation
+    private func launchSaveStateWithValidation(_ saveState: PVSaveState, game: PVGame, core: PVCore? = nil) async {
+        CloudSyncManager.shared.pause(reason: .gameLaunch)
+        defer { CloudSyncManager.shared.resume(reason: .gameLaunch) }
+
+        guard let system = game.system else {
+            showGameLaunchError(
+                title: "Cannot Launch Save State",
+                message: "No system found for this game. The game may be corrupted or misconfigured."
+            )
+            return
+        }
+
+        // Fast path: same multi-location check as launchGameWithValidation
+        let saveStateFileExistsLocally: Bool = {
+            // Check 1: FileLocationResolver (local Documents/Caches + iCloud Drive)
+            if let partialPath = game.file?.partialPath, !partialPath.isEmpty {
+                if FileLocationResolver.shared.resolve(partialPath) != .notFound {
+                    return true
+                }
+            }
+            // Check 2: resolved URL fallback (handles edge cases)
+            if let fileURL = game.file?.url,
+               FileManager.default.fileExists(atPath: fileURL.path) {
+                return true
+            }
+            // Check 3: current system ROMs directory (file may have been moved between systems)
+            let filename = game.file?.fileName
+                ?? (game.romPath.isEmpty ? nil : URL(fileURLWithPath: game.romPath).lastPathComponent)
+            if let filename = filename, !filename.isEmpty {
+                let systemRomsDir = Paths.romsPath(forSystemIdentifier: system.identifier)
+                let expectedURL = systemRomsDir.appendingPathComponent(filename)
+                if FileManager.default.fileExists(atPath: expectedURL.path) {
+                    ILOG("SceneCoordinator: Found file at system ROMs path for save state launch: \(expectedURL.lastPathComponent)")
+                    if let liveGame = RomDatabase.sharedInstance.game(withMD5: game.md5Hash),
+                       let file = liveGame.file {
+                        let correctPartialPath = "\(system.identifier)/\(filename)"
+                        if file.partialPath != correctPartialPath {
+                            try? RomDatabase.sharedInstance.writeTransaction {
+                                file.partialPath = correctPartialPath
+                                liveGame.isDownloaded = true
+                            }
+                        }
+                    }
+                    return true
+                }
+            }
+            return false
+        }()
+
+        if saveStateFileExistsLocally {
+            ILOG("SceneCoordinator: Game file exists locally, skipping cloud validation for save state: \(game.file?.url?.lastPathComponent ?? game.title)")
+            if system.requiresBIOS {
+                syncStatusManager.show(
+                    gameTitle: game.title,
+                    statusMessage: "Validating requirements...",
+                    onCancel: { [weak self] in
+                        self?.cancelActiveLaunch()
+                    }
+                )
+            }
+        } else if !game.isDownloaded || !(game.file?.online ?? true) {
+            syncStatusManager.show(
+                gameTitle: game.title,
+                statusMessage: "Validating requirements...",
+                onCancel: { [weak self] in
+                    self?.cancelActiveLaunch()
+                }
+            )
+
+            let validation = await validatePreDownloadRequirements(for: game, system: system)
+
+            guard !Task.isCancelled else {
+                ILOG("SceneCoordinator: Save state launch cancelled during pre-download validation")
+                return
+            }
+
+            if !validation.canProceed {
+                syncStatusManager.hide()
+                let shouldContinue = await showPreDownloadWarning(validation: validation)
+                if !shouldContinue {
+                    ILOG("SceneCoordinator: User cancelled save state launch due to missing requirements")
+                    return
+                }
+                ILOG("SceneCoordinator: User chose to continue save state launch despite missing requirements")
+
+                syncStatusManager.show(
+                    gameTitle: game.title,
+                    statusMessage: "Downloading game file...",
+                    onCancel: { [weak self] in
+                        self?.cancelActiveLaunch()
+                    }
+                )
+            } else {
+                syncStatusManager.update(statusMessage: "Downloading game file...")
+            }
+
+            // Cloud validation needed — file isn't local
+            let validator: GameSyncValidator?
+            if Defaults[.iCloudSync] {
+                validator = GameSyncValidator(cloudSyncManager: CloudSyncManager.shared)
+            } else {
+                validator = nil
+            }
+
+            if let validator = validator {
+                // Cloud validation timeout. iCloud cold-connection + large ROM
+                // download can legitimately take ~60s — anything tighter fires
+                // false "game not available" errors while the download is still
+                // making progress.
+                let isValid = await withTaskGroup(of: Bool.self) { group in
+                    group.addTask {
+                        await validator.ensureGameReady(game) { [weak self] progressMessage in
+                            Task { @MainActor in
+                                self?.syncStatusManager.update(statusMessage: progressMessage)
+                            }
+                            ILOG("Game sync progress: \(progressMessage)")
+                        }
+                    }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: 60_000_000_000)
+                        return false
+                    }
+                    let result = await group.next() ?? false
+                    group.cancelAll()
+                    return result
+                }
+
+                guard !Task.isCancelled else {
+                    ILOG("SceneCoordinator: Save state launch cancelled during sync validation")
+                    return
+                }
+
+                if !isValid {
+                    syncStatusManager.error("Game file is not available. Please ensure iCloud sync is enabled and the game is synced.")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        self?.syncStatusManager.hide()
+                        self?.showGameLaunchError(
+                            title: "Cannot Launch Save State",
+                            message: "The game file is not available on this device.\n\nTo fix this:\n1. Make sure iCloud sync is enabled in Settings\n2. Wait for the game to finish syncing (check the cloud icon)\n3. Try launching again\n\nIf the problem persists, try removing and re-importing the game."
+                        )
+                    }
+                    return
+                }
+            } else {
+                // No cloud sync and file doesn't exist locally
+                syncStatusManager.hide()
+                showGameLaunchError(
+                    title: "Game File Not Found",
+                    message: "The game file could not be found on your device.\n\nThis can happen if:\n• The file was deleted\n• The file was moved\n• There's a storage issue\n\nTry removing the game from your library and re-importing it."
+                )
+                return
+            }
+        } else {
+            // File is marked as downloaded but not found on disk
+            syncStatusManager.hide()
+            if game.hasCloudAssets {
+                showCloudSyncEnablePrompt(for: game, core: core)
+            } else {
+                showGameLaunchError(
+                    title: "Game File Not Found",
+                    message: "The game file could not be found on your device.\n\nThis can happen if:\n• The file was deleted\n• The file was moved\n• There's a storage issue\n\nTry removing the game from your library and re-importing it."
+                )
+            }
+            return
+        }
+
+        // Validate BIOS and core requirements
+        // Show status for BIOS validation if system requires BIOS
+        if system.requiresBIOS {
+            syncStatusManager.update(statusMessage: "Validating BIOS requirements...")
+        }
+
+        let validation = await validatePreDownloadRequirements(for: game, system: system)
+
+        if !validation.canProceed {
+            var errorTitle = "Cannot Launch Save State"
+            var errorMessage = ""
+
+            if !validation.hasAvailableCores {
+                errorTitle = "No Compatible Core"
+                errorMessage = "There are no compatible emulator cores available for \(system.name).\n\n"
+                if AppState.shared.isAppStore {
+                    errorMessage += "Some cores may be unavailable in the App Store version. Enable 'Unsupported Cores' in Settings to see more options."
+                } else {
+                    errorMessage += "Please ensure the required core is installed and enabled."
+                }
+            } else if !validation.missingBIOSFiles.isEmpty {
+                errorTitle = "Missing BIOS Files"
+                PVEmulatorConfiguration.createBIOSDirectory(forSystemIdentifier: system.enumValue)
+                let missingFiles = validation.missingBIOSFiles.joined(separator: "\n• ")
+                let rootDirName = RelativeRoot.platformDefault == .caches ? "Caches" : "Documents"
+                let biosPath = "\(rootDirName)/BIOS/\(system.identifier)/"
+                errorMessage = "\(system.name) requires BIOS files to run games.\n\nMissing files:\n• \(missingFiles)\n\nPlease add these files to:\n\(biosPath)"
+            }
+
+            syncStatusManager.hide()
+            WLOG("SceneCoordinator: Cannot launch save state - \(errorTitle)")
+            showGameLaunchError(title: errorTitle, message: errorMessage)
+            return
+        }
+
+        // Download save state if needed
+        syncStatusManager.update(statusMessage: "Checking save state...")
+
+        let fileManager = FileManager.default
+        let saveStateReady: Bool
+
+        if let localURL = saveState.file?.url, fileManager.fileExists(atPath: localURL.path) {
+            saveStateReady = true
+        } else {
+            // Save state needs to be downloaded
+            guard let recordID = saveState.cloudRecordID, !recordID.isEmpty else {
+                syncStatusManager.error("Save state not available.")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.syncStatusManager.hide()
+                    self?.showGameLaunchError(
+                        title: "Save State Not Available",
+                        message: "The save state file is not available on this device and cannot be downloaded from iCloud.\n\nThis may happen if:\n• iCloud sync is disabled\n• The save state was never synced\n• There's a sync issue\n\nTry enabling iCloud sync and waiting for sync to complete."
+                    )
+                }
+                return
+            }
+
+            let frozenSaveState = saveState.freeze()
+            syncStatusManager.update(statusMessage: "Downloading save state...")
+
+            do {
+                try await CloudSyncManager.shared.downloadSaveState(for: frozenSaveState)
+                saveStateReady = true
+            } catch {
+                syncStatusManager.error("Save state download failed.")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.syncStatusManager.hide()
+                    self?.showGameLaunchError(
+                        title: "Download Failed",
+                        message: "Failed to download the save state: \(error.localizedDescription)\n\nPlease check your internet connection and iCloud sync settings."
+                    )
+                }
+                ELOG("Failed to download save state \(recordID): \(error)")
+                return
+            }
+        }
+
+        guard saveStateReady else {
+            syncStatusManager.hide()
+            return
+        }
+
+        syncStatusManager.complete()
+
+        // Small delay to show completion status
+        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+
+        // Hide sync status before launching
+        syncStatusManager.hide()
+
+        // Fetch fresh save state from Realm to ensure file references are up to date
+        let preparedSaveState: PVSaveState?
+        do {
+            let realm = RomDatabase.sharedInstance.realm
+            preparedSaveState = realm.object(ofType: PVSaveState.self, forPrimaryKey: saveState.id)?.freeze()
+        } catch {
+            ELOG("Failed to refresh save state \(saveState.id): \(error)")
+            preparedSaveState = saveState.freeze()
+        }
+
+        // Determine which core to use: explicit core parameter, save state's core, or nil
+        let coreToUse: PVCore? = core ?? preparedSaveState?.core
+
+        // Check save state version mismatch before launching.
+        // If the user approves (or there is no mismatch), record the save state ID so
+        // the emulator VC skips the identical check when it loads the state on boot.
+        if let stateToCheck = preparedSaveState {
+            let shouldProceed = await SaveStateVersionChecker.confirmLoad(
+                saveState: stateToCheck,
+                overrideCore: coreToUse,
+                alertState: alertState
+            )
+            if !shouldProceed {
+                ILOG("SceneCoordinator: User cancelled save state launch due to version mismatch")
+                return
+            }
+            // Mark this save state as already version-checked for this launch so the
+            // emulator VC does not re-prompt on its own load call.
+            AppState.shared.emulationUIState.confirmedMismatchSaveStateID = stateToCheck.id
+        }
+
+        /// Rehydrate the game after async sync work so launch does not use stale/frozen snapshots.
+        let gameForLaunch = refreshedGameForLaunch(from: game)
+
+        /// Pull this game's battery/SRAM data before the core starts. Cores read
+        /// their battery file at boot, so this has to happen before launch — but
+        /// it must never gate it. Applied on both the plain-game and save-state
+        /// launch paths, since a save-state launch needs the cartridge save just
+        /// as much.
+        await downloadBatterySavesIfNeeded(for: gameForLaunch)
+
+        // Set the current game, save state, and core in EmulationUIState
+        AppState.shared.emulationUIState.currentGame = gameForLaunch
+        AppState.shared.emulationUIState.currentSaveState = preparedSaveState
+        if let coreToUse = coreToUse {
+            AppState.shared.emulationUIState.currentCore = coreToUse
+        }
+
+        // Verify the game was set correctly
+        if let currentGame = AppState.shared.emulationUIState.currentGame {
+            ILOG("SceneCoordinator: Successfully set current game in EmulationUIState: \(currentGame.title) (ID: \(currentGame.id))")
+            if let saveState = preparedSaveState {
+                ILOG("SceneCoordinator: Save state set: \(saveState.id)")
+            }
+            if let core = core {
+                ILOG("SceneCoordinator: Core set: \(core.projectName)")
+            }
+
+            // Load per-game / per-system controller profiles for all connected controllers.
+            loadControllerProfiles(for: gameForLaunch, core: coreToUse)
+
+            // Open the emulator scene - the emulator will handle loading the game with save state
+            openEmulatorScene()
+        } else {
+            ELOG("SceneCoordinator: Failed to set current game in EmulationUIState")
+            showGameLaunchError(
+                title: "Failed to Launch Save State",
+                message: "Could not prepare the game for launch. This may be due to:\n\n• Missing or corrupted game file\n• Core not available or failed to load\n• Insufficient memory\n\nTry restarting the app, or remove and re-import the game if the problem persists."
+            )
+        }
+    }
+
+    // MARK: - Transfer Pak Pre-Launch Setup
+
+    /// Shows the Transfer Pak configuration sheet before launching an N64 game if:
+    ///   - The `mupenTransferPak` feature flag is enabled
+    ///   - The game is an N64 title known to use the Transfer Pak
+    ///   - No Transfer Pak slots are currently configured for this game
+    ///
+    /// Awaits until the user taps "Skip & Launch", "Launch Game", or swipes to dismiss.
+    private func maybePromptTransferPakSetup(for game: PVGame) async {
+        guard Defaults[.mupenTransferPak],
+              SystemIdentifier(rawValue: game.systemIdentifier) == .N64,
+              TransferPakCompatibleGames.isKnownTransferPakGame(game.title)
+        else { return }
+
+        let md5 = game.md5Hash
+        // Don't re-prompt if the user has configured at least one slot, or if they explicitly
+        // skipped the prompt on a previous launch (prevents nagging on every launch).
+        let shouldSkip = await Task.detached(priority: .userInitiated) {
+            let alreadyConfigured = (0..<4).contains { TransferPakStore.romPath(forGameMD5: md5, port: $0) != nil }
+            let userSkipped = TransferPakStore.wasPromptSkipped(forGameMD5: md5)
+            return alreadyConfigured || userSkipped
+        }.value
+        guard !shouldSkip else { return }
+
+        ILOG("SceneCoordinator: Showing pre-launch Transfer Pak setup for \(game.title)")
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            _preLaunchContinuation = continuation
+            preLaunchTransferPakGame = game
+        }
+    }
+
+    /// Confirms the Transfer Pak setup and dismisses the pre-launch sheet, resuming the
+    /// launch continuation on the next main run-loop turn.
+    ///
+    /// Call from button actions inside the sheet (`launchAction`). Deferring the
+    /// continuation resumption to the next run-loop turn (via `DispatchQueue.main.async`)
+    /// prevents changing root-level navigation state while the sheet dismissal animation
+    /// is still in-flight, which would cause layout warnings on some iOS versions.
+    /// `.sheet(item:)` may skip `onDismiss` when the binding is cleared programmatically
+    /// (a known SwiftUI bug), so this method resumes the continuation proactively rather
+    /// than relying solely on `onDismiss`.  `dismissPreLaunchTransferPak()` (called from
+    /// `onDismiss`) is a safe no-op when called after this method.
+    public func confirmAndDismissPreLaunchTransferPak() {
+        preLaunchTransferPakGame = nil
+        let cont = _preLaunchContinuation
+        _preLaunchContinuation = nil
+        // Defer resumption to the next run-loop turn so SwiftUI can finish tearing down
+        // the sheet's view hierarchy before we mutate root-level navigation state.
+        // Without this deferral, clearing `preLaunchTransferPakGame` and immediately
+        // resuming can trigger a root-view update while the sheet dismissal is still
+        // in-flight, causing layout warnings or dropped animations on some iOS versions.
+        DispatchQueue.main.async { cont?.resume() }
+    }
+
+    /// Called by the sheet's `onDismiss` callback after the dismissal animation finishes.
+    /// Resumes the launch continuation if it has not already been resumed by
+    /// `confirmAndDismissPreLaunchTransferPak()`. Safe to call multiple times — second call is
+    /// a no-op because `_preLaunchContinuation` is cleared on first use.
+    public func dismissPreLaunchTransferPak() {
+        preLaunchTransferPakGame = nil   // no-op if already nil (button path cleared it)
+        guard let cont = _preLaunchContinuation else { return }
+        _preLaunchContinuation = nil
+        cont.resume()
+    }
+
+    /// Show error alert for game launch failures and return to main scene.
+    ///
+    /// `actionButtonTitle`/`action` let a caller attach one recovery affordance
+    /// (e.g. "BIOS Guide") without every error path having to know about the
+    /// alert plumbing.
+    private func showGameLaunchError(title: String,
+                                     message: String,
+                                     actionButtonTitle: String? = nil,
+                                     action: (() -> Void)? = nil) {
+        // Ensure we're on the main scene
+        openMainScene()
+
+        // Show RetroWave styled alert
+        guard let actionButtonTitle else {
+            alertState.show(
+                title: title,
+                message: message,
+                type: .error
+            )
+            return
+        }
+
+        // The RetroWave alert's *secondary* slot is its cancel/back slot — gamepad B
+        // (`dismissFromCancel`) and tvOS Menu (`onExitCommand`) both invoke
+        // `onSecondaryAction`. So the actionable button has to be primary, with the
+        // plain dismiss as secondary; swapping them would fire the action on cancel.
+        alertState.show(
+            title: title,
+            message: message,
+            type: .error,
+            primaryButtonTitle: actionButtonTitle,
+            primaryAction: action,
+            secondaryButtonTitle: "Close"
+        )
+    }
+
+    /// Show a prompt offering to enable cloud sync when a ROM is missing but has cloud assets.
+    /// Enabling sync and retrying the launch gives the user a one-tap path to recovery.
+    private func showCloudSyncEnablePrompt(for game: PVGame, core: PVCore?) {
+        openMainScene()
+
+        // Capture value types to avoid retaining a Realm object across the alert lifecycle
+        let gameMD5 = game.md5Hash
+        let coreID = core?.identifier
+
+        alertState.show(
+            title: "Game Available in iCloud",
+            message: "This game's ROM file isn't on your device, but it exists in your iCloud library.\n\nEnable Cloud Sync to download it automatically.",
+            type: .standard,
+            primaryButtonTitle: "Enable & Download",
+            primaryAction: { [weak self] in
+                // Turn on cloud sync
+                Defaults[.iCloudSync] = true
+                Defaults[.iCloudSyncMode] = .cloudKit
+
+                // Re-fetch the game from Realm (the original reference may be stale)
+                let realm = RomDatabase.sharedInstance.realm
+                guard let freshGame = realm.object(ofType: PVGame.self, forPrimaryKey: gameMD5) else {
+                    return
+                }
+                let freshCore: PVCore? = coreID.flatMap { realm.object(ofType: PVCore.self, forPrimaryKey: $0) }
+                self?.launchGame(freshGame, core: freshCore)
+            },
+            secondaryButtonTitle: "Open Settings",
+            secondaryAction: {
+                NotificationCenter.default.post(name: NSNotification.Name("PVShowSettings"), object: nil)
+            }
+        )
+    }
+
+    /// Handles closing the emulator and returning to the main scene
+    public func closeEmulator() {
+        ILOG("SceneCoordinator: closeEmulator() called")
+
+        // Defensively clear the launch guard so taps aren't blocked after
+        // emulator dismissal (the Task defer should already have cleared it,
+        // but edge cases like system-initiated dismissal can skip it).
+        activeLaunchTask?.cancel()
+        activeLaunchTask = nil
+        launchTimeoutTask?.cancel()
+        launchTimeoutTask = nil
+
+        // Reset the app open action FIRST to prevent any reopening attempts
+        AppState.shared.appOpenAction = .none
+        ILOG("SceneCoordinator: Reset appOpenAction to .none when closing emulator")
+
+        // Clear the emulation state
+        AppState.shared.emulationUIState.core = nil
+        AppState.shared.emulationUIState.emulator = nil
+        AppState.shared.emulationUIState.currentGame = nil
+        ILOG("SceneCoordinator: Cleared emulation state")
+
+        /// Resume all background services via the central registry
+        BackgroundServiceRegistry.shared.resumeAll(reason: .emulation)
+
+        // Return to the main scene
+        ILOG("SceneCoordinator: Calling openMainScene()")
+        openMainScene()
+        ILOG("SceneCoordinator: closeEmulator() completed")
+    }
+}

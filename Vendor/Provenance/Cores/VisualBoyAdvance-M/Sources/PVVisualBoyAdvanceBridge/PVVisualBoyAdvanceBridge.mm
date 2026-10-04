@@ -1,0 +1,1323 @@
+/*
+ Copyright (c) 2015, OpenEmu Team
+ 
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ * Redistributions of source code must retain the above copyright
+ notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright
+ notice, this list of conditions and the following disclaimer in the
+ documentation and/or other materials provided with the distribution.
+ * Neither the name of the OpenEmu Team nor the
+ names of its contributors may be used to endorse or promote products
+ derived from this software without specific prior written permission.
+ 
+ THIS SOFTWARE IS PROVIDED BY OpenEmu Team ''AS IS'' AND ANY
+ EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ DISCLAIMED. IN NO EVENT SHALL OpenEmu Team BE LIABLE FOR ANY
+ DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef GLES_SILENCE_DEPRECATION
+#define GLES_SILENCE_DEPRECATION 1
+#endif
+
+@import PVEmulatorCore;
+@import PVCoreBridge;
+@import PVCoreObjCBridge;
+
+#import "PVVisualBoyAdvanceBridge.h"
+
+@import PVAudio;
+@import PVVisualBoyAdvanceOptions;
+@import libvisualboyadvance;
+@import PVLoggingObjC;
+
+#if TARGET_OS_MACCATALYST || TARGET_OS_OSX
+#import <OpenGL/gl3.h>
+#import <OpenGL/OpenGL.h>
+#import <GLUT/GLUT.h>
+@import GameController;
+#else
+#import <OpenGLES/gltypes.h>
+#import <OpenGLES/ES3/gl.h>
+#import <OpenGLES/ES3/glext.h>
+#import <OpenGLES/EAGL.h>
+#endif
+
+#include <atomic>
+#include <sys/time.h>
+#include "System.h"
+#include "Util.h"
+#include "gba/GBA.h"
+#include "gba/RTC.h"
+#include "gba/Sound.h"
+#include "common/SoundDriver.h"
+
+// ---------------------------------------------------------------------------
+// MARK: - RetroAchievements rc_client (HAVE_RCHEEVOS)
+// Mirrors PVGambatteBridge: CRcheevos from PVRcheevos SPM; GBA bus addresses.
+// ---------------------------------------------------------------------------
+#if HAVE_RCHEEVOS
+#include "rc_client.h"
+
+static uint32_t pvvba_read_memory(uint32_t address, uint8_t *buffer,
+                                  uint32_t num_bytes, rc_client_t *client) {
+    (void)client;
+    for (uint32_t i = 0; i < num_bytes; ++i) {
+        uint32_t addr = address + i;
+        uint8_t value = 0xFF;
+        if (addr >= 0x02000000 && addr <= 0x0203FFFF) {
+            if (workRAM) {
+                value = workRAM[addr - 0x02000000];
+            }
+        } else if (addr >= 0x03000000 && addr <= 0x03007FFF) {
+            if (internalRAM) {
+                value = internalRAM[addr - 0x03000000];
+            }
+        } else if (addr >= 0x06000000 && addr <= 0x06017FFF) {
+            if (vram) {
+                value = vram[addr - 0x06000000];
+            }
+        }
+        buffer[i] = value;
+    }
+    return num_bytes;
+}
+
+static void pvvba_server_call(const rc_api_request_t *request,
+                              rc_client_server_callback_t callback,
+                              void *callback_data,
+                              rc_client_t * __unused client) {
+    if (!request->url) {
+        rc_api_server_response_t empty = {};
+        empty.http_status_code = 0;
+        callback(&empty, callback_data);
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:request->url]];
+    if (!url) {
+        rc_api_server_response_t empty = {};
+        empty.http_status_code = 400;
+        callback(&empty, callback_data);
+        return;
+    }
+    NSMutableURLRequest *urlReq = [NSMutableURLRequest requestWithURL:url];
+    urlReq.timeoutInterval = 30.0;
+    const char *postData = request->post_data;
+    if (postData && *postData) {
+        urlReq.HTTPMethod = @"POST";
+        urlReq.HTTPBody = [NSData dataWithBytes:postData length:strlen(postData)];
+        [urlReq setValue:@"application/x-www-form-urlencoded"
+      forHTTPHeaderField:@"Content-Type"];
+    } else {
+        urlReq.HTTPMethod = @"GET";
+    }
+    [urlReq setValue:@"Provenance/PVRcheevos" forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession]
+        dataTaskWithRequest:urlReq
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+              rc_api_server_response_t resp = {};
+              if (data && !error) {
+                  resp.body             = (const char *)data.bytes;
+                  resp.body_length      = (uint32_t)data.length;
+                  resp.http_status_code = (int)[(NSHTTPURLResponse *)response statusCode];
+              } else {
+                  resp.http_status_code = 0;
+              }
+              callback(&resp, callback_data);
+          }] resume];
+}
+
+static void pvvba_event_handler(const rc_client_event_t *event, rc_client_t *client) {
+    PVVisualBoyAdvanceBridge *bridge = (__bridge PVVisualBoyAdvanceBridge *)
+                                        rc_client_get_userdata(client);
+    if (!bridge) { return; }
+
+    switch (event->type) {
+        case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED: {
+            const rc_client_achievement_t *ach = event->achievement;
+            NSString *badgeName = ach->badge_name ? @(ach->badge_name) : nil;
+            NSURL *badgeURL = badgeName.length
+                ? [NSURL URLWithString:[NSString stringWithFormat:
+                      @"https://media.retroachievements.org/Badge/%@.png", badgeName]]
+                : nil;
+            [bridge rcAchievementTriggeredWithID:ach->id
+                                         title:ach->title       ? @(ach->title)       : nil
+                                   description:ach->description ? @(ach->description) : nil
+                                        points:ach->points
+                                      badgeURL:badgeURL
+                                    isHardcore:(BOOL)rc_client_get_hardcore_enabled(client)];
+            break;
+        }
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_SHOW: {
+            const rc_client_achievement_t *ach = event->achievement;
+            [bridge rcAchievementProgressWithID:ach->id
+                                        title:ach->title ? @(ach->title) : nil
+                                 progressText:ach->measured_progress ? @(ach->measured_progress) : nil];
+            break;
+        }
+        case RC_CLIENT_EVENT_LEADERBOARD_STARTED: {
+            const rc_client_leaderboard_t *lb = event->leaderboard;
+            [bridge rcLeaderboardStartedWithID:lb->id
+                                       title:lb->title       ? @(lb->title)       : nil
+                                 description:lb->description ? @(lb->description) : nil
+                                   scoreText:lb->tracker_value ? @(lb->tracker_value) : nil];
+            break;
+        }
+        case RC_CLIENT_EVENT_LEADERBOARD_FAILED:
+            if (event->leaderboard != NULL) {
+                [bridge rcLeaderboardFailedWithID:event->leaderboard->id];
+            }
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_SUBMITTED: {
+            const rc_client_leaderboard_t *lb = event->leaderboard;
+            [bridge rcLeaderboardSubmittedWithID:lb->id
+                                         title:lb->title       ? @(lb->title)       : nil
+                                   description:lb->description ? @(lb->description) : nil
+                                     scoreText:lb->tracker_value ? @(lb->tracker_value) : nil];
+            break;
+        }
+        default:
+            break;
+    }
+}
+#endif // HAVE_RCHEEVOS
+
+EmulatedSystem vba;
+int emulating = 0;
+uint32_t pad[PVGBAButtonCount];
+
+static __weak PVVisualBoyAdvanceBridge *_current;
+
+@interface PVVisualBoyAdvanceBridge ()
+{
+    uint8_t *videoBuffer;
+    int32_t *soundBuffer;
+    NSURL *_romFile, *_saveFile;
+
+    NSString *_romID;
+    BOOL _enableRTC, _enableMirroring, _useBIOS, _haveFrame, _migratingSave;
+    int _flashSize, _cpuSaveType;
+#if HAVE_RCHEEVOS
+    rc_client_t *_rcClient;
+#endif
+    std::atomic<bool> _achievementsActive;
+}
+- (void)loadOverrides:(NSString *)gameID;
+- (void)writeSaveFile;
+- (void)migrateSaveFile;
+/// Called from `pvvba_load_callback` / `pvvba_login_callback` (cannot use private ivars from static C functions).
+- (void)pvvba_applyAchievementsLoadResult:(BOOL)success;
+@end
+
+@implementation PVVisualBoyAdvanceBridge
+@synthesize valueChangedHandler;
+
+#if !TARGET_OS_WATCH
+/// Required by `EmulatorCoreControllerDataSource` (`controller(forPlayer:)` in Swift).
+- (GCController * _Nullable)controllerForPlayer:(NSUInteger)player {
+    switch (player) {
+        case 1: return self.controller1;
+        case 2: return self.controller2;
+        case 3: return self.controller3;
+        case 4: return self.controller4;
+        case 5: return self.controller5;
+        case 6: return self.controller6;
+        case 7: return self.controller7;
+        case 8: return self.controller8;
+        default: return nil;
+    }
+}
+#endif
+
+- (instancetype)init {
+    if((self = [super init])) {
+        self->videoBuffer = (uint8_t *) malloc(240 * 160 * 4);
+        vba = GBASystem;
+        _achievementsActive.store(false);
+    }
+
+    _current = self;
+
+    return self;
+}
+
+- (void)dealloc {
+#if HAVE_RCHEEVOS
+    if (_rcClient) {
+        rc_client_destroy(_rcClient);
+        _rcClient = NULL;
+    }
+#endif
+    if(self->videoBuffer) {
+        free(self->videoBuffer);
+        self->videoBuffer = nil;
+    }
+}
+
+# pragma mark - Execution
+
+- (BOOL)loadFileAtPath:(NSString *)path error:(NSError**)error {
+    memset(pad, 0, sizeof(uint32_t) * PVGBAButtonCount);
+
+    self->_romFile = [NSURL fileURLWithPath:path];
+
+    int loaded = CPULoadRom([path UTF8String]);
+
+    if(loaded == 0) {
+		if(error != NULL) {
+			NSDictionary *userInfo = @{
+				NSLocalizedDescriptionKey: @"Failed to load game.",
+				NSLocalizedFailureReasonErrorKey: @"VisualBoyAdvanced failed to load ROM.",
+				NSLocalizedRecoverySuggestionErrorKey: @"Check that file isn't corrupt and in format VisualBoyAdvanced supports."
+			};
+
+			NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+													code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+												userInfo:userInfo];
+
+			*error = newError;
+		}
+        return NO;
+    }
+
+    utilUpdateSystemColorMaps(false);
+
+    // Read the cart's Game ID
+    char gameID[5];
+    gameID[0] = rom[0xac];
+    gameID[1] = rom[0xad];
+    gameID[2] = rom[0xae];
+    gameID[3] = rom[0xaf];
+    gameID[4] = 0;
+
+    DLOG(@"VBA: GameID in ROM is: %s\n", gameID);
+
+    // Load per-game settings from vba-over.ini
+    [self loadOverrides:[NSString stringWithFormat:@"%s", gameID]];
+
+    // Check if BIOS file even exists
+    NSString *romFolder = [path stringByDeletingLastPathComponent];
+    NSString *biosPath = [self.BIOSPath stringByAppendingPathComponent:@"GBA.BIOS"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:biosPath]) {
+        ILOG(@"BIOS found at %@. Will use.", biosPath);
+        self->_useBIOS = YES;
+    } else {
+        if (self->_useBIOS) {
+			if(error != NULL) {
+				NSDictionary *userInfo = @{
+					NSLocalizedDescriptionKey: @"Failed to load game.",
+					NSLocalizedFailureReasonErrorKey: @"vba-over.ini states this ROM requires BIOS but none found at: %@.\nPlease install this bios.",
+					NSLocalizedRecoverySuggestionErrorKey: @"Check that file isn't corrupt and in format VisualBoyAdvanced supports."
+				};
+
+				NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+														code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+													userInfo:userInfo];
+
+				*error = newError;
+			}
+            return NO;
+        }
+        
+        self->_useBIOS = NO;
+    }
+    
+    // Apply settings
+    rtcEnable(self->_enableRTC);
+    useBios = self->_useBIOS;
+    mirroringEnable = self->_enableMirroring;
+    doMirroring(mirroringEnable);
+    cpuSaveType = (int)self->_cpuSaveType;
+    
+    // Load core options
+    skipBios = VisualBoyAdvanceOptions.skipBios;
+    cpuDisableSfx = VisualBoyAdvanceOptions.cpuDisableSfx;
+    speedHack = VisualBoyAdvanceOptions.speedHack;
+    skipSaveGameBattery = VisualBoyAdvanceOptions.skipSaveGameBattery;
+    skipSaveGameCheats = VisualBoyAdvanceOptions.skipSaveGameCheats;
+
+    if(self->_flashSize == 0x10000 || self->_flashSize == 0x20000) {
+        flashSetSize((int)self->_flashSize);
+    }
+
+    soundInit();
+    soundSetSampleRate(32768); // 44100 chirps
+    //soundFiltering = 0.0;
+    //soundInterpolation = false;
+
+    soundReset();
+
+    CPUInit(self->_useBIOS ? biosPath.UTF8String : 0, self->_useBIOS);
+    CPUReset();
+
+    // Load battery save or migrate old one
+    NSString *extensionlessFilename = [[self->_romFile lastPathComponent] stringByDeletingPathExtension];
+    NSString *batterySavesDirectory = [self batterySavesPath];
+    if([batterySavesDirectory length]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:batterySavesDirectory withIntermediateDirectories:YES attributes:nil error:NULL];
+    }
+    
+    self->_saveFile = [NSURL fileURLWithPath:[batterySavesDirectory stringByAppendingPathComponent:[extensionlessFilename stringByAppendingPathExtension:@"sav2"]]];
+
+    if ([self->_saveFile checkResourceIsReachableAndReturnError:nil] && vba.emuReadBattery([[self->_saveFile path] UTF8String])) {
+        ILOG(@"VBA: Battery loaded");
+    }
+    else {
+        [self migrateSaveFile];
+    }
+    emulating = 1;
+
+#if HAVE_RCHEEVOS
+    if (!_rcClient) {
+        _rcClient = rc_client_create(pvvba_read_memory, pvvba_server_call);
+        if (_rcClient) {
+            rc_client_set_userdata(_rcClient, (__bridge void *)self);
+            rc_client_set_event_handler(_rcClient, pvvba_event_handler);
+        }
+    }
+#endif
+
+    return YES;
+}
+
+- (void)executeFrame {
+    [self executeFrameSkippingFrame:NO];
+}
+
+- (void)executeFrameSkippingFrame:(BOOL)skip {
+    self->_haveFrame = NO;
+    while (!self->_haveFrame) { vba.emuMain(vba.emuCount); }
+    [self tickAchievements];
+}
+
+- (void)resetEmulation { vba.emuReset(); }
+
+- (void)stopEmulation {
+    [super stopEmulation]; //Leave emulation loop first
+
+    emulating = 0;
+
+#if HAVE_RCHEEVOS
+    if (_rcClient) {
+        rc_client_unload_game(_rcClient);
+        rc_client_destroy(_rcClient);
+        _rcClient = NULL;
+    }
+    _achievementsActive.store(false);
+#endif
+
+    [self writeSaveFile];
+
+    vba.emuCleanUp();
+    soundShutdown();
+}
+
+- (NSTimeInterval)frameInterval {
+    return 59.727501;
+}
+
+# pragma mark - RetroAchievements
+
+- (void *)ewramBasePtr {
+    return (void *)workRAM;
+}
+
+- (void *)iwramBasePtr {
+    return (void *)internalRAM;
+}
+
+- (void *)vbaVramBasePtr {
+    return (void *)vram;
+}
+
+- (BOOL)achievementsActive {
+    return _achievementsActive.load();
+}
+
+- (void)tickAchievements {
+#if HAVE_RCHEEVOS
+    if (_rcClient && _achievementsActive.load()) {
+        rc_client_do_frame(_rcClient);
+    }
+#endif
+}
+
+#if HAVE_RCHEEVOS
+
+typedef struct pvvba_load_ctx {
+    void *bridge;
+    void *completion;
+} pvvba_load_ctx_t;
+
+static void pvvba_load_callback(int result, const char * __unused error_message,
+                                rc_client_t * __unused client, void *userdata) {
+    pvvba_load_ctx_t *ctx = (pvvba_load_ctx_t *)userdata;
+    PVVisualBoyAdvanceBridge *bridge = (__bridge_transfer PVVisualBoyAdvanceBridge *)ctx->bridge;
+    void (^completion)(BOOL) = (__bridge_transfer void (^)(BOOL))ctx->completion;
+    ctx->completion = NULL;
+    free(ctx);
+
+    BOOL success = (result == RC_OK);
+    [bridge pvvba_applyAchievementsLoadResult:success];
+    if (completion) { completion(success); }
+}
+
+typedef struct pvvba_login_ctx {
+    void *bridge;
+    void *gameHash;
+    void *completion;
+} pvvba_login_ctx_t;
+
+static void pvvba_login_callback(int result, const char * __unused error_message,
+                                 rc_client_t *client, void *userdata) {
+    pvvba_login_ctx_t *lCtx = (pvvba_login_ctx_t *)userdata;
+    PVVisualBoyAdvanceBridge *bridge = (__bridge_transfer PVVisualBoyAdvanceBridge *)lCtx->bridge;
+    NSString *hash               = (__bridge_transfer NSString *)lCtx->gameHash;
+    void (^completion)(BOOL)     = (__bridge_transfer void (^)(BOOL))lCtx->completion;
+    lCtx->completion = NULL;
+    free(lCtx);
+
+    if (result != RC_OK) {
+        [bridge pvvba_applyAchievementsLoadResult:NO];
+        if (completion) { completion(NO); }
+        return;
+    }
+
+    pvvba_load_ctx_t *loadCtx = (pvvba_load_ctx_t *)malloc(sizeof(pvvba_load_ctx_t));
+    if (!loadCtx) {
+        [bridge pvvba_applyAchievementsLoadResult:NO];
+        if (completion) { completion(NO); }
+        return;
+    }
+    loadCtx->bridge     = (__bridge_retained void *)bridge;
+    loadCtx->completion = completion ? (__bridge_retained void *)[completion copy] : NULL;
+    rc_client_begin_load_game(client, hash.UTF8String, pvvba_load_callback, loadCtx);
+}
+
+#endif // HAVE_RCHEEVOS
+
+- (void)loadAchievementsForGameHash:(NSString *)gameHash
+                         completion:(void (^)(BOOL success))completion {
+#if HAVE_RCHEEVOS
+    if (!_rcClient) {
+        _achievementsActive.store(false);
+        if (completion) { completion(NO); }
+        return;
+    }
+
+    if (rc_client_get_user_info(_rcClient) != NULL) {
+        pvvba_load_ctx_t *ctx = (pvvba_load_ctx_t *)malloc(sizeof(pvvba_load_ctx_t));
+        if (!ctx) {
+            _achievementsActive.store(false);
+            if (completion) { completion(NO); }
+            return;
+        }
+        ctx->bridge     = (__bridge_retained void *)self;
+        ctx->completion = completion ? (__bridge_retained void *)[completion copy] : NULL;
+        rc_client_begin_load_game(_rcClient, gameHash.UTF8String, pvvba_load_callback, ctx);
+        return;
+    }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *username = [defaults stringForKey:@"ra_username"];
+    NSString *token    = [defaults stringForKey:@"ra_session_token"];
+    if (!username.length || !token.length) {
+        _achievementsActive.store(false);
+        if (completion) { completion(NO); }
+        return;
+    }
+
+    pvvba_login_ctx_t *lCtx = (pvvba_login_ctx_t *)malloc(sizeof(pvvba_login_ctx_t));
+    if (!lCtx) {
+        _achievementsActive.store(false);
+        if (completion) { completion(NO); }
+        return;
+    }
+    lCtx->bridge     = (__bridge_retained void *)self;
+    lCtx->gameHash   = (__bridge_retained void *)[gameHash copy];
+    lCtx->completion = completion ? (__bridge_retained void *)[completion copy] : NULL;
+    rc_client_begin_login_with_token(_rcClient, username.UTF8String, token.UTF8String,
+                                     pvvba_login_callback, lCtx);
+#else
+    _achievementsActive.store(false);
+    if (completion) { completion(NO); }
+#endif
+}
+
+- (void)unloadAchievements {
+#if HAVE_RCHEEVOS
+    if (_rcClient) {
+        rc_client_unload_game(_rcClient);
+    }
+#endif
+    _achievementsActive.store(false);
+}
+
+- (void)pvvba_applyAchievementsLoadResult:(BOOL)success {
+    _achievementsActive.store(success);
+}
+
+# pragma mark - Video
+
+- (const void *)videoBuffer { return self->videoBuffer; }
+
+- (CGRect)screenRect { return CGRectMake(0, 0, 240, 160); }
+
+- (CGSize)bufferSize { return CGSizeMake(240, 160); }
+
+- (CGSize)aspectSize { return CGSizeMake(3, 2); }
+
+- (GLenum)pixelFormat { return GL_BGRA; }
+
+- (GLenum)pixelType { return GL_UNSIGNED_BYTE; }
+
+- (GLenum)internalPixelFormat { return GL_RGBA; }
+
+# pragma mark - Audio
+
+- (double)audioSampleRate {
+    double samplerate = soundGetSampleRate();
+    if(samplerate < 32768) {
+        samplerate = 32768;
+    }
+    return samplerate;
+}
+
+- (NSUInteger)channelCount { return 2; }
+
+# pragma mark - Save States
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
+
+- (BOOL)saveStateToFileAtPath:(NSString *)fileName error:(NSError**)error {
+    @synchronized(self) {
+        BOOL success = vba.emuWriteState([fileName UTF8String]);
+		if (!success) {
+			if(error != NULL) {
+				NSDictionary *userInfo = @{
+					NSLocalizedDescriptionKey: @"Failed to save state.",
+					NSLocalizedFailureReasonErrorKey: @"Core failed to create save state.",
+					NSLocalizedRecoverySuggestionErrorKey: @""
+				};
+
+				NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+														code:PVEmulatorCoreErrorCodeCouldNotSaveState
+													userInfo:userInfo];
+
+				*error = newError;
+			}
+		}
+		return success;
+    }
+}
+
+/// `EmulatorCoreSavesSerializer` exposes this selector (`@objc(loadStateToFileAtPath:error:)`).
+- (BOOL)loadStateToFileAtPath:(NSString *)fileName error:(NSError **)error {
+    @synchronized(self) {
+        BOOL success = vba.emuReadState([fileName UTF8String]);
+		if (!success) {
+			if(error != NULL) {
+				NSDictionary *userInfo = @{
+					NSLocalizedDescriptionKey: @"Failed to save state.",
+					NSLocalizedFailureReasonErrorKey: @"Core failed to load save state.",
+					NSLocalizedRecoverySuggestionErrorKey: @""
+				};
+				
+				NSError *newError = [NSError errorWithDomain:CoreError.PVEmulatorCoreErrorDomain
+														code:PVEmulatorCoreErrorCodeCouldNotLoadState
+													userInfo:userInfo];
+				
+				*error = newError;
+			}
+		}
+		return success;
+    }
+}
+
+- (BOOL)loadStateFromFileAtPath:(NSString *)fileName error:(NSError**)error {
+    return [self loadStateToFileAtPath:fileName error:error];
+}
+
+#pragma clang diagnostic pop
+
+# pragma mark - Input
+
+enum {
+    KEY_BUTTON_A      = 1 << 0,
+    KEY_BUTTON_B      = 1 << 1,
+    KEY_BUTTON_SELECT = 1 << 2,
+    KEY_BUTTON_START  = 1 << 3,
+    KEY_RIGHT         = 1 << 4,
+    KEY_LEFT          = 1 << 5,
+    KEY_UP            = 1 << 6,
+    KEY_DOWN          = 1 << 7,
+    KEY_BUTTON_R      = 1 << 8,
+    KEY_BUTTON_L      = 1 << 9
+};
+
+const int GBAMap[] = {KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_BUTTON_A, KEY_BUTTON_B, KEY_BUTTON_L, KEY_BUTTON_R, KEY_BUTTON_START, KEY_BUTTON_SELECT};
+
+- (void)didPushGBAButton:(PVGBAButton)button forPlayer:(NSInteger)player { pad[player] |= GBAMap[button]; }
+
+- (void)didReleaseGBAButton:(PVGBAButton)button forPlayer:(NSInteger)player { pad[player] &= ~GBAMap[button]; }
+
+bool systemReadJoypads() {
+    __strong PVVisualBoyAdvanceBridge *strongCurrent = _current;
+
+    for (NSInteger playerIndex = 0; playerIndex < 2; playerIndex++) {
+        GCController *controller = nil;
+        if (strongCurrent.controller1 && playerIndex == 0) {
+            controller = strongCurrent.controller1;
+        }
+        else if (strongCurrent.controller2 && playerIndex == 1) {
+            controller = strongCurrent.controller2;
+            playerIndex = 1;
+        }
+
+        if (controller) {
+            if ([controller extendedGamepad]) {
+                GCExtendedGamepad *gamepad = [controller extendedGamepad];
+                GCControllerDirectionPad *dpad = [gamepad dpad];
+
+                (gamepad.dpad.up.isPressed || gamepad.leftThumbstick.up.isPressed) ? pad[playerIndex] |= KEY_UP : pad[playerIndex] &= ~KEY_UP;
+                (gamepad.dpad.down.isPressed || gamepad.leftThumbstick.down.isPressed) ? pad[playerIndex] |= KEY_DOWN : pad[playerIndex] &= ~KEY_DOWN;
+                (gamepad.dpad.left.isPressed || gamepad.leftThumbstick.left.isPressed) ? pad[playerIndex] |= KEY_LEFT : pad[playerIndex] &= ~KEY_LEFT;
+                (gamepad.dpad.right.isPressed || gamepad.leftThumbstick.right.isPressed) ? pad[playerIndex] |= KEY_RIGHT : pad[playerIndex] &= ~KEY_RIGHT;
+
+                (gamepad.buttonA.isPressed || gamepad.buttonY.isPressed) ? pad[playerIndex] |= KEY_BUTTON_B : pad[playerIndex] &= ~KEY_BUTTON_B;
+                (gamepad.buttonB.isPressed || gamepad.buttonX.isPressed) ? pad[playerIndex] |= KEY_BUTTON_A : pad[playerIndex] &= ~KEY_BUTTON_A;
+
+                gamepad.leftShoulder.isPressed ? pad[playerIndex] |= KEY_BUTTON_L : pad[playerIndex] &= ~KEY_BUTTON_L;
+                gamepad.rightShoulder.isPressed ? pad[playerIndex] |= KEY_BUTTON_R : pad[playerIndex] &= ~KEY_BUTTON_R;
+
+				gamepad.leftTrigger.isPressed ? pad[playerIndex] |= KEY_BUTTON_SELECT : pad[playerIndex] &= ~KEY_BUTTON_SELECT;
+                gamepad.rightTrigger.isPressed ? pad[playerIndex] |= KEY_BUTTON_START : pad[playerIndex] &= ~KEY_BUTTON_START;
+                
+            }
+#if TARGET_OS_TV
+            else if ([controller microGamepad])
+            {
+                GCMicroGamepad *gamepad = [controller microGamepad];
+                GCControllerDirectionPad *dpad = [gamepad dpad];
+
+                gamepad.dpad.up.value > 0.5 ? pad[playerIndex] |= KEY_UP : pad[playerIndex] &= ~KEY_UP;
+                gamepad.dpad.down.value > 0.5 ? pad[playerIndex] |= KEY_DOWN : pad[playerIndex] &= ~KEY_DOWN;
+                gamepad.dpad.left.value > 0.5 ? pad[playerIndex] |= KEY_LEFT : pad[playerIndex] &= ~KEY_LEFT;
+                gamepad.dpad.right.value > 0.5 ? pad[playerIndex] |= KEY_RIGHT : pad[playerIndex] &= ~KEY_RIGHT;
+                
+                gamepad.buttonA.isPressed ? pad[playerIndex] |= KEY_BUTTON_B : pad[playerIndex] &= ~KEY_BUTTON_B;
+                gamepad.buttonX.isPressed ? pad[playerIndex] |= KEY_BUTTON_A : pad[playerIndex] &= ~KEY_BUTTON_A;
+            }
+#endif
+        }
+    }
+
+    return true;
+}
+
+# pragma mark - Misc Helper Methods
+
+- (void)loadOverrides:(NSString *)gameID {
+    // Set defaults
+    self->_enableRTC       = NO;
+    self->_enableMirroring = NO;
+    self->_useBIOS         = NO;
+    self->_cpuSaveType     = 0;
+    self->_flashSize       = 0x10000;
+
+    // Read in vba-over.ini and break it into an array of strings
+    NSString *iniPath = [[NSBundle bundleForClass:[self class]] pathForResource:@"vba-over" ofType:@"ini"];
+    NSString *iniString = [NSString stringWithContentsOfFile:iniPath encoding:NSUTF8StringEncoding error:NULL];
+    NSArray *settings = [iniString componentsSeparatedByString:@"\n"];
+
+    BOOL matchFound = NO;
+    NSMutableDictionary *overridesFound = [[NSMutableDictionary alloc] init];
+    NSString *temp;
+
+    // Check if vba-over.ini has per-game settings for our gameID
+    for (NSString *s in settings) {
+        temp = nil;
+
+        if ([s hasPrefix:@"["]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"[" intoString:nil];
+            [scanner scanUpToString:@"]" intoString:&temp];
+
+            if([temp caseInsensitiveCompare:gameID] == NSOrderedSame) {
+                matchFound = YES;
+                self->_romID = temp;
+            }
+
+            continue;
+        } else if (matchFound && [s hasPrefix:@"saveType="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"saveType=" intoString:nil];
+            [scanner scanUpToString:@"\n" intoString:&temp];
+            self->_cpuSaveType = [temp intValue];
+            [overridesFound setObject:temp forKey:@"CPU saveType"];
+
+            continue;
+        } else if (matchFound && [s hasPrefix:@"rtcEnabled="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"rtcEnabled=" intoString:nil];
+            [scanner scanUpToString:@"\n" intoString:&temp];
+            self->_enableRTC = [temp boolValue];
+            [overridesFound setObject:temp forKey:@"rtcEnabled"];
+
+            continue;
+        } else if (matchFound && [s hasPrefix:@"flashSize="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"flashSize=" intoString:nil];
+            [scanner scanUpToString:@"\n" intoString:&temp];
+            self->_flashSize = [temp intValue];
+            [overridesFound setObject:temp forKey:@"flashSize"];
+
+            continue;
+        } else if (matchFound && [s hasPrefix:@"mirroringEnabled="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"mirroringEnabled=" intoString:nil];
+            [scanner scanUpToString:@"\n" intoString:&temp];
+            self->_enableMirroring = [temp boolValue];
+            [overridesFound setObject:temp forKey:@"mirroringEnabled"];
+
+            continue;
+        } else if (matchFound && [s hasPrefix:@"useBios="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:s];
+            [scanner scanString:@"useBios=" intoString:nil];
+            [scanner scanUpToString:@"\n" intoString:&temp];
+            self->_useBIOS = [temp boolValue];
+            [overridesFound setObject:temp forKey:@"useBios"];
+
+            continue;
+        }
+        else if (matchFound) {
+            break;
+        }
+    }
+
+    if (matchFound) { DLOG(@"VBA: overrides found: %@", overridesFound); }
+}
+
+- (void)writeSaveFile {
+    if (vba.emuWriteBattery([[self->_saveFile path] UTF8String]))
+        DLOG(@"VBA: Battery saved");
+}
+
+/*
+ This migration method is meant to correct broken behavior in forks of VBA/VBA-M so that we can reuse battery saves with our unmodified VBA-M core port. Forks vba-next/vbam-libretro created battery saves incompatible with vanilla VBA-M. Problems include:
+
+ - EEPROM and FLASH all arbitrarily saved as 139KB (139264 bytes) instead of correct sizes.
+ - SRAM sometimes saved incorrectly as 8KB (8192 bytes) instead of proper 66KB (65536 bytes).
+ - SRAM sometimes saved incorrectly as 512 bytes instead of proper 66KB, resulting in data loss.
+ - SRAM sometimes saved incorrectly as 139KB (139264 bytes) instead of proper 66KB (65536 bytes).
+ - FLASH sometimes saved corrupt/empty 66KB files instead of saves meant to be 131KB (131072 bytes).
+ - Battery save files always generated even if a game did not support saving.
+ */
+- (void)migrateSaveFile {
+    // Build a path to the old save file and check if it exists
+    NSURL *extensionlessFilename = [self->_saveFile URLByDeletingPathExtension];
+    NSURL *saveFileToMigrate = [extensionlessFilename URLByAppendingPathExtension:@"sav"];
+
+    if (![saveFileToMigrate checkResourceIsReachableAndReturnError:nil]) { return; }
+
+    /*
+     +----------------+----------+-------------+-----------------+--------------------------------------+
+     |     Format     | saveType | cpuSaveType |  Size in Bytes  |            Example Games             |
+     +----------------+----------+-------------+-----------------+--------------------------------------|
+     |  (AUTODETECT)  |    0     |      0      |        -        |                                      |
+     |  SRAM          |    1     |      2      |      65536*     | F-Zero, Kirby Nightmare in Dreamland |
+     |  FLASH         |    2     |      3      | 65536 or 131072 | Golden Sun, Pokemon Emerald          |
+     |  EEPROM        |    3     |      1      |   512 or 8192   | Super Mario Advance, LoZ: Minish Cap |
+     |  EEPROM+Sensor |    3     |      4      |   512 or 8192   | Yoshi's Universal Gravitation        |
+     |  (NONE)        |    5     |      5      |        -        |                                      |
+     +-----------------------------------------------------------+--------------------------------------+
+     * According to some docs, SRAM should be 32768 bytes but VBA saves SRAM as 65536
+     Note: `saveType` = `gbaSaveType` global save var, `cpuSaveType` = `saveType=` in vba-over.ini
+     See: GBA.cpp:3500 and http://problemkaputt.de/gbatek.htm#gbacartbackupids
+     */
+
+    // Step 0
+    // Backup original save file as .sav.old
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSURL *backupSaveFile = [saveFileToMigrate URLByAppendingPathExtension:@"old"];
+    [fileManager copyItemAtURL:saveFileToMigrate toURL:backupSaveFile error:nil];
+
+    // Step 1
+    // Prefer the vba-over.ini override (cpuSaveType) when it is set — this is
+    // authoritative for known games (especially Pokemon FLASH 128K carts that
+    // do not touch save memory at startup, where cycle-based detection returns 0
+    // and the migration would mis-classify the save as SRAM and truncate it).
+    // _cpuSaveType comes from vba-over.ini saveType= (see loadOverrides:).
+    // Mapping (GBA.cpp::CPUReset switch cpuSaveType):
+    //   1 EEPROM -> saveType=3, 2 SRAM -> saveType=1, 3 FLASH -> saveType=2,
+    //   4 EEPROM+Sensor -> saveType=3, 5 NONE -> saveType=5
+    self->_migratingSave = YES;
+
+    if (self->_cpuSaveType != 0) {
+        switch (self->_cpuSaveType) {
+            case 1: saveType = 3; break;                       // EEPROM
+            case 2: saveType = 1; break;                       // SRAM
+            case 3:
+                saveType = 2;                                  // FLASH
+                if (self->_flashSize == 0x10000 || self->_flashSize == 0x20000) {
+                    flashSize = (int)self->_flashSize;
+                }
+                break;
+            case 4: saveType = 3; break;                       // EEPROM + Sensor
+            case 5: saveType = 5; break;                       // NONE
+            default: break;
+        }
+        DLOG(@"VBA migrate: using vba-over.ini override cpuSaveType=%d -> saveType=%d flashSize=%d",
+             (int)self->_cpuSaveType, saveType, flashSize);
+    } else {
+        // No override — fall back to running the CPU for 500 cycles to try and
+        // determine the save type. Seems high but save types for some games
+        // cannot be determined until 300+ cycles (e.g. Golden Sun).
+        for (int i = 0; i < 500; i++) { vba.emuMain(vba.emuCount); }
+    }
+
+    // Step 2
+    // If VBA did not determine the save type while cycling the CPU, fall back to lookup by the GBA Cart Backup ID. Sometimes VBA cannot determine save types until certain points in game when memory is accessed. This routine, adapted from Util.cpp, is rarely used as cycling the CPU is usually enough.
+    // Note: Lookup via GBA Cart Backup ID is not 100% accurate http://zork.net/~st/jottings/GBA_saves.html
+    if (saveType == 0 && !eepromInUse) {
+        uint8_t *data;
+        size_t size;
+
+        // Load GBA cart, read bytes, get length
+        NSData *dataObj = [NSData dataWithContentsOfURL:[self->_romFile URLByStandardizingPath]];
+        if(dataObj == nil) return;
+        size = [dataObj length];
+        data = (uint8_t *)[dataObj bytes];
+
+        uint32_t *p = (uint32_t *)data;
+        uint32_t *end = (uint32_t *)(data + size);
+
+        while(p < end) {
+            uint32_t d = *((uint32_t *)p);
+
+            if(d == 0x52504545) {
+                if(memcmp(p, "EEPROM_", 7) == 0) {
+                    if(saveType == 0)
+                    {
+                        saveType = 3;
+                        eepromSize = 8192;
+                    }
+                }
+            } else if (d == 0x4D415253) {
+                if(memcmp(p, "SRAM_", 5) == 0) {
+                    if(saveType == 0)
+                        saveType = 1;
+                }
+            } else if (d == 0x53414C46) {
+                if(memcmp(p, "FLASH1M_", 8) == 0) {
+                    if(saveType == 0) {
+                        saveType = 2;
+                        flashSize = 0x20000;
+                    }
+                } else if(memcmp(p, "FLASH", 5) == 0) {
+                    if(saveType == 0) {
+                        saveType = 2;
+                        flashSize = 0x10000;
+                    }
+                }
+            } else if (d == 0x52494953) {
+                if(memcmp(p, "SIIRTC_V", 8) == 0)
+                    self->_enableRTC = true;
+            }
+            p++;
+        }
+        // if no matches found, then set it to NONE
+        if(saveType == 0) {
+            saveType = 5;
+        }
+
+        if (saveType == 0 || saveType == 5) DLOG(@"saveType 0 NONE");
+        if (saveType == 3) DLOG(@"saveType 3 EEPROM_");
+        if (saveType == 1) DLOG(@"saveType 1 SRAM_");
+        if (saveType == 2) DLOG(@"saveType 2 FLASH size %d", flashSize);
+        if (self->_enableRTC) DLOG(@"rtcFound");
+    }
+
+    DLOG(@"saveType: %d eepromInUse %d flashSize %d eepromSize %d", saveType, eepromInUse, flashSize, eepromSize);
+
+    // Step 3
+    // Migrate save file if needed
+    uint8_t *saveFileData;
+    size_t saveFileSize;
+
+    // Load save file, read bytes, get length
+    NSData *dataObj = [NSData dataWithContentsOfURL:saveFileToMigrate];
+    if(dataObj == nil) return;
+    saveFileSize = [dataObj length];
+    saveFileData = (uint8_t *)[dataObj bytes];
+
+    // EEPROM saves
+
+    // 139KB to 8KB - remove the front 131072 bytes
+    if ((saveType == 3 || eepromInUse) && eepromSize == 8192 && saveFileSize == 139264)
+        memmove(saveFileData, saveFileData + 131072, saveFileSize -= 131072);
+
+    // 139KB to 512 bytes - remove the front 131072 and last 7680 bytes
+    else if ((saveType == 3 || eepromInUse) && eepromSize == 512 && saveFileSize == 139264) {
+        memmove(saveFileData, saveFileData + 131072, saveFileSize -= 131072);
+        saveFileData[512] = 0; // null terminate to drop the last 7680 bytes
+        saveFileSize = 512;
+    }
+
+    // FLASH saves
+
+    // 139KB to 131KB - remove the last 8192 bytes
+    else if (saveType == 2 && flashSize == 131072 && saveFileSize == 139264) {
+        saveFileData[131072] = 0;
+        saveFileSize = 131072;
+    }
+    // 139KB to 66KB  - remove the last 73728 bytes
+    // GUARD: If the vba-over.ini override declares this cart is FLASH 128K
+    // (flashSize=0x20000), refuse to truncate to 64K — doing so would destroy
+    // 64KB of save data (this was the cause of Pokemon "save failed" reports
+    // when the cart was mis-detected as FLASH 64K). Leave the original .sav
+    // alone in that case so it can still be loaded as 128K.
+    else if (saveType == 2 && flashSize == 65536 && saveFileSize == 139264) {
+        if (self->_flashSize == 0x20000) {
+            DLOG(@"VBA migrate: refusing to truncate 139KB save to 64K — vba-over.ini says cart is FLASH 128K. Leaving .sav intact.");
+            CPUReset();
+            self->_migratingSave = NO;
+            return;
+        }
+        saveFileData[65536] = 0;
+        saveFileSize = 65536;
+    }
+    // Case where some 131KB FLASH saved as 66KB with nothing but 0xFF bytes and no save data
+    // All we can do is delete so the game doesn't crash
+    else if (saveType == 2 && flashSize == 131072 && saveFileSize == 65536) {
+        [fileManager removeItemAtURL:saveFileToMigrate error:nil];
+        CPUReset();
+        self->_migratingSave = NO;
+        return;
+    }
+
+    // SRAM saves
+
+    // 139KB to 66KB  - remove the last 73728 bytes
+    else if (saveType == 1 && saveFileSize == 139264) {
+        saveFileData[65536] = 0;
+        saveFileSize = 65536;
+    }
+    // Case where some 66KB SRAM saved as 8KB - add 57344 bytes of 0xFF to the end
+    // e.g. Kirby Nightmare in Dreamland
+    // Note: This is a lot of potential data lost and might not fix all saves
+    else if (saveType == 1 && saveFileSize == 8192) {
+        NSMutableData *appendedData = [NSMutableData dataWithBytes:saveFileData length:saveFileSize];
+        uint8_t *bytesToAppend = (uint8_t *)malloc(57344);
+        memset(bytesToAppend, 0xFF, 57344);
+        NSData *append = [NSData dataWithBytesNoCopy:bytesToAppend length:57344 freeWhenDone:YES];
+        [appendedData appendBytes:[append bytes] length:[append length]];
+
+        saveFileData = (uint8_t *)[appendedData bytes];
+        saveFileSize = [appendedData length];
+    } else {
+        DLOG(@"VBA: Did not migrate save file because unnecessary or not detected.");
+    }
+
+    // Step 4
+    // Save migrated file to .sav2 and delete old save file
+    if (saveFileSize < 139264) {
+        NSError *error = nil;
+        NSURL *extensionlessFilename = [saveFileToMigrate URLByDeletingPathExtension];
+        NSURL *migratedSaveFile = [extensionlessFilename URLByAppendingPathExtension:@"sav2"];
+        NSData *outData = [NSData dataWithBytes:saveFileData length:saveFileSize];
+
+        [outData writeToURL:migratedSaveFile options:NSDataWritingAtomic error:&error];
+
+        if (error) {
+            DLOG(@"VBA: Error writing migrated save file: %@", error);
+            CPUReset();
+            self->_migratingSave = NO;
+            return;
+        }
+
+        DLOG(@"VBA: Writing new save file: %@", migratedSaveFile);
+
+        // Reset because we ran the CPU
+        CPUReset();
+        self->_migratingSave = NO;
+
+        if (vba.emuReadBattery([[migratedSaveFile path] UTF8String]))
+            DLOG(@"VBA: Battery loaded");
+    } else {
+        CPUReset();
+        self->_migratingSave = NO;
+    }
+
+    // Delete old save file since we created a backup .sav.old
+    [fileManager removeItemAtURL:saveFileToMigrate error:nil];
+}
+
+// VBA internal functions and stubs
+uint16_t systemColorMap16[0x10000];
+uint32_t systemColorMap32[0x10000];
+int systemColorDepth = 32;
+int systemRedShift = 19;
+int systemGreenShift = 11;
+int systemBlueShift = 3;
+int RGB_LOW_BITS_MASK = 0x00010101;
+int systemDebug = 0;
+int systemVerbose = 0;
+int systemFrameSkip = 0;
+int systemSaveUpdateCounter = SYSTEM_SAVE_NOT_UPDATED;
+int systemSpeed = 0;
+uint32_t systemGetClock()
+{
+    //struct timeval tv;
+
+    //gettimeofday(&tv, NULL);
+    //return tv.tv_sec*1000;
+    return 0;
+}
+
+int systemGetSensorX(void) {return 0;}
+int systemGetSensorY(void) {return 0;}
+bool systemPauseOnFrame() {return false;}
+bool systemCanChangeSoundQuality() {return false;} // ?
+void (*dbgOutput)(const char *s, uint32_t addr);
+void systemFrame() {}
+void systemShowSpeed(int speed) {}
+void systemScreenCapture(int a) {}
+void systemUpdateMotionSensor() {}
+void systemOnSoundShutdown() {}
+void systemOnWriteDataToSoundBuffer(const uint16_t *finalWave, int length) {}
+
+// VBA video and execution
+void system10Frames(int rate) {
+    __strong PVVisualBoyAdvanceBridge *strongCurrent = _current;
+
+    if(systemSaveUpdateCounter && !strongCurrent->_migratingSave)
+    {
+        if(--systemSaveUpdateCounter <= SYSTEM_SAVE_NOT_UPDATED)
+        {
+            [_current writeSaveFile];
+            systemSaveUpdateCounter = SYSTEM_SAVE_NOT_UPDATED;
+        }
+    }
+}
+
+void systemDrawScreen() {
+    __strong PVVisualBoyAdvanceBridge *strongCurrent = _current;
+
+    strongCurrent->_haveFrame = YES;
+
+    // Get rid of the first line and the last row
+    dispatch_queue_t the_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+    dispatch_apply(160, the_queue, ^(size_t y){
+        memcpy(strongCurrent->videoBuffer + y * 240 * 4, pix + (y + 1) * (240 + 1) * 4, 240 * 4);
+    });
+}
+
+// VBA input
+uint32_t systemReadJoypad(int which) {
+    uint32_t res = 0;
+
+    which %= 4;
+    if(which == -1)
+        which = 0;
+
+    res = pad[which];
+
+    // Disallow L+R or U+D of being pressed at the same time
+    if((res & (KEY_RIGHT | KEY_LEFT)) == (KEY_RIGHT | KEY_LEFT)) res &= ~ KEY_RIGHT;
+    if((res & (KEY_UP    | KEY_DOWN)) == (KEY_UP    | KEY_DOWN)) res &= ~ KEY_UP;
+
+    //if((res & 48) == 48)
+    //    res &= ~16;
+    //if((res & 192) == 192)
+    //    res &= ~128;
+
+    return res;
+}
+
+// VBA audio
+class DummySound : public SoundDriver {
+public:
+    DummySound();
+    virtual ~DummySound();
+
+    virtual bool init(long sampleRate);
+    virtual void pause();
+    virtual void reset();
+    virtual void resume();
+    virtual void write(uint16_t * finalWave, int length);
+};
+
+DummySound::DummySound() {}
+
+void DummySound::write(u16 * finalWave, int length) {
+    __strong PVVisualBoyAdvanceBridge *strongCurrent = _current;
+
+    [[strongCurrent ringBufferAtIndex:0] write:finalWave size:length];
+}
+
+bool DummySound::init(long sampleRate) {
+    return true;
+}
+
+DummySound::~DummySound() {}
+void DummySound::pause() {}
+void DummySound::resume() {}
+void DummySound::reset() {}
+
+SoundDriver *systemSoundInit() {
+    soundShutdown();
+
+    return new DummySound();
+}
+
+// VBA logging
+void systemMessage(int, const char * str, ...) {
+    va_list args;
+    va_start(args, str);
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), str, args);
+    va_end(args);
+    DLOG(@"VBA message: %s", buf);
+    NSString *msg = [NSString stringWithUTF8String:buf];
+    if (msg.length > 0) {
+        [PVOSDNotification postMessage:msg type:PVOSDTypeInfo duration:3.0];
+    }
+}
+
+- (void)didPush:(PVGBAButton)button forPlayer:(NSInteger)player {
+    [self didPushGBAButton:button forPlayer:player];
+}
+
+- (void)didRelease:(PVGBAButton)button forPlayer:(NSInteger)player {
+    [self didReleaseGBAButton:button forPlayer:player];
+}
+
+@end
+
+#pragma mark - Cheats
+
+@implementation PVVisualBoyAdvanceBridge (Cheats)
+
+// Maps sanitized code -> user-provided label
+static NSMutableDictionary *cheatList = nil;
+// Maps sanitized code -> codeType (e.g. "GameShark", "Action Replay v3") for per-code dispatch
+static NSMutableDictionary *cheatCodeTypeList = nil;
+
+- (NSArray<NSString *> *)cheatCodeTypes {
+    return @[
+        @"GameShark",
+        @"Code Breaker",
+        @"Action Replay v3",
+        @"Action Replay v1/v2"
+    ];
+}
+
+- (BOOL)setCheatWithCode:(NSString *)code type:(NSString *)type codeType:(NSString *)codeType
+          cheatIndex:(UInt8)cheatIndex enabled:(BOOL)enabled {
+    // Lazy-initialise cheat dictionaries
+    if (!cheatList) {
+        cheatList = [[NSMutableDictionary alloc] init];
+    }
+    if (!cheatCodeTypeList) {
+        cheatCodeTypeList = [[NSMutableDictionary alloc] init];
+    }
+
+    // Sanitize
+    code = [code stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    // VBA expects cheats UPPERCASE
+    code = [code uppercaseString];
+
+    // Remove any spaces
+    code = [code stringByReplacingOccurrencesOfString:@" " withString:@""];
+
+    // Concat address/value pairs
+    NSArray *multipleCodes = [code componentsSeparatedByString:@"+"];
+    for (NSUInteger i = 0; i < multipleCodes.count; i++) {
+        NSString *singleCode = multipleCodes[i];
+        if (i + 1 < multipleCodes.count && singleCode.length <= 8) {
+            singleCode = [singleCode stringByAppendingString:multipleCodes[i + 1]];
+            i++;
+        }
+        if (enabled) {
+            // Store the user-provided label (type) so it can be passed to the VBA cheat engine
+            [cheatList setValue:type ?: singleCode forKey:singleCode];
+            // Store per-code codeType so 16-char codes are dispatched correctly
+            // even when cheats of different types are mixed together
+            [cheatCodeTypeList setValue:codeType ?: @"" forKey:singleCode];
+        } else {
+            [cheatList removeObjectForKey:singleCode];
+            [cheatCodeTypeList removeObjectForKey:singleCode];
+        }
+    }
+
+    cheatsDeleteAll(false); // Old values not restored by default. Dunno if matters much to cheaters
+
+    BOOL anyAdded = NO;
+
+    // Apply enabled cheats found in dictionary
+    for (NSString *singleCode in cheatList)
+    {
+        NSString *label = cheatList[singleCode] ?: @"cheat";
+        NSString *storedCodeType = cheatCodeTypeList[singleCode] ?: codeType;
+        DLOG(@"VBA: Processing cheat %@ codeType %@", singleCode, storedCodeType);
+        if ([singleCode length] == 11 || [singleCode length] == 13 || [singleCode length] == 17) // Code with Address:Value
+        {
+            // XXXXXXXX:YY || XXXXXXXX:YYYY || XXXXXXXX:YYYYYYYY
+            cheatsAddCheatCode([singleCode UTF8String], [label UTF8String]);
+            anyAdded = YES;
+        }
+        else if ([singleCode length] == 12) // Codebreaker/GameShark SP/Xploder code
+        {
+            // VBA expects 12-character Codebreaker/GameShark SP codes in format: XXXXXXXX YYYY
+            NSMutableString *formattedCode = [NSMutableString stringWithString:singleCode];
+            [formattedCode insertString:@" " atIndex:8];
+
+            cheatsAddCBACode([formattedCode UTF8String], [label UTF8String]);
+            anyAdded = YES;
+        }
+        else if ([singleCode length] == 16) // GameShark Advance/Action Replay (v1/v2) and Action Replay v3
+        {
+            // Note: GameShark and Action Replay were synonymous until AR v3. Same codes and devices, but different names by region
+            if ([storedCodeType isEqualToString:@"GameShark"])
+                cheatsAddGSACode([singleCode UTF8String], [label UTF8String], false); // false = GS/AR v1/v2 (not AR v3)
+
+            // AR v3 was an entirely different device from GS/AR v1/v2, with different code types and encryption
+            else if ([storedCodeType isEqualToString:@"Action Replay v3"])
+                cheatsAddGSACode([singleCode UTF8String], [label UTF8String], true); // true = AR v3 code
+
+            else // default to GS/AR v1/v2 code (can't determine GS/AR v1/v2 vs AR v3 because same length)
+                cheatsAddGSACode([singleCode UTF8String], [label UTF8String], false);
+
+            anyAdded = YES;
+        }
+    }
+
+    // Return YES if cheats were applied or if all cheats were disabled (empty list = success)
+    return anyAdded || [cheatList count] == 0;
+}
+
+- (void)resetCheatCodes {
+    if (cheatList) {
+        [cheatList removeAllObjects];
+    }
+    if (cheatCodeTypeList) {
+        [cheatCodeTypeList removeAllObjects];
+    }
+    cheatsDeleteAll(false);
+}
+
+-(BOOL)supportsCheatCode { return YES; }
+
+@end

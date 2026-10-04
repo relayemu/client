@@ -1,0 +1,451 @@
+import SwiftUI
+import PVLookup
+import PVLookupTypes
+import PVSystems
+import PVMediaCache
+
+struct ArtworkDetailView: View {
+    let artworks: [ArtworkMetadata]
+    let initialIndex: Int
+    let onSelect: (ArtworkSelectionData) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var currentPage = 0
+    @State private var isZoomed = false
+    @GestureState private var scale: CGFloat = 1.0
+    @State private var previewImages: [URL: Image] = [:]
+    let onPageChange: (ArtworkMetadata) -> Void
+    @State private var dragOffset = CGSize.zero
+    @State private var isDragging = false
+    private let imageCache = ImageCache.shared
+
+    init(artworks: [ArtworkMetadata], initialArtwork: ArtworkMetadata, onSelect: @escaping (ArtworkSelectionData) -> Void, onPageChange: @escaping (ArtworkMetadata) -> Void) {
+        self.artworks = artworks
+        self.initialIndex = artworks.firstIndex(of: initialArtwork) ?? 0
+        self.onSelect = onSelect
+        _currentPage = State(initialValue: initialIndex)
+        self.onPageChange = onPageChange
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Color.black
+                    .edgesIgnoringSafeArea(.all)
+                    .opacity(1 - (abs(dragOffset.height) / 500.0))
+
+                TabView(selection: $currentPage) {
+                    ForEach(Array(artworks.enumerated()), id: \.offset) { index, artwork in
+                        ZoomableImageView(
+                            artwork: artwork,
+                            previewImage: previewImages[artwork.url],
+                            geometry: geometry,
+                            isZoomed: $isZoomed
+                        )
+                        .tag(index)
+                    }
+                }
+                .onChange(of: currentPage) { page in
+                    if let artwork = artworks[safe: page] {
+                        onPageChange(artwork)
+                        preloadAdjacentImages()
+                        #if !os(tvOS)
+                        HapticManager.impact(style: .light)
+                        #endif
+                    }
+                }
+                .tabViewStyle(.page)
+
+                overlayControls
+                    .opacity(1 - (abs(dragOffset.height) / 300.0))
+            }
+#if !os(tvOS)
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        if !isZoomed && abs(value.translation.width) < abs(value.translation.height) {
+                            dragOffset = value.translation
+                            isDragging = true
+                        }
+                    }
+                    .onEnded { value in
+                        isDragging = false
+                        if abs(dragOffset.height) > 100 {
+                            dismiss()
+                        } else {
+                            withAnimation(.spring()) {
+                                dragOffset = .zero
+                            }
+                        }
+                    }
+            )
+#endif
+            .offset(y: dragOffset.height)
+            .animation(.interactiveSpring(), value: isDragging)
+        }
+        .task {
+            await loadInitialImages()
+        }
+#if !os(tvOS)
+        .gesture(
+            DragGesture(minimumDistance: 50)
+                .onEnded { value in
+                    if value.translation.width > 0 {
+                        withAnimation {
+                            currentPage = max(0, currentPage - 1)
+                        }
+                    } else {
+                        withAnimation {
+                            currentPage = min(artworks.count - 1, currentPage + 1)
+                        }
+                    }
+                }
+        )
+#endif
+#if os(tvOS)
+        /// Siri remote left/right for page navigation
+        .onMoveCommand { direction in
+            switch direction {
+            case .left:
+                withAnimation {
+                    currentPage = max(0, currentPage - 1)
+                }
+            case .right:
+                withAnimation {
+                    currentPage = min(artworks.count - 1, currentPage + 1)
+                }
+            default:
+                break
+            }
+        }
+        /// Menu button dismisses the detail view
+        .onExitCommand {
+            dismiss()
+        }
+        /// Play/pause selects the current artwork
+        .onPlayPauseCommand {
+            selectCurrentArtwork()
+        }
+#endif
+        .onAppear {
+            #if os(macOS)
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                switch event.keyCode {
+                case 123:
+                    withAnimation {
+                        currentPage = max(0, currentPage - 1)
+                    }
+                    return nil
+                case 124:
+                    withAnimation {
+                        currentPage = min(artworks.count - 1, currentPage + 1)
+                    }
+                    return nil
+                case 53:
+                    dismiss()
+                    return nil
+                default:
+                    return event
+                }
+            }
+            #endif
+        }
+    }
+
+    /// Select the currently displayed artwork
+    private func selectCurrentArtwork() {
+        guard let currentArtwork = artworks[safe: currentPage],
+              let image = previewImages[currentArtwork.url] else { return }
+        onSelect(ArtworkSelectionData(
+            metadata: currentArtwork,
+            previewImage: image
+        ))
+        dismiss()
+    }
+
+    private var overlayControls: some View {
+        VStack {
+            HStack {
+                Button(action: { dismiss() }) {
+                    Image(systemName: "xmark")
+                        #if os(tvOS)
+                        .font(.title)
+                        .padding(12)
+                        #else
+                        .font(.title2)
+                        #endif
+                        .foregroundColor(.white)
+                }
+                Spacer()
+
+                Text("\(currentPage + 1) of \(artworks.count)")
+                    .foregroundColor(.white)
+                    #if os(tvOS)
+                    .font(.body)
+                    #else
+                    .font(.caption)
+                    #endif
+
+                Spacer()
+
+                #if os(tvOS)
+                /// Navigation hint for tvOS users
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.left.chevron.right")
+                    Text("Navigate")
+                }
+                .font(.caption)
+                .foregroundColor(.white.opacity(0.7))
+                #endif
+            }
+            .padding()
+            .background(LinearGradient(colors: [.black.opacity(0.7), .clear],
+                                     startPoint: .top,
+                                     endPoint: .bottom))
+
+            Spacer()
+
+            if let currentArtwork = artworks[safe: currentPage] {
+                VStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let description = currentArtwork.description {
+                            Text(description)
+                                #if os(tvOS)
+                                .font(.title3)
+                                #else
+                                .font(.headline)
+                                #endif
+                        }
+                        Text("\(currentArtwork.type.displayName) • \(currentArtwork.source)")
+                            .font(.subheadline)
+                        if let resolution = currentArtwork.resolution {
+                            Text(resolution)
+                                .font(.caption)
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal)
+
+                    if let image = previewImages[currentArtwork.url] {
+                        Button {
+                            onSelect(ArtworkSelectionData(
+                                metadata: currentArtwork,
+                                previewImage: image
+                            ))
+                            dismiss()
+                        } label: {
+                            Text("Select This Artwork")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .cornerRadius(10)
+                        }
+                        .padding(.horizontal)
+                        #if os(tvOS)
+                        .buttonStyle(.card)
+                        #endif
+                    }
+                }
+                #if os(tvOS)
+                .padding(.bottom, 60)
+                #else
+                .padding(.bottom, 40)
+                #endif
+                .padding(.top)
+                .background {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            LinearGradient(
+                                colors: [.clear, .black.opacity(0.3)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        }
+                        .shadow(color: .black.opacity(0.3), radius: 10, y: -5)
+                }
+            }
+        }
+    }
+
+    private func loadInitialImages() async {
+        let indicesToLoad = [
+            max(0, currentPage - 1),
+            currentPage,
+            min(artworks.count - 1, currentPage + 1)
+        ]
+
+        for index in indicesToLoad {
+            if let artwork = artworks[safe: index] {
+                await loadImage(for: artwork)
+            }
+        }
+    }
+
+    private func preloadAdjacentImages() {
+        let adjacentIndices = [
+            max(0, currentPage - 1),
+            min(artworks.count - 1, currentPage + 1)
+        ]
+
+        for index in adjacentIndices {
+            let artwork = artworks[index]
+            if previewImages[artwork.url] == nil {
+                Task {
+                    await loadImage(for: artwork)
+                }
+            }
+        }
+    }
+
+    private func loadImage(for artwork: ArtworkMetadata, retryCount: Int = 3) async {
+        guard previewImages[artwork.url] == nil else { return }
+
+        do {
+            if let cached = await imageCache.image(for: artwork.url) {
+                previewImages[artwork.url] = cached
+                return
+            }
+
+            let (data, _) = try await URLSession.shared.data(from: artwork.url)
+            /// Downsample at decode time — these are candidate covers shown in a
+            /// preview grid, and search results can be very large scans.
+            if let uiImage = ArtworkDownsampler.image(data: data, maxPixelSize: ArtworkDownsampleTarget.detail.maxPixelSize) {
+                let image = Image(uiImage: uiImage)
+                previewImages[artwork.url] = image
+                await imageCache.setImage(image, for: artwork.url)
+            }
+        } catch {
+            if retryCount > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await loadImage(for: artwork, retryCount: retryCount - 1)
+            } else {
+                print("Error loading image after retries: \(error)")
+            }
+        }
+    }
+}
+
+struct ZoomableImageView: View {
+    let artwork: ArtworkMetadata
+    let previewImage: Image?
+    let geometry: GeometryProxy
+    @Binding var isZoomed: Bool
+
+    @State private var scale = 1.0
+    @State private var lastScale = 1.0
+    @State private var offset = CGSize.zero
+    @State private var lastOffset = CGSize.zero
+    @State private var loadingError: Error?
+    @State private var isLoading = true
+
+    private var isImageZoomed: Bool {
+        scale > 1.0
+    }
+
+    var body: some View {
+        ZStack {
+            if let error = loadingError {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.largeTitle)
+                        .foregroundColor(.gray)
+                    Text(error.localizedDescription)
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.center)
+                }
+                .padding()
+            } else if let image = previewImage {
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .scaleEffect(scale)
+                    .offset(offset)
+#if !os(tvOS)
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { value in
+                                let delta = value / lastScale
+                                lastScale = value
+                                scale = min(max(scale * delta, 1), 4)
+                            }
+                            .onEnded { _ in
+                                lastScale = 1.0
+                                HapticManager.impact(style: .light)
+                            }
+                    )
+                    .simultaneousGesture(
+                        DragGesture()
+                            .onChanged { value in
+                                guard isImageZoomed else { return }
+                                offset = CGSize(
+                                    width: lastOffset.width + value.translation.width,
+                                    height: lastOffset.height + value.translation.height
+                                )
+                            }
+                            .onEnded { _ in
+                                lastOffset = offset
+                                HapticManager.impact(style: .light)
+                            }
+                    )
+                    .highPriorityGesture(
+                        TapGesture(count: 2).onEnded {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                if isImageZoomed {
+                                    scale = 1.0
+                                    offset = .zero
+                                    lastOffset = .zero
+                                } else {
+                                    scale = 2.0
+                                }
+                            }
+                            HapticManager.impact(style: .medium)
+                        }
+                    )
+#endif
+
+                if isImageZoomed {
+                    VStack {
+                        Text("\(Int(scale * 100))%")
+                            .font(.caption)
+                            .padding(4)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(4)
+
+                        Button {
+                            withAnimation(.spring()) {
+                                scale = 1.0
+                                offset = .zero
+                                lastOffset = .zero
+                            }
+                        } label: {
+                            Text("Reset Zoom")
+                                .font(.caption)
+                                .padding(4)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(4)
+                        }
+                    }
+                    .transition(.opacity)
+                    .padding()
+                }
+            } else {
+                ProgressView()
+            }
+        }
+        .frame(width: geometry.size.width, height: geometry.size.height)
+        .onChange(of: scale) { newScale in
+            isZoomed = newScale > 1.0
+        }
+        .animation(.interactiveSpring(), value: offset)
+        .animation(.spring(), value: scale)
+    }
+}
+
+extension Collection {
+    subscript(safe index: Index) -> Self.Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}

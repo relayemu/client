@@ -1,0 +1,1100 @@
+{
+  "schemaVersion": 1,
+  "$comment": "Canonical core/source/dependency manifest. Licence texts are in Vendor/LicenseEvidence and Resources/Licenses/texts; generated notices use Scripts/relay-licenses.py.",
+  "auditedOn": "2026-09-03",
+  "commercialUseValues": [
+    "permitted",
+    "prohibited",
+    "unresolved"
+  ],
+  "legalReviewStatusValues": [
+    "not-required",
+    "required",
+    "blocked"
+  ],
+  "relayStatusValues": [
+    "enabled",
+    "candidate",
+    "rejected"
+  ],
+  "cores": [
+    {
+      "id": "mgba",
+      "name": "mGBA",
+      "relayStatus": "enabled",
+      "upstream": "https://github.com/Provenance-Emu/mGBA-Core",
+      "revision": "2abe0f4993b65030e33e0a3b5b6ca1c1e9247f01",
+      "upstreamBase": "https://github.com/mgba-emu/mgba (fork, locally modified; not byte-identical to any 0.10.x release tag)",
+      "version": "0.10.3+provenance",
+      "stateCompatibilityVersion": "mgba-0.10.3-provenance-2abe0f49",
+      "license": "MPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "file-level",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/mgba-emu__mgba__LICENSE",
+      "systems": [
+        "gb",
+        "gbc",
+        "gba"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "rewind",
+        "cheats",
+        "fastForward",
+        "rumble"
+      ],
+      "build": {
+        "mechanism": "vendored-subtree",
+        "path": "Vendor/Provenance/Cores/mGBA",
+        "product": "PVCoremGBA",
+        "adapter": "Packages/RelayEmulation/Sources/RelayProvenanceAdapter",
+        "baselineCommit": "d2cf43558f5845f1135a93f3d5cd604de3adcf11"
+      },
+      "copyright": "© 2013–2024 Jeffrey Pfau and mGBA contributors; Provenance fork © Provenance Emu contributors",
+      "licenseText": "Resources/Licenses/texts/mgba.txt",
+      "modificationsNote": "Relay adds Game Boy/Game Boy Color to the vendored fork's build, chooses the core by system, reports the picture's own ratio and exposes in-memory state and battery bytes; every change is in the shipped source (Vendor/Provenance/Cores/mGBA) and in Scripts/relay-core-source-bundle.sh's diff.",
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "MPL-2.0 §3.3 permits distribution under a Secondary License (GPL); Relay's client is GPL-3.0-or-later"
+    },
+    {
+      "id": "ares",
+      "name": "ares",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/ares-emulator/ares",
+      "revision": "7b51c8ab719e403a150aa700e0933d9e93a06851",
+      "version": "v148",
+      "stateCompatibilityVersion": "unknown",
+      "license": "ISC",
+      "commercialUse": "permitted",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/ares-emulator__ares__LICENSE",
+      "systems": [
+        "nes",
+        "snes",
+        "n64",
+        "md",
+        "sms",
+        "gg",
+        "pce",
+        "ws",
+        "wsc",
+        "ngp",
+        "ngpc",
+        "gb",
+        "gbc",
+        "gba",
+        "ps1"
+      ],
+      "applePlatforms": [
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "varies by system"
+      ],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "ISC and permissive third-party components"
+    },
+    {
+      "id": "sameboy",
+      "name": "SameBoy",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/LIJI32/SameBoy",
+      "revision": "213a12ce93d66b105a113debd9396306066a7cfc",
+      "version": "v1.0.3",
+      "stateCompatibilityVersion": "unknown",
+      "license": "MIT (Expat)",
+      "commercialUse": "permitted",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/LIJI32__SameBoy__LICENSE",
+      "systems": [
+        "gb",
+        "gbc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "optional boot ROM (SameBoy ships its own free boot ROMs)"
+      ],
+      "capabilities": [
+        "saveStates",
+        "rewind"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "Expat (Core/ only; iOS/ directory carries a marketplace clause and is excluded)"
+    },
+    {
+      "id": "nestopia-ue",
+      "name": "Nestopia UE",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/0ldsk00l/nestopia",
+      "revision": "a0079a045b6ad87410ed7c4192977314bb86e222",
+      "version": "1.53.2",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/0ldsk00l__nestopia__COPYING",
+      "systems": [
+        "nes"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "source headers: 'either version 2 of the License, or (at your option) any later version' (source/core/NstCore.hpp)"
+    },
+    {
+      "id": "fceux",
+      "name": "FCEUX",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/TASEmulators/fceux",
+      "revision": "a62b868e9247c4aafd66f597cdfa8d2609704087",
+      "version": "v2.6.6",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/TASEmulators__fceux__COPYING",
+      "systems": [
+        "nes"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "COPYING is GPL-2.0 text; source headers not yet checked for 'or later'"
+    },
+    {
+      "id": "mesen2",
+      "name": "Mesen 2",
+      "relayStatus": "enabled",
+      "upstream": "https://github.com/SourMesen/Mesen2",
+      "revision": "b9fa69ddc6d0a331fb103fdb5eef6904305703c2",
+      "version": "2.1.1",
+      "license": "GPL-3.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/SourMesen__Mesen2__LICENSE",
+      "systems": [
+        "nes",
+        "snes",
+        "sms",
+        "gg",
+        "pce",
+        "ws",
+        "wsc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "rewind",
+        "fastForward"
+      ],
+      "build": {
+        "mechanism": "vendored-archive",
+        "path": "Vendor/Mesen2",
+        "product": "MesenRelay",
+        "adapter": "Packages/RelayEmulation/Sources/RelayMesenAdapter",
+        "archiveSHA256": "5e6a54951b5715100665fdf127d9339aa8600c97fb4d7e9c9618c7f75ea479e0"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0 (LICENSE file; README 'GPL V3'); bundled modules audited 2026-09-03: HQX LGPL-2.1+, Scale2x GPL-2.0+, xBRZ GPL-3.0, 2xSaI/SuperEagle GPL-3.0+ (RetroArch), kissfft BSD-3, miniz public domain, spng BSD-2, magic_enum MIT, md5/sha1 public domain, Lua+LuaSocket MIT, 7-Zip C SDK public domain; firmware external except the 64-byte SPC700 IPL ROM embedded in Core/SNES/Spc.cpp as in every SNES emulator",
+      "stateCompatibilityVersion": "mesen2-2.1.1-b9fa69dd-state4",
+      "copyright": "Copyright (C) 2014-2025 Sour",
+      "licenseText": "Resources/Licenses/texts/mesen2.txt",
+      "modificationsNote": "No upstream file is modified. Relay adds Vendor/Mesen2/Package.swift (SwiftPM manifest compiling Core/, Utilities/, Lua/, SevenZip/ as upstream's makefile does) and Vendor/Mesen2/RelayBridge/ (a C API over the C++ Emulator, GPL-3.0-or-later)."
+    },
+    {
+      "id": "quicknes",
+      "name": "QuickNES",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/QuickNES_Core",
+      "revision": "26bb785c9deddb66a17717b21bb4e328f03ade32",
+      "version": "(no release; master)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__QuickNES_Core__LICENSE",
+      "systems": [
+        "nes"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "LICENSE is GPL-2.0 text; headers not checked (often described as LGPL-2.1)"
+    },
+    {
+      "id": "bsnes",
+      "name": "bsnes",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/bsnes-emu/bsnes",
+      "revision": "7d5aa1e656b9171524d01b1b22917197d8121cb4",
+      "version": "v115",
+      "license": "GPL-3.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/bsnes-emu__bsnes__LICENSE.txt",
+      "systems": [
+        "snes"
+      ],
+      "applePlatforms": [
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0; nall/libco/ruby/hiro ISC"
+    },
+    {
+      "id": "snes9x",
+      "name": "Snes9x",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/snes9xgit/snes9x",
+      "revision": "a0420aef6a5df627c1ddd00495f3eb32b6ef8aa3",
+      "version": "1.63",
+      "license": "Snes9x non-commercial",
+      "commercialUse": "prohibited",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "blocked",
+      "licenceEvidence": "Vendor/LicenseEvidence/snes9xgit__snes9x__LICENSE",
+      "systems": [
+        "snes"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "prohibited"
+      },
+      "clientCompatibility": "prohibited",
+      "clientCompatibilityNote": "non-commercial"
+    },
+    {
+      "id": "genesis-plus-gx",
+      "name": "Genesis Plus GX",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/ekeeke/Genesis-Plus-GX",
+      "revision": "27426f00aa68f9f358c86919e8a40985326fa05b",
+      "version": "(no release; master)",
+      "license": "Genesis Plus GX non-commercial",
+      "commercialUse": "prohibited",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "blocked",
+      "licenceEvidence": "Vendor/LicenseEvidence/ekeeke__Genesis-Plus-GX__LICENSE.txt",
+      "systems": [
+        "md",
+        "sms",
+        "gg"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "prohibited"
+      },
+      "clientCompatibility": "prohibited",
+      "clientCompatibilityNote": "non-commercial"
+    },
+    {
+      "id": "picodrive",
+      "name": "PicoDrive",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/irixxxx/picodrive",
+      "revision": "ddba40e28304725dc6f3648e62dd024790f56713",
+      "version": "v2.05",
+      "license": "PicoDrive non-commercial",
+      "commercialUse": "prohibited",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "blocked",
+      "licenceEvidence": "Vendor/LicenseEvidence/irixxxx__picodrive__COPYING",
+      "systems": [
+        "md",
+        "sms",
+        "gg",
+        "pce",
+        "pcecd"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "prohibited"
+      },
+      "clientCompatibility": "prohibited",
+      "clientCompatibilityNote": "non-commercial"
+    },
+    {
+      "id": "blastem",
+      "name": "BlastEm",
+      "relayStatus": "candidate",
+      "upstream": "https://www.retrodev.com/repos/blastem",
+      "revision": "libretro mirror b4d75247ebad8852fd9bc385b423df704c6c5af5",
+      "version": "(no release)",
+      "license": "GPL-3.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__blastem__COPYING",
+      "systems": [
+        "md",
+        "sms",
+        "gg"
+      ],
+      "applePlatforms": [
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0; separately blocked by its native code generator (JIT)"
+    },
+    {
+      "id": "gearsystem",
+      "name": "Gearsystem",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/drhelius/Gearsystem",
+      "revision": "f58ed102b6abd10a522ef17d5716c890083115b9",
+      "version": "3.9.18",
+      "license": "GPL-3.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/drhelius__Gearsystem__LICENSE",
+      "systems": [
+        "sms",
+        "gg"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0"
+    },
+    {
+      "id": "mupen64plus",
+      "name": "Mupen64Plus",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/mupen64plus/mupen64plus-core",
+      "revision": "6dca4c15370ac3e2171ce7b31426695f8f39b460",
+      "version": "2.6.0",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/mupen64plus__mupen64plus-core__LICENSES",
+      "systems": [
+        "n64"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": true,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "analogInput"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "source headers 'version 2 ... or (at your option) any later version' (src/main/main.c); separately blocked by JIT"
+    },
+    {
+      "id": "melonds",
+      "name": "melonDS",
+      "relayStatus": "enabled",
+      "upstream": "https://github.com/melonDS-emu/melonDS",
+      "revision": "906e9ebb27da8c6a715cd7abab4abfe8a8d29427",
+      "version": "1.1",
+      "license": "GPL-3.0-or-later",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/melonDS-emu__melonDS__LICENSE",
+      "systems": [
+        "nds"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "rewind",
+        "fastForward",
+        "touchInput",
+        "multipleScreens"
+      ],
+      "build": {
+        "mechanism": "vendored-archive",
+        "path": "Vendor/melonDS",
+        "product": "MelonRelay",
+        "adapter": "Packages/RelayEmulation/Sources/RelayMelonAdapter",
+        "archiveSHA256": "5edcd49fe593df24e47f29eb27636c8c4d3698dc21ac224697708a8fcd9ea262"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "source headers 'version 3 of the License, or (at your option) any later version'; bundled modules audited 2026-09-03: dolphin emitter GPL-2.0+, teakra MIT, fatfs BSD-style, xxhash BSD-2, tiny-AES-c Unlicense, blip-buf LGPL-2.1+, sha1 public domain, FreeBIOS BSD (Gilead Kutnick 2013); libslirp/pcap optional and excluded",
+      "stateCompatibilityVersion": "melonds-1.1-906e9ebb-state1",
+      "copyright": "Copyright 2016-2026 melonDS team",
+      "licenseText": "Resources/Licenses/texts/melonds.txt",
+      "modificationsNote": "No upstream file is modified. Relay adds Vendor/melonDS/Package.swift (SwiftPM manifest over the core sources of src/CMakeLists.txt with ENABLE_JIT, ENABLE_OGLRENDERER and ENABLE_GDBSTUB off) and Vendor/melonDS/RelayBridge/ (the Platform implementation and a C API, GPL-3.0-or-later)."
+    },
+    {
+      "id": "desmume",
+      "name": "DeSmuME",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/TASEmulators/desmume",
+      "revision": "b3915949700be824253a35affa7f7b8248e84e46",
+      "version": "release_0_9_13",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/TASEmulators__desmume__license.txt",
+      "systems": [
+        "nds"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "multipleScreens",
+        "touchInput"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "source headers 'either version 2 of the License, or (at your option) any later version' (desmume/src/NDSSystem.cpp)"
+    },
+    {
+      "id": "duckstation",
+      "name": "DuckStation",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/stenzek/duckstation",
+      "revision": "ec81e45b2923c0b16b299822cb21f55f63128422",
+      "version": "latest",
+      "license": "CC-BY-NC-ND-4.0",
+      "commercialUse": "prohibited",
+      "copyleft": "none",
+      "sourceOfferRequired": false,
+      "attributionRequired": true,
+      "legalReviewStatus": "blocked",
+      "licenceEvidence": "Vendor/LicenseEvidence/stenzek__duckstation__LICENSE",
+      "systems": [
+        "ps1"
+      ],
+      "applePlatforms": [
+        "ios",
+        "macos"
+      ],
+      "requiresJIT": true,
+      "firmware": [
+        "PlayStation BIOS (proprietary, never bundled)"
+      ],
+      "capabilities": [
+        "saveStates",
+        "analogInput"
+      ],
+      "build": {
+        "mechanism": "prohibited"
+      },
+      "clientCompatibility": "prohibited",
+      "clientCompatibilityNote": "CC BY-NC-ND 4.0"
+    },
+    {
+      "id": "swanstation",
+      "name": "SwanStation",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/swanstation",
+      "revision": "7f69c199ed88d5723f71dd3a6e9c1b7a45b535a6",
+      "version": "(no release)",
+      "license": "GPL-3.0-only",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__swanstation__LICENSE",
+      "systems": [
+        "ps1"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "PlayStation BIOS (proprietary, never bundled)"
+      ],
+      "capabilities": [
+        "saveStates",
+        "analogInput"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0; native arm64 interpreter build succeeded with WITH_RECOMPILER=0 and WITH_MMAP_FASTMEM=0."
+    },
+    {
+      "id": "pcsx-rearmed",
+      "name": "PCSX-ReARMed",
+      "relayStatus": "enabled",
+      "upstream": "https://github.com/notaz/pcsx_rearmed",
+      "revision": "da2cb8ecd17fd0932ab6d94774c0522beebce6e3",
+      "version": "r26-da2cb8e",
+      "license": "GPL-2.0-or-later",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/notaz__pcsx_rearmed__COPYING",
+      "systems": [
+        "ps1"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "PlayStation SCPH-5500/5501/5502 BIOS (recommended, user-supplied and never bundled); GPL HLE fallback with limited compatibility"
+      ],
+      "capabilities": [
+        "saveStates",
+        "fastForward",
+        "analogInput",
+        "diskSwap"
+      ],
+      "build": {
+        "mechanism": "vendored-archive",
+        "path": "Vendor/PCSXReARMed",
+        "product": "PCSXRelay",
+        "adapter": "Packages/RelayEmulation/Sources/RelayPCSXAdapter",
+        "archiveSHA256": "ff191a349aa88b7156f2c40ae32b7144884eec921542f07508d88715105d175e"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "Core interpreter, HLE, SPU and NEON GPU headers explicitly allow GPL version 2 or later; gpulib offers GPL-2.0-or-later or LGPL-2.1-or-later. Compiled decoder/helper dependencies are permissive.",
+      "stateCompatibilityVersion": "pcsx-da2cb8e-relay1",
+      "copyright": "PCSX Team; Gražvydas \"notaz\" Ignotas; Gilead \"Exophase\" Kutnick; Pete Bernert; PCSX-ReARMed contributors",
+      "licenseText": "Resources/Licenses/texts/pcsx-rearmed.txt",
+      "modificationsNote": "Pinned upstream archive is unchanged. Relay adds Package.swift and RelayBridge for native Apple integration, validated CHD decoding, cards, portable BIOS-free states and controller/disc operations. DYNAREC is disabled on every platform; no executable-memory allocation or ptrace workaround is compiled."
+    },
+    {
+      "id": "beetle-psx",
+      "name": "Beetle PSX (Mednafen)",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/beetle-psx-libretro",
+      "revision": "b4bca9f868176b157f021add3a96991aca12cb4d",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__beetle-psx-libretro__COPYING",
+      "systems": [
+        "ps1"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "PlayStation BIOS (proprietary, never bundled)"
+      ],
+      "capabilities": [
+        "saveStates",
+        "analogInput"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "Mednafen documents GPL-2.0-or-later; libretro fork headers not checked"
+    },
+    {
+      "id": "ppsspp",
+      "name": "PPSSPP",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/hrydgard/ppsspp",
+      "revision": "bdaf6dcaf45107e1236f07a7d9a8c8e784ce93af",
+      "version": "v1.20.4",
+      "license": "GPL-2.0-or-later",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/hrydgard__ppsspp__LICENSE.TXT",
+      "systems": [
+        "psp"
+      ],
+      "applePlatforms": [
+        "ios",
+        "macos"
+      ],
+      "requiresJIT": true,
+      "firmware": [],
+      "capabilities": [
+        "saveStates",
+        "analogInput"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-2.0-or-later (LICENSE.TXT); separately blocked by JIT"
+    },
+    {
+      "id": "mednafen",
+      "name": "Mednafen",
+      "relayStatus": "rejected",
+      "upstream": "https://mednafen.github.io/",
+      "revision": "see beetle-* libretro forks for pinned mirrors",
+      "version": "1.32.x",
+      "license": "GPL-2.0-or-later",
+      "commercialUse": "prohibited",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "blocked",
+      "licenceEvidence": "https://mednafen.github.io/documentation/#Section_licenses",
+      "systems": [
+        "pce",
+        "pcecd",
+        "ws",
+        "wsc",
+        "ngp",
+        "ngpc",
+        "nes",
+        "snes",
+        "md",
+        "sms",
+        "gg",
+        "ps1"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "per system; PC Engine CD and PlayStation need proprietary BIOS"
+      ],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "prohibited"
+      },
+      "clientCompatibility": "prohibited",
+      "clientCompatibilityNote": "Mega Drive module carries Genesis Plus GX non-commercial code; other modules GPL-2.0-or-later but the tree is mixed until audited per module"
+    },
+    {
+      "id": "beetle-pce",
+      "name": "Beetle PCE (Mednafen)",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/beetle-pce-libretro",
+      "revision": "ae99235c2139c176c1a8d0fde2957bf701d3cab0",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__beetle-pce-libretro__COPYING",
+      "systems": [
+        "pce",
+        "pcecd"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "PC Engine CD system card (proprietary, never bundled)"
+      ],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "Mednafen PCE module GPL-2.0-or-later per Mednafen; libretro fork headers not checked"
+    },
+    {
+      "id": "beetle-wswan",
+      "name": "Beetle WonderSwan (Mednafen)",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/beetle-wswan-libretro",
+      "revision": "4b01295838ea89e3f1355bbe4cb5cf98aa6108cd",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__beetle-wswan-libretro__COPYING",
+      "systems": [
+        "ws",
+        "wsc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "Cygne GPL-2.0 per Mednafen; 'or later' not verified"
+    },
+    {
+      "id": "beetle-ngp",
+      "name": "Beetle NeoPop (Mednafen)",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/beetle-ngp-libretro",
+      "revision": "a50d5ac288a81f2104ddf43195a4efdd15c72227",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__beetle-ngp-libretro__COPYING",
+      "systems": [
+        "ngp",
+        "ngpc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "NeoPop GPL-2.0 per Mednafen; 'or later' not verified"
+    },
+    {
+      "id": "race",
+      "name": "RACE",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/RACE",
+      "revision": "c7810dd7f172827bfa2004813bc000b13786636b",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__RACE__license.txt",
+      "systems": [
+        "ngp",
+        "ngpc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "license.txt is GPL-2.0 text; headers not checked"
+    },
+    {
+      "id": "gambatte",
+      "name": "Gambatte",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/libretro/gambatte-libretro",
+      "revision": "d9d6cd06382d1ced30de34d56d3609452323dab1",
+      "version": "(no release)",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/libretro__gambatte-libretro__COPYING",
+      "systems": [
+        "gb",
+        "gbc"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "COPYING is GPL-2.0 text; upstream is understood to be GPL-2.0-only; headers not checked"
+    },
+    {
+      "id": "nanoboyadvance",
+      "name": "NanoBoyAdvance",
+      "relayStatus": "candidate",
+      "upstream": "https://github.com/nba-emu/NanoBoyAdvance",
+      "revision": "55b5cf0ae3d929582ac5bfd486558173502b8354",
+      "version": "v1.8.3",
+      "license": "GPL-3.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "not-required",
+      "licenceEvidence": "Vendor/LicenseEvidence/nba-emu__NanoBoyAdvance__LICENSE",
+      "systems": [
+        "gba"
+      ],
+      "applePlatforms": [
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [
+        "GBA BIOS (optional)"
+      ],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "compatible",
+      "clientCompatibilityNote": "GPL-3.0"
+    },
+    {
+      "id": "vbam",
+      "name": "VisualBoyAdvance-M",
+      "relayStatus": "rejected",
+      "upstream": "https://github.com/visualboyadvance-m/visualboyadvance-m",
+      "revision": "e09d13fe35e188da5fa3d961c6d3eaffb521d32b",
+      "version": "v2.2.3",
+      "license": "GPL-2.0",
+      "commercialUse": "permitted",
+      "copyleft": "strong",
+      "sourceOfferRequired": true,
+      "attributionRequired": true,
+      "legalReviewStatus": "required",
+      "licenceEvidence": "Vendor/LicenseEvidence/visualboyadvance-m__visualboyadvance-m__LICENSE",
+      "systems": [
+        "gb",
+        "gbc",
+        "gba"
+      ],
+      "applePlatforms": [
+        "ios",
+        "tvos",
+        "macos"
+      ],
+      "requiresJIT": false,
+      "firmware": [],
+      "capabilities": [
+        "saveStates"
+      ],
+      "build": {
+        "mechanism": "not-integrated"
+      },
+      "clientCompatibility": "unverified",
+      "clientCompatibilityNote": "LICENSE is GPL-2.0 text; headers not checked"
+    }
+  ],
+  "clientLicense": "GPL-3.0-or-later",
+  "clientCompatibilityValues": [
+    "compatible",
+    "incompatible",
+    "unverified",
+    "prohibited"
+  ]
+}

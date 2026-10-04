@@ -1,0 +1,196 @@
+//
+//  PVSNESEmulatorCore.swift
+//  PVSNES
+//
+
+import Foundation
+import PVAudio
+import PVCoreBridge
+import PVCoreObjCBridge
+import PVEmulatorCore
+import PVLogging
+import PVRcheevosBridge
+import PVSupport
+#if canImport(GameController)
+import GameController
+#endif
+#if canImport(OpenGLES)
+import OpenGLES
+import OpenGLES.ES3
+#endif
+
+@objc
+@objcMembers
+open class PVSNES9xEmulatorCore: PVEmulatorCore, @unchecked Sendable {
+
+    // MARK: Video
+
+    // MARK: Lifecycle
+
+    public required init() {
+        super.init()
+        self.bridge = (PVSNESEmulatorCoreBridge() as! any ObjCBridgedCoreBridge)
+    }
+
+    // [CHEEVOS-DIAG] Diagnostic-only frame counter so we can see when the core is
+    // running frames but `achievementsActive` is false (i.e. the rc_client never
+    // finished loading). Logged every 600 frames (~10 s at 60 fps).
+    private static let diagLogStride: UInt64 = 600
+    nonisolated(unsafe) private static var diagFrameCount: UInt64 = 0
+    nonisolated(unsafe) private static var diagInactiveFrameCount: UInt64 = 0
+
+    public override func executeFrame() {
+        super.executeFrame()
+        Self.diagFrameCount &+= 1
+        if achievementsActive {
+            tickAchievements()
+        } else {
+            Self.diagInactiveFrameCount &+= 1
+            if Self.diagInactiveFrameCount % Self.diagLogStride == 0 {
+                ILOG("[CHEEVOS-DIAG] SNES9x executeFrame achievementsActive=false totalFrames=\(Self.diagFrameCount) inactiveFrames=\(Self.diagInactiveFrameCount)")
+            }
+        }
+    }
+}
+
+extension PVSNES9xEmulatorCore: PVSNESSystemResponderClient {
+    public func didPush(_ button: PVCoreBridge.PVSNESButton, forPlayer player: Int) {
+        (bridge as! PVSNESSystemResponderClient).didPush(button, forPlayer: player)
+    }
+    
+    public func didRelease(_ button: PVCoreBridge.PVSNESButton, forPlayer player: Int) {
+        (bridge as! PVSNESSystemResponderClient).didRelease(button, forPlayer: player)
+    }
+}
+
+extension PVSNES9xEmulatorCore: ArchiveSupport {
+    public var supportedArchiveFormats: ArchiveSupportOptions {
+        return [.gzip, .zip]
+    }
+}
+
+
+// MARK: - MouseResponder
+
+extension PVSNES9xEmulatorCore: MouseResponder {
+
+    public var gameSupportsMouse: Bool {
+        return (bridge as! PVSNESEmulatorCoreBridge).isSNESMouseGame
+    }
+
+    public var requiresMouse: Bool { false }
+
+#if canImport(GameController)
+    @available(iOS 14.0, tvOS 14.0, *)
+    public func didScroll(_ cursor: GCDeviceCursor) {}
+
+    public var mouseMovedHandler: GCMouseMoved? { nil }
+#endif
+
+    public func mouseMoved(atPoint point: CGPoint) {
+        let snesBridge = bridge as! PVSNESEmulatorCoreBridge
+#if os(tvOS)
+        // On tvOS the Siri Remote pan handler delivers per-event *relative* deltas in
+        // view-point units — not normalised [0,1] absolute positions.  Pass them through
+        // the dedicated delta path so we don't double-differentiate or misscale.
+        snesBridge.snesMouseMoved(byDelta: point)
+#else
+        snesBridge.snesMouseMoved(to: point)
+#endif
+    }
+
+    public func leftMouseDown(atPoint point: CGPoint) {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLeftMouseDown()
+    }
+
+    public func leftMouseUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLeftMouseUp()
+    }
+
+    public func rightMouseDown(atPoint point: CGPoint) {
+        (bridge as! PVSNESEmulatorCoreBridge).snesRightMouseDown()
+    }
+
+    public func rightMouseUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesRightMouseUp()
+    }
+}
+
+// MARK: - LightGunResponder
+
+extension PVSNES9xEmulatorCore: LightGunResponder {
+
+    public var gameSupportsLightGun: Bool {
+        return (bridge as! PVSNESEmulatorCoreBridge).isSNESLightGunGame
+    }
+
+    public var requiresLightGun: Bool { false }
+
+    public func lightGunMovedToPoint(_ point: CGPoint, isOffscreen: Bool) {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunMoved(
+            to: point,
+            isOffscreen: isOffscreen
+        )
+    }
+
+    public func lightGunTriggerDown() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunTriggerDown()
+    }
+
+    public func lightGunTriggerUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunTriggerUp()
+    }
+
+    public func lightGunAuxADown() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunAuxADown()
+    }
+
+    public func lightGunAuxAUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunAuxAUp()
+    }
+
+    public func lightGunAuxBDown() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunAuxBDown()
+    }
+
+    public func lightGunAuxBUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunAuxBUp()
+    }
+
+    public func lightGunStartDown() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunStartDown()
+    }
+
+    public func lightGunStartUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunStartUp()
+    }
+
+    public func lightGunReloadDown() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunReloadDown()
+    }
+
+    public func lightGunReloadUp() {
+        (bridge as! PVSNESEmulatorCoreBridge).snesLightGunReloadUp()
+    }
+}
+
+extension PVSNESEmulatorCoreBridge: GameWithCheat {
+    public func setCheat(code: String, type: String, codeType: String, cheatIndex: UInt8, enabled: Bool) -> Bool {
+        do {
+            try self.setCheat(code, setType: type, setCodeType: codeType, setIndex: cheatIndex, setEnabled: enabled)
+            return true
+        } catch let error {
+            NSLog("Error setCheat \(error)")
+            return false
+        }
+    }
+
+    public var cheatCodeTypes: [String] {
+        return ["Game Genie", "Pro Action Replay", "Gold Finger", "Raw Code"]
+    }
+
+    public var supportsCheatCode: Bool
+    {
+        return true
+    }
+}

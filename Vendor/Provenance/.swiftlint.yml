@@ -1,0 +1,156 @@
+disabled_rules:
+  - block_based_kvo
+  - colon
+  - control_statement
+  - cyclomatic_complexity
+  - discarded_notification_center_observer
+  - file_length
+  - function_parameter_count
+  - generic_type_name
+  - identifier_name
+  - multiple_closures_with_trailing_closure
+  - nesting
+  - switch_case_alignment
+  - todo
+  - type_name
+  - unused_closure_parameter
+
+# Threshold-configured rules — kept enabled at high tolerances (not in disabled_rules)
+line_length: 200
+type_body_length:
+  - 300 # warning
+  - 600 # error
+function_body_length:
+  - 200 # warning
+  - 500 # error
+large_tuple:
+  - 4 # warning
+  - 6 # error
+
+opt_in_rules:
+  - closure_spacing
+  - contains_over_filter_count
+  - contains_over_filter_is_empty
+  - empty_count
+  - empty_string
+  - first_where
+  - force_unwrapping
+  - last_where
+  - toggle_bool
+
+# Owned source — only first-party code, no submodules or vendored deps
+included:
+  # App targets
+  - Provenance
+  - "Provenance Tests"
+  - "Provenance Mini Watch App"
+  - "Provenance Mini Watch AppTests"
+  - "Provenance Mini Watch AppUITests"
+  - ProvenanceTV
+  # PV* Swift Package modules
+  - PVAudio
+  - PVCheevos
+  - PVCoreAudio
+  - PVCoreBridge
+  - PVCoreBridgeRetro
+  - PVCoreLoader
+  - PVCoreObjCBridge
+  - PVEmulatorCore
+  - PVFeatureFlags
+  - PVHashing
+  - PVHelp
+  - PVJIT
+  - PVLibrary
+  - PVLogging
+  - PVLookup
+  - PVMacros
+  - PVObjCUtils
+  - PVPatching
+  - PVPatreon
+  - PVPlists
+  - PVPrimitives
+  - PVSettings
+  - PVShaders
+  - PVSupport
+  - PVThemes
+  - PVUI
+  - PVUSBManager
+  - PVWebServer
+  # Companion app
+  - ProvenanceCompanion
+  # Extensions (all first-party)
+  - Extensions/ActivityMonitorExtension
+  - Extensions/ActivityReportExtension
+  - Extensions/BackgroundDownloadExtension
+  - Extensions/macOS
+  - "Extensions/Provenance Stickers"
+  - Extensions/QuickLookPreview
+  - "Extensions/ROM File Provider"
+  - Extensions/Spotlight
+  - Extensions/SpotlightImportExtension
+  - Extensions/ThumbnailExtension
+  - Extensions/TopShelf
+  - Extensions/TopShelfv2
+
+excluded:
+  - Carthage
+  - PVSupport/Carthage
+  - PVLibrary/Carthage
+  - Pods
+  - Cores        # upstream emulator submodules — not our code
+  - CoresRetro   # RetroArch submodule
+  - Dependencies # vendored third-party (ZipArchive, cubeb, FFMpeg, etc.)
+  - Scripts
+  - fastlane
+  - build
+  - archive
+  - .build
+  - .swiftpm
+
+analyzer_rules: # Rules run by `swiftlint analyze`
+  - explicit_self
+
+# Severity overrides
+force_cast: warning
+force_try: warning
+empty_count: warning
+empty_string: warning
+
+reporter: "xcode" # override per-invocation with --reporter github-actions-logging in CI
+
+custom_rules:
+  placeholders_in_comments:
+    included: ".*\\.swift"
+    name: "No Placeholders in Comments"
+    regex: "<#([^#]+)#>"
+    match_kinds:
+      - comment
+      - doccomment
+    message: "Placeholder left in comment."
+    severity: warning
+  tiles_deprecated:
+    included: ".*\\.swift"
+    name: "Tiles are deprecated in favor of Frame"
+    regex: "\\b[Tt]iles?\\b"
+    message: "Tiles are deprecated in favor of Frame"
+    severity: warning
+  unlocalized_text_init:
+    # Warn when Text() is called with a String variable/expression rather than a literal
+    # LocalizedStringKey. `Text(someVar)` bypasses localization; prefer
+    # `Text(verbatim: someVar)` (explicit non-localized) or change the property to
+    # return `LocalizedStringKey` / use `String(localized:)` at the call site.
+    #
+    # Pattern explanation:
+    #   Text\(           — SwiftUI Text initialiser
+    #   (?!\"            — NOT followed by a string literal (those are LocalizedStringKey)
+    #   (?!verbatim:     — NOT the explicit verbatim: label (intentionally non-localized)
+    #   (?!String\(      — NOT String(...) which may itself contain String(localized:)
+    #   (?!Image         — NOT Image(...) mistakenly flagged
+    #
+    # Scope: ProvenanceCompanion only (companion app owns its own localization).
+    included: ".*/ProvenanceCompanion/.*\\.swift"
+    excluded: ".*/Preview Content/.*"
+    name: "Potentially Unlocalized Text"
+    regex: "Text\\((?!\"|verbatim:|String\\(|Image)"
+    message: "Text() called with a non-literal argument — use Text(\"key\") (LocalizedStringKey) or Text(verbatim:) if intentionally unlocalized."
+    severity: warning

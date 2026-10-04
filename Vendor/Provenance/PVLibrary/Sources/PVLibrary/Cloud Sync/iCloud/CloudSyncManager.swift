@@ -1,0 +1,2365 @@
+//
+//  CloudSyncManager.swift
+//  PVLibrary
+//
+//  Created by Joseph Mattiello on 4/22/25.
+//  Copyright 2025 Provenance Emu. All rights reserved.
+//
+
+import Foundation
+import os
+import Combine
+import PVLogging
+import PVPrimitives
+import PVFileSystem
+import PVRealm
+import RealmSwift
+import Defaults
+import PVSettings
+import CloudKit
+import RxSwift
+import RxRealm
+
+/// Represents the current state of the Cloud Sync process.
+extension CloudSyncManager {
+    public enum SyncStatus: Equatable {
+        /// Idle - no sync in progress
+        case idle
+
+        /// Syncing - general sync in progress (use more specific states if possible)
+        case syncing
+
+        /// Initial sync - first-time sync or checking all records
+        case initialSync
+
+        /// Uploading - upload in progress
+        case uploading
+
+        /// Downloading - download in progress
+        case downloading
+
+        /// Initializing - sync providers are being set up
+        case initializing
+
+        /// Error - sync encountered an error
+        case error(Error)
+
+        /// Disabled - sync is turned off in settings
+        case disabled
+
+        public static func == (lhs: SyncStatus, rhs: SyncStatus) -> Bool {
+            switch (lhs, rhs) {
+            case (.idle, .idle),
+                (.syncing, .syncing),
+                (.initialSync, .initialSync),
+                (.uploading, .uploading),
+                (.downloading, .downloading),
+                (.initializing, .initializing),
+                (.disabled, .disabled):
+                return true
+            case let (.error(lhsError), .error(rhsError)):
+                // Optionally compare errors more specifically if needed
+                return (lhsError as NSError).domain == (rhsError as NSError).domain &&
+                (lhsError as NSError).code == (rhsError as NSError).code
+            default:
+                return false
+            }
+        }
+    }
+}
+
+/// Manager for cloud sync operations
+/// Handles initialization and coordination of sync providers
+public class CloudSyncManager {
+    // MARK: - Properties
+
+    /// Shared instance. Disabled (no-op) when CloudKit entitlement is absent (e.g. sideloaded builds).
+    public static let shared: CloudSyncManager = {
+        guard let container = iCloudConstants.container else {
+            WLOG("[CloudSyncManager] CloudKit entitlement not present — sync disabled")
+            return CloudSyncManager()
+        }
+        return CloudSyncManager(container: container)
+    }()
+
+    /// ROM syncer
+    public var romsSyncer: RomsSyncing?
+
+    /// Save states syncer
+    public var saveStatesSyncer: SaveStatesSyncing?
+
+    /// BIOS syncer
+    public var biosSyncer: BIOSSyncing?
+
+    /// Non-database syncer for files like BIOS, Battery States, Screenshots, and DeltaSkins
+    public var nonDatabaseSyncer: CloudKitNonDatabaseSyncer?
+
+    /// Error handler
+    public let errorHandler = CloudSyncErrorHandler()
+
+    /// Disposable for subscriptions
+    private var disposeBag = DisposeBag()
+    private var cancellables = Set<AnyCancellable>()
+    private var saveStateToken: NotificationToken?
+    private let saveStateObserverQueue = DispatchQueue(label: "org.provenance.cloudsync.savestates.observer", qos: .utility)
+
+    /// Publisher for sync status changes
+    private let syncStatusSubject = PassthroughSubject<SyncStatus, Never>()
+
+    /// Publisher for sync status
+    public var syncStatusPublisher: AnyPublisher<SyncStatus, Never> {
+        syncStatusSubject.eraseToAnyPublisher()
+    }
+
+    /// Current sync status
+    @Published public private(set) var syncStatus: SyncStatus = .idle
+
+    /// Current sync info - used to provide additional context about the current operation
+    @Published public var currentSyncInfo: [String: Any]? = nil
+
+    /// Active reasons the service is paused (PausableService conformance)
+    @MainActor public private(set) var activePauseReasons = Set<ServiceLifecycleReason>()
+
+    /// Backward-compatible flag — `true` when paused for `.emulation` (emulator UI session / gameplay scene, not core `setPauseEmulation`).
+    @MainActor public var isPausedForEmulation: Bool {
+        activePauseReasons.contains(.emulation)
+    }
+
+    /// `true` when any high-priority work (emulation OR game launch) wants the
+    /// sync layer to yield. Upload/background-sync paths should check this
+    /// rather than `isPausedForEmulation` so that user-initiated download
+    /// progress isn't starved by background uploads during launch.
+    @MainActor public var shouldYieldSync: Bool {
+        activePauseReasons.contains(.emulation) || activePauseReasons.contains(.gameLaunch)
+    }
+
+    /// Notification tokens
+    private var notificationTokens: [NSObjectProtocol] = []
+    private var integrityAuditTask: Task<Void, Never>?
+    private var metadataBootstrapTask: Task<Void, Never>?
+    /// Track active async tasks so they can be cancelled on emulation pause.
+    /// Protected by `activeTasksLock` via `withLock`.
+    private var activeSyncTasks: [Task<Void, Never>] = []
+    /// Thread-safe guard for `activeSyncTasks`. Uses `OSAllocatedUnfairLock` (iOS 16+).
+    private let activeTasksLock = OSAllocatedUnfairLock<Void>()
+
+    /// Throttle for status updates to prevent flooding the UI
+    private var lastStatusUpdate: Date = .distantPast
+    private var lastStatusSent: SyncStatus = .idle
+    private let statusUpdateThrottleInterval: TimeInterval = 0.5 // minimum seconds between status updates
+
+    /// Operation queues for pausable/cancellable work
+    private let metadataQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "org.provenance.cloudsync.metadataQueue"
+        q.qualityOfService = .utility
+        q.maxConcurrentOperationCount = 1
+        return q
+    }()
+    private let romsQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "org.provenance.cloudsync.romsQueue"
+        q.qualityOfService = .utility
+        // 4 slots gives background artwork/metadata fetches enough headroom to coexist
+        // without starving user-initiated work. User downloads bypass this queue entirely
+        // (see `fetchRecordWithProgress`'s `bypassQueue` param).
+        q.maxConcurrentOperationCount = 4
+        return q
+    }()
+    private let saveStatesQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "org.provenance.cloudsync.saveStatesQueue"
+        q.qualityOfService = .utility
+        q.maxConcurrentOperationCount = 4
+        return q
+    }()
+    private let biosQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "org.provenance.cloudsync.biosQueue"
+        q.qualityOfService = .utility
+        q.maxConcurrentOperationCount = 4
+        return q
+    }()
+    private let nonDbQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "org.provenance.cloudsync.nonDbQueue"
+        q.qualityOfService = .utility
+        q.maxConcurrentOperationCount = 4
+        return q
+    }()
+
+    /// Structured log channel for CloudKit sync operations.
+    /// Use `CloudSyncManager.syncLog` for structured events and `syncLog.info()/error()` for free-form messages.
+    public static let syncLog: PVLogChannel = {
+        let channel = PVLogChannel("cloudkit-sync", fileOutput: true, maxEntries: 1000)
+        PVLogChannelRegistry.shared.register(channel)
+        return channel
+    }()
+
+    /// Prioritized task queue coordinator for all sync operations.
+    public let taskCoordinator = SyncTaskQueueCoordinator()
+
+    /// CloudKit Container. Nil when running without CloudKit entitlements (sideloaded builds).
+    private let container: CKContainer?
+
+    /// Observes local PVGame changes to forward metadata edits to CloudKit.
+    private var localGameSyncMonitor: LocalGameSyncMonitor?
+
+    // MARK: - Initialization
+
+    /// No-op initializer used when CloudKit entitlement is not present (e.g. sideloaded builds).
+    private init() {
+        self.container = nil
+    }
+
+    /// Private initializer for singleton
+    private init(container: CKContainer) {
+        self.container = container
+        registerForNotifications()
+        Task.detached { @MainActor in
+            self.setupObservers()
+            BackgroundServiceRegistry.shared.register(self)
+        }
+
+        // Start cross-queue dependency listeners
+        Task { await taskCoordinator.startEventListeners() }
+
+        // Initialize sync providers if iCloud sync is enabled
+        if Defaults[.iCloudSync] {
+            initializeSyncProviders()
+            startMetadataBootstrap(reason: "startup")
+        }
+    }
+
+    deinit {
+        // Unregister from notifications
+        for token in notificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        // Remove observers
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: - Task Tracking
+
+    private func trackSyncTask(_ task: Task<Void, Never>) {
+        activeTasksLock.withLock { activeSyncTasks.append(task) }
+    }
+
+    private func cancelAllActiveSyncTasks() {
+        let tasks = activeTasksLock.withLock {
+            let tasks = activeSyncTasks
+            activeSyncTasks.removeAll()
+            return tasks
+        }
+        tasks.forEach { $0.cancel() }
+    }
+
+    private func enqueueMetadataWork(_ work: @escaping @Sendable () async -> Void) {
+        let op = BlockOperation()
+        op.addExecutionBlock { [weak self, weak op] in
+            guard let self, let op, !op.isCancelled else { return }
+            let task = Task {
+                let pausedForEmulation = await MainActor.run(body: { self.isPausedForEmulation })
+                if Task.isCancelled || pausedForEmulation { return }
+                await work()
+            }
+            self.trackSyncTask(task)
+        }
+        metadataQueue.addOperation(op)
+    }
+
+    // MARK: - CloudKit Settings Integration
+
+    /// Check if sync should be allowed based on current device conditions and user settings
+    private func shouldAllowSync() async -> Bool {
+        // Check if paused for emulation
+        if await MainActor.run(body: { isPausedForEmulation }) {
+            DLOG("Sync paused for emulation, skipping sync")
+            return false
+        }
+
+        // Check if background sync is disabled and app is in background
+        let cloudKitBackgroundSync = Defaults[.cloudKitBackgroundSync]
+        if !cloudKitBackgroundSync, await isAppInBackground() {
+            DLOG("Background sync disabled, skipping sync")
+            return false
+        }
+
+        // Check low power mode setting
+        let cloudKitRespectLowPowerMode = Defaults[.cloudKitRespectLowPowerMode]
+        if  cloudKitRespectLowPowerMode, ProcessInfo.processInfo.isLowPowerModeEnabled {
+            DLOG("Low power mode enabled and respect setting is on, skipping sync")
+            return false
+        }
+
+        // Check charging requirement
+        let cloudKitSyncOnlyWhenCharging = Defaults[.cloudKitSyncOnlyWhenCharging]
+        if  cloudKitSyncOnlyWhenCharging, !(await isDeviceCharging()) {
+            DLOG("Device not charging and charging requirement enabled, skipping sync")
+            return false
+        }
+
+        // Check network conditions
+        if !(await isNetworkAvailableForSync()) {
+            DLOG("Network not available for sync based on user settings")
+            return false
+        }
+
+        return true
+    }
+
+    /// Check if the current network connection is suitable for sync based on user settings
+    private func isNetworkAvailableForSync() async -> Bool {
+        let networkMode = Defaults[.cloudKitSyncNetworkMode]
+
+        // For now, we'll assume network is available if any mode is selected
+        // In a real implementation, you would check actual network type (WiFi/Cellular)
+        switch networkMode {
+        case .wifiAndCellular:
+            return true // Allow both
+        case .wifiOnly:
+            // Would need to check if current connection is WiFi
+            // For now, assume true - implement actual WiFi detection as needed
+            return true
+        case .cellularOnly:
+            // Would need to check if current connection is cellular
+            // For now, assume true - implement actual cellular detection as needed
+            return true
+        }
+    }
+
+    /// Check if the app is currently in background
+    private func isAppInBackground() async -> Bool {
+        return await MainActor.run {
+            UIApplication.shared.applicationState == .background
+        }
+    }
+
+    /// Check if the device is currently charging
+    private func isDeviceCharging() async -> Bool {
+#if os(tvOS)
+        return true
+#else
+
+        return await MainActor.run {
+            UIDevice.current.batteryState == .charging || UIDevice.current.batteryState == .full
+        }
+#endif
+    }
+
+    /// Check if a file should be synced based on content type settings
+    private func shouldSyncContent(type: CloudKitSyncContentType) -> Bool {
+        let userContentType = Defaults[.cloudKitSyncContentType]
+
+        switch userContentType {
+        case .all:
+            return true
+        case .saveStatesOnly:
+            return type == .saveStatesOnly
+        case .romsOnly:
+            return type == .romsOnly
+        case .metadataOnly:
+            // `.metadataOnly` was originally meant as "skip the big files" — i.e.
+            // skip ROMs (which can be GB-scale). Save states are small (KB–MB)
+            // and the cross-device hand-off is the single most valuable thing
+            // CloudKit sync provides, so allow them through. This is what fixes
+            // the tvOS default install where save states never auto-uploaded
+            // and only appeared after manually triggering "Force Initial Sync".
+            return type == .metadataOnly || type == .saveStatesOnly
+        }
+    }
+
+    /// Check if a file size is acceptable for current network conditions
+    private func isFileSizeAcceptableForNetwork(_ fileSize: Int64) -> Bool {
+        let networkMode = Defaults[.cloudKitSyncNetworkMode]
+        var maxCellularSizeBytes = Int64(Defaults[.cloudKitMaxCellularFileSize])
+        // Backward-compat: if value looks like MB (very small number), convert to bytes
+        if maxCellularSizeBytes > 0 && maxCellularSizeBytes <= 1000 {
+            maxCellularSizeBytes *= 1024 * 1024
+        }
+
+        switch networkMode {
+        case .wifiAndCellular:
+            // Conservative path previously applied cellular cap always; relax it to only cap truly tiny thresholds
+            return fileSize <= maxCellularSizeBytes
+        case .wifiOnly:
+            return true
+        case .cellularOnly:
+            return fileSize <= maxCellularSizeBytes
+        }
+    }
+
+    /// Get the maximum number of concurrent operations based on user settings
+    private func getMaxConcurrentOperations() -> Int {
+        return Defaults[.cloudKitMaxConcurrentUploads]
+    }
+
+    /// Check if files should be compressed based on user settings
+    private func shouldCompressFiles() -> Bool {
+        return Defaults[.cloudKitCompressFiles]
+    }
+
+    /// Check if local files should be deleted after successful upload
+    private func shouldDeleteLocalAfterUpload() -> Bool {
+        return Defaults[.cloudKitDeleteLocalAfterUpload]
+    }
+
+    /// Check if failed uploads should be retried
+    private func shouldRetryFailedUploads() -> Bool {
+        return Defaults[.cloudKitRetryFailedUploads]
+    }
+
+    /// Get the maximum number of retry attempts
+    private func getMaxRetryAttempts() -> Int {
+        return Defaults[.cloudKitMaxRetryAttempts]
+    }
+
+    /// Check if conflicts should be auto-resolved
+    private func shouldAutoResolveConflicts() -> Bool {
+        return Defaults[.cloudKitAutoResolveConflicts]
+    }
+
+    /// Check if sync notifications should be shown
+    private func shouldShowSyncNotifications() -> Bool {
+        return Defaults[.cloudKitShowSyncNotifications]
+    }
+
+    /// Get the sync frequency interval in seconds
+    private func getSyncFrequencyInterval() -> TimeInterval? {
+        let frequency = Defaults[.cloudKitSyncFrequency]
+        return frequency.timeInterval
+    }
+
+    /// Whether ROM metadata/content should be synced for the current content preference.
+    private func shouldSyncROMContent() -> Bool {
+        switch Defaults[.cloudKitSyncContentType] {
+        case .all, .romsOnly, .metadataOnly:
+            return true
+        case .saveStatesOnly:
+            return false
+        }
+    }
+
+    /// Whether save state metadata/content should be synced for the current content preference.
+    private func shouldSyncSaveStateContent() -> Bool {
+        switch Defaults[.cloudKitSyncContentType] {
+        case .all, .saveStatesOnly, .metadataOnly:
+            return true
+        case .romsOnly:
+            return false
+        }
+    }
+
+    // MARK: - Content Type Enum for Settings Integration
+
+    private enum CloudKitSyncContentType {
+        case saveStatesOnly
+        case romsOnly
+        case metadataOnly
+    }
+
+    // MARK: - Helper Methods for Settings Integration
+
+    /// Show a sync notification if notifications are enabled
+    private func showSyncNotification(message: String) async {
+        guard shouldShowSyncNotifications() else { return }
+
+        await MainActor.run {
+            // In a real implementation, you would show a proper notification
+            // For now, we'll just log it
+            Self.syncLog.event(.sync, item: "notification", status: .ok, detail: message)
+
+            // You could integrate with UNUserNotificationCenter here
+            // let content = UNMutableNotificationContent()
+            // content.title = "CloudKit Sync"
+            // content.body = message
+            // ...
+        }
+    }
+
+    /// Delete local save state file after successful upload
+    private func deleteLocalSaveStateFile(_ saveState: PVSaveState) async {
+        guard shouldDeleteLocalAfterUpload() else { return }
+
+        do {
+            if let fileURL = saveState.file?.url {
+                try await FileManager.default.removeItem(at: fileURL)
+                DLOG("Deleted local save state file: \(fileURL.lastPathComponent)")
+            }
+        } catch {
+            Self.syncLog.event(.delete, item: "save-state/local-file", status: .failed, detail: error.localizedDescription)
+        }
+    }
+
+    /// Format byte count into human-readable string
+    private func formatByteCount(_ byteCount: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useAll]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: byteCount)
+    }
+
+    // MARK: - Public Methods
+
+    /// Start syncing
+    /// - Returns: Async function completes when initial sync is done (or immediately if not needed/disabled)
+    public func startSync() async {
+        // Hard guard: never start sync while emulation is paused
+        if await MainActor.run(body: { isPausedForEmulation }) {
+            DLOG("[SYNC] startSync called while paused for emulation; skipping.")
+            return
+        }
+
+        guard Defaults[.iCloudSync] else {
+            DLOG("[SYNC] iCloud sync disabled, skipping startSync.")
+            updateSyncStatus(.disabled)
+            return
+        }
+
+        // Check if sync is allowed based on current conditions
+        guard await shouldAllowSync() else {
+            DLOG("[SYNC] Sync not allowed due to current conditions (network, power, etc.)")
+            return
+        }
+
+        let syncLog = Self.syncLog
+        syncLog.event(.start, item: "sync/cloudkit", status: .inProgress, detail: "Starting CloudKit sync")
+
+        // Initialize sync providers if needed
+        if romsSyncer == nil || saveStatesSyncer == nil || nonDatabaseSyncer == nil {
+            syncLog.event(.start, item: "sync/providers", status: .inProgress, detail: "Initializing sync providers")
+            initializeSyncProviders()
+        }
+
+        guard romsSyncer != nil || saveStatesSyncer != nil || nonDatabaseSyncer != nil else {
+            syncLog.event(.start, item: "sync/providers", status: .failed, detail: "Sync providers failed to initialize")
+            updateSyncStatus(.error(CloudSyncError.missingDependency))
+            return
+        }
+
+        startMetadataBootstrap(reason: "start-sync")
+
+        // Kick off remote changes fetch IMMEDIATELY to populate Realm with PVGame metadata on fresh installs
+        updateSyncStatus(.downloading)
+        enqueueMetadataWork { [weak self] in
+            await self?.fetchRemoteChanges()
+        }
+
+        // Refresh isDownloaded for all games using a single directory scan.
+        // This catches any stale values left by crashes, partial syncs, or
+        // prior bugs that set isDownloaded=false on locally-imported games.
+        enqueueMetadataWork {
+            let result = await GameFileStatusService.shared.refreshAllStatuses()
+            if result.upgraded > 0 || result.downgraded > 0 {
+                DLOG("[SYNC] Startup status refresh: \(result.upgraded) upgraded, \(result.downgraded) downgraded out of \(result.totalGames) games")
+            }
+        }
+
+        // Check for missing ROM files at startup (non-blocking)
+        enqueueMetadataWork { [weak self] in
+            await self?.checkForMissingROMFiles(force: false)
+        }
+
+        // Enqueue initial sync (uploads) AFTER remote fetch completes.
+        // On a fresh install all local data came from CloudKit, so once
+        // fetchRemoteChanges finishes every Realm object already has a
+        // cloudRecordID and isInitialSyncNeeded() returns false — avoiding
+        // thousands of redundant per-file CloudKit queries.
+        enqueueMetadataWork { [weak self] in
+            guard let self else { return }
+            self.updateSyncStatus(.initialSync)
+
+            var hasErrors = false
+            var lastError: Error?
+
+            do {
+                let syncCount = await CloudKitInitialSyncer.shared?.performInitialSync(forceSync: false)
+                DLOG("CloudKit initial sync completed - potentially uploaded \(syncCount ?? 0) new records.")
+            } catch {
+                CloudSyncManager.syncLog.event(.sync, item: "sync/initial", status: .failed, detail: error.localizedDescription)
+                hasErrors = true
+                lastError = error
+                await self.errorHandler.handle(error: error)
+            }
+
+            if hasErrors {
+                CloudSyncManager.syncLog.event(.sync, item: "sync/cloudkit", status: .failed, detail: "Sync completed with errors")
+                if let error = lastError {
+                    self.updateSyncStatus(.error(CloudSyncError.cloudKitError(error)))
+                }
+            } else {
+                self.updateSyncStatus(.idle)
+                DLOG("Initial sync phase completed successfully.")
+            }
+        }
+    }
+
+    /// Fetch only remote changes without doing initial sync
+    /// Useful for responding to CloudKit notifications
+    public func fetchRemoteChangesOnly() async {
+        if await MainActor.run(body: { isPausedForEmulation }) {
+            DLOG("[SYNC] fetchRemoteChangesOnly called while paused for emulation; skipping.")
+            return
+        }
+
+        guard Defaults[.iCloudSync] else {
+            DLOG("iCloud sync disabled, skipping fetchRemoteChangesOnly.")
+            return
+        }
+
+        // Initialize sync providers if needed
+        if romsSyncer == nil || saveStatesSyncer == nil || nonDatabaseSyncer == nil {
+            initializeSyncProviders()
+        }
+
+        guard romsSyncer != nil || saveStatesSyncer != nil || nonDatabaseSyncer != nil else {
+            Self.syncLog.event(.sync, item: "sync/providers", status: .failed, detail: "Sync providers failed to initialize, aborting fetch")
+            return
+        }
+
+        updateSyncStatus(.downloading)
+        DLOG("Fetching remote changes from CloudKit...")
+
+        enqueueMetadataWork { [weak self] in
+            await self?.fetchRemoteChanges()
+        }
+
+        updateSyncStatus(.idle)
+        DLOG("Remote fetch complete.")
+    }
+
+    /// Upload a ROM file to the cloud
+    /// - Parameter game: The game to upload
+    /// - Returns: Async function that completes when the upload is done or throws an error
+    public func uploadROM(for game: PVGame) async throws {
+//        guard let game = game.thaw() else {
+//            ELOG("Failed to thaw game: \(game.title)")
+//            return
+//        }
+
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer else {
+            DLOG("Sync disabled or syncer not available. Skipping ROM upload.")
+            return
+        }
+
+        // Check if sync is allowed based on current conditions
+        guard await shouldAllowSync() else {
+            DLOG("Sync not allowed due to current conditions, skipping ROM upload")
+            return
+        }
+
+        // Check if ROM content should be synced based on user settings
+        guard shouldSyncContent(type: .romsOnly) else {
+            DLOG("ROM sync disabled by user content type settings")
+            return
+        }
+
+        if game.contentless {
+            DLOG("Skipping CloudKit ROM upload for contentless placeholder game: \(game.title)")
+            return
+        }
+
+        let md5 = game.md5Hash
+
+        // Check file size if it exists
+        if let romPath = PVEmulatorConfiguration.path(forGame: game),
+           let fileSize = try? FileManager.default.attributesOfItem(atPath: romPath.path)[.size] as? Int64 {
+            guard isFileSizeAcceptableForNetwork(fileSize) else {
+                DLOG("ROM file too large for current network settings: \(formatByteCount(fileSize))")
+                return
+            }
+        }
+
+        updateSyncStatus(.uploading, info: ["type": "ROM", "title": game.title])
+
+        var retryCount = 0
+        let maxRetries = shouldRetryFailedUploads() ? getMaxRetryAttempts() : 1
+        let title = game.title
+
+        while retryCount < maxRetries {
+            do {
+                try await romsSyncer.uploadGame(md5)
+                DLOG("Successfully uploaded ROM: \(title)")
+
+                // Show notification if enabled
+                if shouldShowSyncNotifications() {
+                    await showSyncNotification(message: "Uploaded ROM: \(title)")
+                }
+
+                updateSyncStatus(.idle)
+                scheduleIntegrityAudit(reason: "post-rom-upload", delay: 1.0)
+                return
+            } catch let error as CloudSyncError {
+                retryCount += 1
+
+                // Provide specific error messages based on error type
+                let errorMessage: String
+                switch error {
+                case .invalidData:
+                    errorMessage = "Upload failed: Invalid or corrupted game data. Please verify the ROM file is valid."
+                case .assetTooLarge(let size, let maxSize):
+                    let sizeMB = Double(size) / (1024 * 1024)
+                    let maxMB = Double(maxSize) / (1024 * 1024)
+                    errorMessage = "Upload failed: File size (\(String(format: "%.1f", sizeMB))MB) exceeds CloudKit limit (\(String(format: "%.1f", maxMB))MB)"
+                case .fileSystemError(let underlyingError):
+                    errorMessage = "Upload failed: File system error - \(underlyingError.localizedDescription)"
+                case .cloudKitError(let underlyingError):
+                    if let ckError = underlyingError as? CKError {
+                        var baseMessage = "Upload failed: CloudKit error"
+                        baseMessage += " (code: \(ckError.code.rawValue))"
+
+                        switch ckError.code {
+                        case .invalidArguments:
+                            baseMessage = "Upload failed: Invalid CloudKit record structure. The game data may be corrupted."
+                        case .limitExceeded:
+                            baseMessage = "Upload failed: File exceeds CloudKit size limits (500MB max)"
+                        case .networkUnavailable, .networkFailure:
+                            baseMessage = "Upload failed: Network unavailable. Please check your internet connection."
+                        case .partialFailure:
+                            baseMessage = "Upload failed: Partial failure"
+                            if let partialErrors = ckError.partialErrorsByItemID {
+                                baseMessage += " - \(partialErrors.count) items failed"
+                                for (itemID, itemError) in partialErrors.prefix(3) {
+                                    let recordIDString: String
+                                    if let recordID = itemID as? CKRecord.ID {
+                                        recordIDString = recordID.recordName
+                                    } else {
+                                        recordIDString = "\(itemID)"
+                                    }
+
+                                    if let itemCKError = itemError as? CKError {
+                                        baseMessage += "\n  \(recordIDString): code \(itemCKError.code.rawValue) - \(itemCKError.localizedDescription)"
+                                    } else {
+                                        baseMessage += "\n  \(recordIDString): \(itemError.localizedDescription)"
+                                    }
+                                }
+                                if partialErrors.count > 3 {
+                                    baseMessage += "\n  ... and \(partialErrors.count - 3) more"
+                                }
+                            }
+                        case .serviceUnavailable:
+                            baseMessage = "Upload failed: CloudKit service unavailable. Please try again later."
+                        case .requestRateLimited:
+                            baseMessage = "Upload failed: Rate limited"
+                            if let retryAfter = ckError.retryAfterSeconds {
+                                baseMessage += " - Retry after \(retryAfter) seconds"
+                            }
+                        case .quotaExceeded:
+                            baseMessage = "Upload failed: iCloud storage quota exceeded"
+                        default:
+                            baseMessage += " - \(ckError.localizedDescription)"
+                            if let retryAfter = ckError.retryAfterSeconds {
+                                baseMessage += " (Retry after \(retryAfter) seconds)"
+                            }
+                        }
+                        errorMessage = baseMessage
+                    } else {
+                        errorMessage = "Upload failed: CloudKit error - \(underlyingError.localizedDescription)"
+                    }
+                default:
+                    errorMessage = "Upload failed: \(error.localizedDescription)"
+                }
+
+                Self.syncLog.event(.upload, item: "rom/\(title)", status: .failed, detail: "attempt \(retryCount)/\(maxRetries): \(errorMessage)")
+
+                if retryCount >= maxRetries {
+                    updateSyncStatus(.error(error))
+                    // Re-throw with more descriptive error
+                    throw CloudSyncError.genericError(errorMessage)
+                } else {
+                    // Wait before retry (exponential backoff)
+                    let delay = TimeInterval(retryCount * 2)
+                    DLOG("Retrying upload for \(title) after \(delay) seconds...")
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            } catch {
+                retryCount += 1
+                Self.syncLog.event(.upload, item: "rom/\(title)", status: .failed, detail: "attempt \(retryCount)/\(maxRetries): \(error.localizedDescription)")
+
+                if retryCount >= maxRetries {
+                    updateSyncStatus(.error(error))
+                    throw error
+                } else {
+                    // Wait before retry (exponential backoff)
+                    let delay = TimeInterval(retryCount * 2)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            }
+        }
+    }
+
+    /// Download a ROM file from the cloud
+    /// - Parameter game: The game to download
+    /// - Returns: Async function that completes when the download is done or throws an error
+    public func downloadROM(for game: PVGame) async throws {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer else {
+            DLOG("Sync disabled or syncer not available. Skipping ROM download.")
+            return // Or throw?
+        }
+
+        updateSyncStatus(.downloading, info: ["type": "ROM", "title": game.title])
+        do {
+            // Ensure downloadGame exists and is async
+            // Assuming downloadGame updates local state implicitly
+            try await romsSyncer.downloadGame(md5: game.md5Hash ?? "") // Need downloadGame on protocol/syncer
+            DLOG("Successfully downloaded ROM: \(game.title)")
+            updateSyncStatus(.idle)
+        } catch {
+            Self.syncLog.event(.download, item: "rom/\(game.title)", status: .failed, detail: error.localizedDescription)
+            updateSyncStatus(.error(error))
+            throw error
+        }
+    }
+
+    // MARK: - Artwork Sync
+
+    /// Sync custom artwork for a game to CloudKit
+    /// Call this after saving custom artwork locally to upload it to the cloud
+    /// - Parameters:
+    ///   - game: The game with updated artwork
+    ///   - artworkKey: The PVMediaCache key for the artwork
+    /// - Returns: True if artwork was successfully synced
+    @discardableResult
+    public func syncArtwork(for game: PVGame, artworkKey: String) async throws -> Bool {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer as? CloudKitRomsSyncer else {
+            DLOG("Sync disabled or CloudKit syncer not available. Skipping artwork sync.")
+            return false
+        }
+
+        // Check if sync is allowed
+        guard await shouldAllowSync() else {
+            DLOG("Sync not allowed due to current conditions, skipping artwork sync")
+            return false
+        }
+
+        let md5 = game.md5Hash
+        let syncLog = Self.syncLog
+        guard !md5.isEmpty else {
+            syncLog.event(.sync, item: "artwork/unknown", status: .failed, detail: "Game has no MD5 hash")
+            return false
+        }
+
+        syncLog.event(.sync, item: "artwork/\(game.title)", status: .inProgress, detail: "key: \(artworkKey)")
+
+        do {
+            var success = false
+
+            // Check if game has a local ROM file
+            let hasLocalFile = game.isDownloaded && game.file?.url != nil &&
+                FileManager.default.fileExists(atPath: game.file?.url?.path ?? "")
+
+            if hasLocalFile {
+                // Full upload with ROM and artwork
+                try await romsSyncer.uploadGame(md5)
+                success = true
+            } else {
+                // Artwork-only update (for cloud-synced games without local ROM)
+                success = try await romsSyncer.updateArtworkOnly(for: game, artworkKey: artworkKey)
+            }
+
+            if success {
+                // Post notification that artwork was synced
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .PVGameArtworkDidUpdate,
+                        object: nil,
+                        userInfo: [
+                            PVNotificationUserInfoKeys.gameMD5Key: md5,
+                            PVNotificationUserInfoKeys.artworkURLKey: artworkKey
+                        ]
+                    )
+                }
+                syncLog.event(.sync, item: "artwork/\(game.title)", status: .ok)
+            }
+            return success
+        } catch {
+            syncLog.event(.sync, item: "artwork/\(game.title)", status: .failed, detail: error.localizedDescription)
+            throw error
+        }
+    }
+
+    /// Sync custom artwork for a game by MD5 (safe for background threads)
+    @discardableResult
+    public func syncArtwork(forMD5 md5: String, artworkKey: String) async throws -> Bool {
+        guard !md5.isEmpty else {
+            Self.syncLog.event(.sync, item: "artwork/unknown", status: .failed, detail: "Missing MD5")
+            return false
+        }
+        let frozenGame = await MainActor.run {
+            RomDatabase.sharedInstance.game(withMD5: md5)?.freeze()
+        }
+        guard let frozenGame else {
+            Self.syncLog.event(.sync, item: "artwork/\(md5)", status: .notFound, detail: "Game not found for MD5")
+            return false
+        }
+        return try await syncArtwork(for: frozenGame, artworkKey: artworkKey)
+    }
+
+    /// Sync artwork for multiple games in batch
+    /// - Parameter gameMD5s: Array of game MD5 hashes to sync artwork for
+    /// - Returns: Number of games successfully synced
+    @discardableResult
+    public func syncArtworkBatch(gameMD5s: [String]) async -> Int {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer as? CloudKitRomsSyncer else {
+            DLOG("Sync disabled or CloudKit syncer not available. Skipping batch artwork sync.")
+            return 0
+        }
+
+        // Check if sync is allowed
+        guard await shouldAllowSync() else {
+            DLOG("Sync not allowed due to current conditions, skipping batch artwork sync")
+            return 0
+        }
+
+        let syncLog = Self.syncLog
+        syncLog.event(.sync, item: "artwork/batch", status: .inProgress, detail: "\(gameMD5s.count) games")
+        var successCount = 0
+
+        for md5 in gameMD5s {
+            guard let game = await MainActor.run(body: {
+                RomDatabase.sharedInstance.game(withMD5: md5)
+            }) else {
+                syncLog.event(.sync, item: "artwork/\(md5)", status: .notFound, detail: "Game not found for MD5")
+                continue
+            }
+
+            // Only sync if game has custom artwork
+            guard !game.customArtworkURL.isEmpty else {
+                continue
+            }
+
+            do {
+                // Check if game has local file for full upload, otherwise artwork-only
+                let hasLocalFile = game.isDownloaded && game.file?.url != nil &&
+                    FileManager.default.fileExists(atPath: game.file?.url?.path ?? "")
+
+                if hasLocalFile {
+                    try await romsSyncer.uploadGame(md5)
+                } else {
+                    _ = try await romsSyncer.updateArtworkOnly(for: game, artworkKey: game.customArtworkURL)
+                }
+                successCount += 1
+
+                // Small delay between uploads to avoid rate limiting
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            } catch {
+                syncLog.event(.sync, item: "artwork/\(game.title)", status: .failed, detail: error.localizedDescription)
+            }
+        }
+
+        if successCount > 0 {
+            // Post batch notification
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: .PVGameArtworkDidUpdate,
+                    object: nil,
+                    userInfo: ["batchCount": successCount]
+                )
+            }
+        }
+
+        syncLog.event(.sync, item: "artwork/batch", status: .ok, detail: "\(successCount)/\(gameMD5s.count) games synced")
+        return successCount
+    }
+
+    /// Upload a save state to the cloud
+    /// - Parameter saveState: The save state to upload
+    /// - Returns: Async function that completes when the upload is done or throws an error
+    public func uploadSaveState(for saveState: PVSaveState) async throws {
+        guard Defaults[.iCloudSync], let saveStatesSyncer = saveStatesSyncer else {
+            DLOG("Sync disabled or syncer not available. Skipping save state upload.")
+            return
+        }
+
+        // Check if sync is allowed based on current conditions
+        guard await shouldAllowSync() else {
+            DLOG("Sync not allowed due to current conditions, skipping save state upload")
+            return
+        }
+
+        // Check if save state content should be synced based on user settings
+        guard shouldSyncContent(type: .saveStatesOnly) else {
+            DLOG("Save state sync disabled by user content type settings")
+            return
+        }
+
+        // Check file size if it exists
+        if let saveStatePath = saveState.file?.url,
+           let fileSize = try? FileManager.default.attributesOfItem(atPath: saveStatePath.path)[.size] as? Int64 {
+            guard isFileSizeAcceptableForNetwork(fileSize) else {
+                DLOG("Save state file too large for current network settings: \(formatByteCount(fileSize))")
+                return
+            }
+        }
+
+        updateSyncStatus(.uploading, info: ["type": "Save State", "game": saveState.game.title])
+
+        var retryCount = 0
+        let maxRetries = shouldRetryFailedUploads() ? getMaxRetryAttempts() : 1
+
+        while retryCount < maxRetries {
+            do {
+                // Use the direct async method from CloudKitSaveStatesSyncer
+                try await saveStatesSyncer.uploadSaveState(for: saveState)
+                DLOG("Successfully uploaded save state for game: \(saveState.game.title)")
+
+                // Show notification if enabled
+                if shouldShowSyncNotifications() {
+                    await showSyncNotification(message: "Uploaded save state for: \(saveState.game.title)")
+                }
+
+                // Delete local file if requested by user
+                if shouldDeleteLocalAfterUpload() {
+                    await deleteLocalSaveStateFile(saveState)
+                }
+
+                updateSyncStatus(.idle)
+                return
+            } catch {
+                retryCount += 1
+                Self.syncLog.event(.upload, item: "save-state/\(saveState.game.title)", status: .failed, detail: "attempt \(retryCount)/\(maxRetries): \(error.localizedDescription)")
+
+                if retryCount >= maxRetries {
+                    updateSyncStatus(.error(error))
+                    throw error
+                } else {
+                    // Wait before retry (exponential backoff)
+                    let delay = TimeInterval(retryCount * 2)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            }
+        }
+    }
+
+    /// Download a save state from the cloud
+    /// - Parameter saveState: The save state to download
+    /// - Returns: Async function that completes when the download is done or throws an error
+    public func downloadSaveState(for saveState: PVSaveState) async throws {
+        guard Defaults[.iCloudSync], let saveStatesSyncer = saveStatesSyncer else {
+            DLOG("Sync disabled or syncer not available. Skipping save state download.")
+            return
+        }
+        let saveState = saveState.freeze()
+
+        updateSyncStatus(.downloading, info: ["type": "Save State", "game": saveState.game.title])
+        do {
+            // Ensure downloadSaveState exists, handle Completable return
+            // Assuming Completable has an extension like .toAsync()
+            Self.syncLog.event(.download, item: "save-state/\(saveState.game.title)", status: .inProgress)
+            try await saveStatesSyncer.downloadSaveState(for: saveState, isUserInitiated: true).toAsync()
+            DLOG("Successfully downloaded save state for game: \(saveState.game.title)")
+            updateSyncStatus(.idle)
+        } catch {
+            Self.syncLog.event(.download, item: "save-state/\(saveState.game.title)", status: .failed, detail: error.localizedDescription)
+            updateSyncStatus(.error(error))
+            throw error
+        }
+    }
+
+    /// Re-downloads artwork for games whose PVMediaCache file is missing.
+    /// Safe to call multiple times — skips games that already have cached artwork.
+    public func backfillMissingArtwork() async {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer as? CloudKitRomsSyncer else { return }
+        await romsSyncer.cacheMissingArtworkForExistingGames()
+    }
+
+    /// Update the sync status and notify listeners
+    /// - Parameter status: The new sync status
+    private func updateSyncStatus(_ status: SyncStatus, info: [String: Any]? = nil) {
+        Task { @MainActor in // Ensure updates happen on the main thread
+            // Always update local state
+            self.syncStatus = status
+            self.currentSyncInfo = info
+
+            // Throttle publishing to prevent flooding subscribers
+            // Exception: always publish .idle status immediately
+            let now = Date()
+            let timeSinceLastUpdate = now.timeIntervalSince(self.lastStatusUpdate)
+            let statusChanged = status != self.lastStatusSent
+
+            if status == .idle || timeSinceLastUpdate >= self.statusUpdateThrottleInterval || statusChanged {
+                self.lastStatusUpdate = now
+                self.lastStatusSent = status
+                self.syncStatusSubject.send(status)
+            }
+        }
+    }
+
+    /// Schedule a background audit to verify CloudKit asset state and record integrity
+    private func scheduleIntegrityAudit(reason: String, delay: TimeInterval = 2.0) {
+        guard integrityAuditTask == nil else { return }
+        guard Defaults[.iCloudSync],
+              let romSyncer = romsSyncer as? CloudKitRomsSyncer else {
+            return
+        }
+
+        integrityAuditTask = Task.detached(priority: .background) { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+
+            // First, audit assets (quick check for missing files)
+            await romSyncer.auditCloudAssets()
+
+            // Then, audit record integrity (check for incomplete metadata)
+            // Only run occasionally to avoid excessive API calls
+            if Bool.random() || reason.contains("manual") {
+                await romSyncer.auditAndRepairIncompleteRecords()
+            }
+
+            await MainActor.run {
+                self?.integrityAuditTask = nil
+            }
+        }
+
+        DLOG("Scheduled CloudKit integrity audit (\(reason))")
+    }
+
+    /// Manually trigger a full integrity audit including record repair
+    public func runFullIntegrityAudit() async {
+        let syncLog = Self.syncLog
+        guard Defaults[.iCloudSync],
+              let romSyncer = romsSyncer as? CloudKitRomsSyncer else {
+            syncLog.event(.check, item: "audit/full", status: .skipped, detail: "Sync disabled or no ROM syncer")
+            return
+        }
+
+        syncLog.event(.check, item: "audit/full", status: .inProgress, detail: "Starting manual full integrity audit")
+        await romSyncer.auditCloudAssets()
+        await romSyncer.auditAndRepairIncompleteRecords()
+        syncLog.event(.check, item: "audit/full", status: .ok, detail: "Manual full integrity audit complete")
+    }
+
+    /// Run BIOS CloudKit audit to diagnose sync issues
+    /// - Returns: Audit result containing details about BIOS sync state
+    public func runBIOSAudit() async -> BIOSAuditResult? {
+        let syncLog = Self.syncLog
+        guard Defaults[.iCloudSync] else {
+            syncLog.event(.check, item: "audit/bios", status: .skipped, detail: "Sync disabled")
+            return nil
+        }
+        guard let ckContainer = iCloudConstants.container else {
+            syncLog.event(.check, item: "audit/bios", status: .skipped, detail: "CloudKit entitlement not present")
+            return nil
+        }
+
+        syncLog.event(.check, item: "audit/bios", status: .inProgress)
+        let syncer = CloudKitBIOSSyncer(
+            container: ckContainer,
+            directories: ["BIOS", "System"],
+            errorHandler: errorHandler
+        )
+        let result = await syncer.auditBIOSCloudRecords()
+        syncLog.event(.check, item: "audit/bios", status: .ok)
+        return result
+    }
+
+    /// Repair BIOS sync issues by re-uploading problematic files
+    /// - Returns: Number of BIOS files re-uploaded
+    public func repairBIOSSync() async -> Int {
+        let syncLog = Self.syncLog
+        guard Defaults[.iCloudSync] else {
+            syncLog.event(.sync, item: "bios/repair", status: .skipped, detail: "Sync disabled")
+            return 0
+        }
+        guard let ckContainer = iCloudConstants.container else {
+            syncLog.event(.sync, item: "bios/repair", status: .skipped, detail: "CloudKit entitlement not present")
+            return 0
+        }
+
+        syncLog.event(.sync, item: "bios/repair", status: .inProgress)
+        let syncer = CloudKitBIOSSyncer(
+            container: ckContainer,
+            directories: ["BIOS", "System"],
+            errorHandler: errorHandler
+        )
+        let count = await syncer.repairBIOSSync()
+        syncLog.event(.sync, item: "bios/repair", status: .ok, detail: "\(count) files re-uploaded")
+        return count
+    }
+
+    /// Force BIOS download from CloudKit (re-syncs metadata and downloads missing files)
+    public func forceBIOSDownload() async {
+        let syncLog = Self.syncLog
+        guard Defaults[.iCloudSync] else {
+            syncLog.event(.download, item: "bios/force", status: .skipped, detail: "Sync disabled")
+            return
+        }
+        guard let ckContainer = iCloudConstants.container else {
+            syncLog.event(.download, item: "bios/force", status: .skipped, detail: "CloudKit entitlement not present")
+            return
+        }
+
+        syncLog.event(.download, item: "bios/force", status: .inProgress)
+        let syncer = CloudKitBIOSSyncer(
+            container: ckContainer,
+            directories: ["BIOS", "System"],
+            errorHandler: errorHandler
+        )
+
+        // First sync metadata
+        _ = await syncer.syncMetadataOnly()
+
+        // Then force download all missing files
+        await syncer.downloadMissingBIOSFiles()
+
+        syncLog.event(.download, item: "bios/force", status: .ok)
+    }
+
+    /// Fast targeted download of a single BIOS file from CloudKit
+    /// - Parameters:
+    ///   - filename: The BIOS filename to download
+    ///   - expectedMD5: The expected MD5 hash (used for record ID prediction)
+    ///   - systemIdentifier: The system identifier (e.g., "com.provenance.psx")
+    /// - Returns: True if the BIOS was downloaded successfully
+    public func downloadSingleBIOS(filename: String, expectedMD5: String, systemIdentifier: String) async -> Bool {
+        let syncLog = Self.syncLog
+        guard Defaults[.iCloudSync] else {
+            syncLog.event(.download, item: "bios/\(filename)", status: .skipped, detail: "Sync disabled")
+            return false
+        }
+        guard let ckContainer = iCloudConstants.container else {
+            syncLog.event(.download, item: "bios/\(filename)", status: .skipped, detail: "CloudKit entitlement not present")
+            return false
+        }
+
+        syncLog.event(.download, item: "bios/\(filename)", status: .inProgress, detail: "Starting targeted download")
+
+        let syncer = CloudKitBIOSSyncer(
+            container: ckContainer,
+            directories: ["BIOS", "System"],
+            errorHandler: errorHandler
+        )
+
+        // Try multiple record ID formats in order of likelihood
+        let md5Prefix = String(expectedMD5.prefix(8)).uppercased()
+        let recordIDCandidates = [
+            // Most common format: systemID_filename_md5prefix
+            "\(systemIdentifier)_\(filename)_\(md5Prefix)",
+            // Simple format: systemID_filename
+            "\(systemIdentifier)_\(filename)",
+            // Legacy format: bios_filename
+            "bios_\(filename)",
+            // Just filename
+            filename
+        ]
+
+        for recordID in recordIDCandidates {
+            DLOG("[BIOS FAST] Trying recordID: \(recordID)")
+
+            if await syncer.tryDownloadBIOSByRecordID(recordID, filename: filename, systemIdentifier: systemIdentifier) {
+                syncLog.event(.download, item: "bios/\(filename)", status: .ok, detail: "Downloaded using recordID: \(recordID)")
+                return true
+            }
+        }
+
+        // If direct lookup failed, try a targeted query by filename
+        DLOG("[BIOS FAST] Direct lookup failed, trying filename query...")
+        if await syncer.tryDownloadBIOSByFilename(filename, systemIdentifier: systemIdentifier) {
+            syncLog.event(.download, item: "bios/\(filename)", status: .ok, detail: "Downloaded via filename query")
+            return true
+        }
+
+        syncLog.event(.download, item: "bios/\(filename)", status: .notFound)
+        return false
+    }
+
+    /// Download one game's battery/SRAM data from CloudKit.
+    ///
+    /// Takes the ROM's base name rather than a `PVGame` on purpose: the syncer
+    /// runs off the main actor and Realm objects are thread-confined, so passing
+    /// the model across would trip `verifyThread`. Same reasoning as
+    /// `downloadSingleBIOS`, which takes a system identifier string.
+    ///
+    /// - Returns: number of files downloaded; 0 when sync is off, the entitlement
+    ///   is absent, or nothing was missing.
+    public func downloadBatterySaves(forROMNamed romName: String) async -> Int {
+        guard Defaults[.iCloudSync] else {
+            DLOG("[BATTERY ON-DEMAND] Skipped for \(romName) — iCloud sync disabled")
+            return 0
+        }
+        guard let ckContainer = iCloudConstants.container else {
+            DLOG("[BATTERY ON-DEMAND] Skipped for \(romName) — CloudKit entitlement not present")
+            return 0
+        }
+        let syncer = CloudKitNonDatabaseSyncer(
+            container: ckContainer,
+            directories: [CloudKitNonDatabaseSyncer.batterySavesDirectoryName],
+            errorHandler: errorHandler
+        )
+        return await syncer.downloadBatterySaves(forROMNamed: romName)
+    }
+
+    /// Kick off a fast metadata-only bootstrap for ROMs and save states
+    private func startMetadataBootstrap(reason: String) {
+        Task { @MainActor in
+            guard Defaults[.iCloudSync] else { return }
+            guard metadataBootstrapTask == nil else {
+                DLOG("Metadata bootstrap already in progress, skipping (\(reason)).")
+                return
+            }
+
+            metadataBootstrapTask = Task { [weak self] in
+                await self?.performMetadataBootstrap(reason: reason)
+            }
+        }
+    }
+
+    private func performMetadataBootstrap(reason: String) async {
+        defer {
+            Task { @MainActor in
+                self.metadataBootstrapTask = nil
+            }
+        }
+
+        guard Defaults[.iCloudSync] else { return }
+
+        // Do not run bootstrap while emulation is active; it will be re-triggered on emulationEnd
+        if await MainActor.run(body: { isPausedForEmulation }) {
+            DLOG("[SYNC] Metadata bootstrap skipped (paused for emulation) — will retry on emulation end")
+            return
+        }
+
+        // Capture current syncers
+        let romSyncer = self.romsSyncer as? CloudKitRomsSyncer
+        let saveStatesSyncer = self.saveStatesSyncer as? CloudKitSaveStatesSyncer
+        let biosSyncer = self.biosSyncer as? CloudKitBIOSSyncer
+
+        guard romSyncer != nil || saveStatesSyncer != nil || biosSyncer != nil else {
+            DLOG("Metadata bootstrap skipped (\(reason)) - no CloudKit syncers available.")
+            return
+        }
+
+        let syncLog = Self.syncLog
+        syncLog.event(.sync, item: "metadata/bootstrap", status: .inProgress, detail: "syncers: ROMs=\(romSyncer != nil), SaveStates=\(saveStatesSyncer != nil), BIOS=\(biosSyncer != nil)")
+
+        syncLog.event(.start, item: "metadata/bootstrap", status: .inProgress, detail: reason)
+
+        var totalProcessed = 0
+
+        // Process ROM metadata first so save states can resolve games reliably on fresh installs.
+        if let romSyncer = romSyncer, shouldSyncROMContent() {
+            let count = await romSyncer.syncMetadataOnly()
+            totalProcessed += count
+        } else {
+            DLOG("[SYNC] Skipping ROM metadata bootstrap due to content settings.")
+        }
+
+        if let saveStatesSyncer = saveStatesSyncer, shouldSyncSaveStateContent() {
+            let count = await saveStatesSyncer.syncMetadataOnly()
+            totalProcessed += count
+        } else {
+            DLOG("[SYNC] Skipping save-state metadata bootstrap due to content settings.")
+        }
+
+        // BIOS metadata is independent of ROM/save-state ordering.
+        if let biosSyncer = biosSyncer {
+            totalProcessed += await biosSyncer.syncMetadataOnly()
+        }
+
+        syncLog.event(.complete, item: "metadata/bootstrap", status: .ok, detail: "\(reason) - processed \(totalProcessed) records")
+    }
+
+    // MARK: - Private Methods
+
+    /// Fetch remote changes from CloudKit
+    private func fetchRemoteChanges() async {
+        DLOG("Starting to fetch remote changes via task coordinator...")
+        let coordinator = taskCoordinator
+        let syncLog = Self.syncLog
+
+        // ── Task 1: ROM metadata (highest priority, serial) ──────────────
+        var metadataTaskID: UUID?
+        if romsSyncer != nil, shouldSyncROMContent() {
+            metadataTaskID = await coordinator.submit(
+                to: .metadata,
+                kind: .metadataSync,
+                priority: .metadataSync
+            ) { [weak self] in
+                guard let self else { return }
+                DLOG("Fetching remote ROM metadata (zone change token incremental)...")
+                await CloudKitSyncerStore.shared.refreshRomRemoteChanges()
+                DLOG("Finished applying remote ROM metadata changes")
+            }
+        }
+
+        // ── Task 2: Per-game artwork tasks (chained after metadata) ──────
+        let artworkDeps: Set<UUID> = metadataTaskID.map { [$0] } ?? []
+        // Submit a triage task that fans out into per-game artwork tasks
+        _ = await coordinator.submit(
+            to: .artwork,
+            kind: .custom(description: "artwork-triage"),
+            priority: .artworkRedownload,
+            dependencies: artworkDeps
+        ) { [weak self] in
+            guard let self, let syncer = self.romsSyncer as? CloudKitRomsSyncer else { return }
+            await syncer.submitArtworkTasks(to: coordinator)
+        }
+
+        // ── Task 3: Save state changes (chained after metadata) ──────────
+        if saveStatesSyncer != nil, shouldSyncSaveStateContent() {
+            await coordinator.submit(
+                to: .saveState,
+                kind: .custom(description: "save-state-sync"),
+                priority: .saveStateScreenshot,
+                dependencies: artworkDeps
+            ) { [weak self] in
+                guard let self, let syncer = self.saveStatesSyncer else { return }
+                DLOG("Fetching remote save state changes...")
+                do {
+                    _ = try await syncer.loadAllFromCloud(iterationComplete: nil).toAsync()
+                    DLOG("Successfully fetched remote save state changes")
+                } catch {
+                    syncLog.event(.download, item: "remote/save-states", status: .failed, detail: error.localizedDescription)
+                    throw error
+                }
+            }
+        }
+
+        // ── Task 4: BIOS + non-database files (chained after metadata) ───
+        if nonDatabaseSyncer != nil {
+            await coordinator.submit(
+                to: .bios,
+                kind: .custom(description: "bios-nondb-sync"),
+                priority: .biosSync,
+                dependencies: artworkDeps
+            ) { [weak self] in
+                guard let self, let syncer = self.nonDatabaseSyncer else { return }
+                DLOG("Fetching remote non-database file changes...")
+                do {
+                    _ = try await syncer.loadAllFromCloud(iterationComplete: nil).toAsync()
+                    DLOG("Successfully fetched remote non-database file changes")
+                } catch {
+                    syncLog.event(.download, item: "remote/non-database", status: .failed, detail: error.localizedDescription)
+                    throw error
+                }
+
+                // Bidirectional sweep: upload local Battery States / Screenshots /
+                // Cheats / DeltaSkins that aren't yet (or are newer than) what's in
+                // CloudKit. Without this, those directories never round-trip — fixes
+                // tester report that battery saves never appeared in iCloud.
+                // `forceSyncFiles` is per-directory and internally diffs by modified
+                // date, so re-running it is cheap when there's nothing new.
+                let directories = CloudKitNonDatabaseSyncer.defaultDirectories()
+                for directory in directories {
+                    do {
+                        try await syncer.forceSyncFiles(in: directory).toAsync()
+                    } catch {
+                        syncLog.event(.upload, item: "local/\(directory)", status: .failed, detail: error.localizedDescription)
+                        // Continue with remaining directories — one failure shouldn't block the others.
+                    }
+                }
+            }
+        }
+
+        DLOG("All sync tasks submitted to coordinator")
+    }
+
+    /// Initialize sync providers
+    private func initializeSyncProviders() {
+        var syncMode = Defaults[.iCloudSyncMode]
+
+        // Ensure tvOS always uses CloudKit
+        #if os(tvOS)
+        if !syncMode.isCloudKit {
+            Self.syncLog.event(.sync, item: "providers/init", status: .pending, detail: "tvOS does not support iCloud Drive, switching to CloudKit mode")
+            syncMode = .cloudKit
+            Defaults[.iCloudSyncMode] = .cloudKit
+        }
+        #endif
+
+        DLOG("Initializing sync providers for mode: \(syncMode.description)...")
+        updateSyncStatus(.initializing)
+
+        // Validate CloudKit container configuration
+        guard let container = container, container.containerIdentifier != nil else {
+            Self.syncLog.event(.start, item: "providers/init", status: .failed, detail: "CloudKit container unavailable or identifier is nil")
+            updateSyncStatus(.error(CloudSyncError.missingDependency))
+            return
+        }
+
+        DLOG("CloudKit container validated: \(container.containerIdentifier!)")
+
+        // Use SyncProviderFactory to create syncers based on the selected mode
+        // 1. Initialize ROM Syncer using factory
+        self.romsSyncer = SyncProviderFactory.createROMSyncProvider(
+            container: container,
+            notificationCenter: .default,
+            errorHandler: errorHandler
+        )
+        self.romsSyncer?.workQueue = romsQueue
+
+        if let ckRomsSyncer = self.romsSyncer as? CloudKitRomsSyncer {
+            if localGameSyncMonitor == nil {
+                localGameSyncMonitor = LocalGameSyncMonitor(romsSyncer: ckRomsSyncer)
+            }
+            localGameSyncMonitor?.startMonitoring()
+        } else {
+            localGameSyncMonitor?.stopMonitoring()
+            localGameSyncMonitor = nil
+        }
+
+        // 2. Initialize Save States Syncer using factory
+        self.saveStatesSyncer = SyncProviderFactory.createSaveStatesSyncProvider(
+            notificationCenter: .default,
+            errorHandler: errorHandler
+        )
+        self.saveStatesSyncer?.workQueue = saveStatesQueue
+
+        // 3. Initialize BIOS Syncer using factory
+        self.biosSyncer = SyncProviderFactory.createBIOSSyncProvider(
+            notificationCenter: .default,
+            errorHandler: errorHandler
+        )
+        self.biosSyncer?.workQueue = biosQueue
+        Self.syncLog.event(.start, item: "providers/bios", status: self.biosSyncer != nil ? .ok : .failed)
+
+        // 4. Initialize Non-Database Syncer (CloudKit only for now)
+        // Non-database syncer should exclude BIOS so BIOS files are handled only by the BIOS syncer.
+        var nonDBSyncDirectories: Set<String> = [
+            "Battery States",
+            "Screenshots"
+//            "RetroArch"
+        ]
+        if DeltaSkinSyncSupport.isEnabled {
+            nonDBSyncDirectories.insert(DeltaSkinSyncSupport.directoryName)
+        }
+        self.nonDatabaseSyncer = SyncProviderFactory.createNonDatabaseSyncProvider(
+            container: container,
+            for: nonDBSyncDirectories,
+            notificationCenter: .default,
+            errorHandler: errorHandler
+        )
+        self.nonDatabaseSyncer?.workQueue = nonDbQueue
+
+        // TODO: Support partial init
+
+        // Check if all initializations were successful (optional, depends on initializer throwing)
+        if romsSyncer == nil || saveStatesSyncer == nil || nonDatabaseSyncer == nil {
+            Self.syncLog.event(.start, item: "providers/init", status: .failed, detail: "One or more CloudKit sync providers failed to initialize")
+            updateSyncStatus(.error(CloudSyncError.missingDependency)) // Use .missingDependency
+            // Optionally clear partially initialized syncers?
+            self.romsSyncer = nil
+            self.saveStatesSyncer = nil
+            self.nonDatabaseSyncer = nil
+        } else {
+            DLOG("CloudKit sync providers initialized successfully.")
+
+            // Configure CloudKitInitialSyncer with the initialized providers (optional: fails if CK container unavailable)
+            do {
+                try CloudKitInitialSyncer.configureShared(
+                    romsSyncer: romsSyncer!,
+                    saveStatesSyncer: saveStatesSyncer!,
+                    nonDatabaseSyncer: nonDatabaseSyncer!
+                )
+                DLOG("CloudKitInitialSyncer configured with dependency injection.")
+            } catch {
+                let syncError = (error as? CloudSyncError) ?? CloudSyncError.cloudKitError(error)
+                Self.syncLog.event(.start, item: "providers/initial-syncer", status: .failed, detail: "CloudKitInitialSyncer could not be configured: \(syncError.localizedDescription). Initial batch sync disabled; ROM/save-state syncers remain available.")
+                updateSyncStatus(.error(syncError))
+                // Fallback: `CloudKitInitialSyncer.shared` stays nil; callers use optional chaining / guard.
+            }
+
+            // Don't immediately set to idle, let startSync manage state
+            // updateSyncStatus(.idle)
+
+            // Metadata bootstrap uses ROM/save-state syncers, not CloudKitInitialSyncer; run even if initial batch syncer failed.
+            startMetadataBootstrap(reason: "providers-initialized")
+        }
+    }
+
+    /// Register for notifications
+    private func registerForNotifications() {
+        // Remove existing observers first to prevent duplicates if called multiple times
+        for token in notificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        notificationTokens.removeAll()
+
+        // Observe when iCloud sync setting changes
+        let syncSettingToken = Defaults.publisher(.iCloudSync)
+            .sink { [weak self] change in
+                guard let self = self else { return }
+                ELOG("iCloud Sync setting changed to: \(change.newValue)")
+                self.handleSyncSettingChanged(enabled: change.newValue)
+            }
+            .store(in: &cancellables)
+
+        // Observe game additions/deletions (Realm Notifications)
+        // Keep existing Realm notifications for game changes
+        NotificationCenter.default.addObserver(self, selector: #selector(handleGameAdded(_:)), name: Notification.Name.PVGameImported, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleGameWillBeDeleted(_:)), name: .PVGameWillBeDeleted, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleSaveStateAdded(_:)), name: Notification.Name.PVSaveStateSaved, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleSaveStateWillBeDeleted(_:)), name: .PVSaveStateWillBeDeleted, object: nil)
+    }
+
+    /// Set up observers for sync setting changes and other relevant events
+    private func setupObservers() {
+        // Observe iCloud Sync setting changes using Combine
+        Defaults.publisher(.iCloudSync)
+            .sink { [weak self] change in
+                guard let self = self else { return }
+                ELOG("iCloud Sync setting changed to: \(change.newValue)")
+                self.handleSyncSettingChanged(enabled: change.newValue)
+            }
+            .store(in: &cancellables)
+
+        // Observe new PVSaveState creation using RxRealm
+        setupSaveStateObserver()
+
+        // Observe game additions/deletions (Realm Notifications)
+        // Keep existing Realm notifications for game changes
+        NotificationCenter.default.addObserver(self, selector: #selector(handleGameAdded(_:)), name: Notification.Name.PVGameImported, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleGameWillBeDeleted(_:)), name: .PVGameWillBeDeleted, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleSaveStateAdded(_:)), name: Notification.Name.PVSaveStateSaved, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleSaveStateWillBeDeleted(_:)), name: .PVSaveStateWillBeDeleted, object: nil)
+
+        // Add observer for app returning from background
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                Task {
+                    await CloudKitSyncerStore.shared.refreshRomRemoteChanges()
+                    await self.checkForMissingROMFiles(force: false)
+                }
+            }
+        )
+
+        notificationTokens.append(
+            NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleIntegrityAudit(reason: "app background")
+            }
+        )
+    }
+
+    /// Set up RxRealm observer for new PVSaveState creation
+    private func setupSaveStateObserver() {
+        saveStateObserverQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try Realm()
+            } catch {
+                Self.syncLog.event(.start, item: "save-state/observer", status: .failed, detail: "Failed to initialize Realm: \(error.localizedDescription)")
+                return
+            }
+
+            let realm: Realm
+            do {
+                realm = try Realm()
+            } catch {
+                Self.syncLog.event(.start, item: "save-state/observer", status: .failed, detail: "Failed to open Realm: \(error.localizedDescription)")
+                return
+            }
+
+            let results = realm.objects(PVSaveState.self)
+            self.saveStateToken = results.observe(on: self.saveStateObserverQueue) { [weak self] change in
+                guard let self else { return }
+
+                if CloudKitRemoteApplyGuard.isApplyingRemoteChanges {
+                    return
+                }
+
+                guard Defaults[.iCloudSync] else { return }
+
+                switch change {
+                case .initial:
+                    return
+                case .update(let collection, _, let insertions, _):
+                    guard !insertions.isEmpty else { return }
+
+                    // Skip enqueueing uploads while emulation is active to avoid I/O during gameplay
+                    if self.isPausedForEmulation {
+                        DLOG("[SYNC] Skipping save-state upload enqueue (paused for emulation)")
+                        return
+                    }
+
+                    let newSaveStates = insertions.compactMap { idx -> PVSaveState? in
+                        guard idx < collection.count else { return nil }
+                        let ss = collection[idx]
+                        guard !ss.isInvalidated else { return nil }
+                        if let cloudRecordID = ss.cloudRecordID, !cloudRecordID.isEmpty { return nil }
+                        return ss.freeze()
+                    }
+
+                    guard !newSaveStates.isEmpty else { return }
+
+                    for saveState in newSaveStates {
+                        let title = saveState.game?.title ?? "Unknown"
+                        Task {
+                            await CloudKitUploadQueueActor.shared.enqueueSaveStateUpload(
+                                saveStateID: saveState.id,
+                                gameTitle: title,
+                                priority: .high
+                            )
+                        }
+                    }
+                case .error(let error):
+                    Self.syncLog.event(.sync, item: "save-state/observer", status: .failed, detail: error.localizedDescription)
+                    Task { [weak self] in
+                        await self?.errorHandler.handle(error: error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles changes to the iCloud sync setting
+    /// - Parameter enabled: Whether iCloud sync is now enabled
+    private func handleSyncSettingChanged(enabled: Bool) {
+        if enabled {
+            ILOG("iCloud Sync Enabled")
+            // Re-initialize providers if they weren't already
+            if romsSyncer == nil || saveStatesSyncer == nil || nonDatabaseSyncer == nil {
+                initializeSyncProviders()
+            }
+            startMetadataBootstrap(reason: "settings-toggle")
+            // Perform account check and potentially start initial sync
+            Task { // Wrap async call in Task
+                await self.checkAccountStatusAndSetupIfNeeded() // Add self.
+            }
+        } else {
+            ILOG("iCloud Sync Disabled")
+            // Clear sync providers and stop any ongoing operations
+            // TODO: Implement cancellation logic for ongoing syncs
+            romsSyncer = nil
+            saveStatesSyncer = nil
+            nonDatabaseSyncer = nil
+            localGameSyncMonitor?.stopMonitoring()
+            localGameSyncMonitor = nil
+            updateSyncStatus(.disabled)
+        }
+    }
+
+    /// Checks CloudKit account status and initiates setup if needed.
+    private func checkAccountStatusAndSetupIfNeeded() async {
+        DLOG("Checking CloudKit account status...")
+
+        let syncLog = Self.syncLog
+        guard let container = container else {
+            syncLog.event(.check, item: "account/status", status: .skipped, detail: "CloudKit container unavailable")
+            updateSyncStatus(.disabled)
+            return
+        }
+
+        do {
+            let accountStatus = try await container.accountStatus()
+
+            // Log account status for debugging
+            syncLog.event(.check, item: "account/status", status: .ok, detail: "status=\(accountStatus.rawValue)")
+
+            switch accountStatus {
+            case .available:
+                syncLog.event(.check, item: "account/status", status: .ok, detail: "Account available, proceeding with sync setup")
+                // Verify container identifier is configured
+                guard container.containerIdentifier != nil else {
+                    syncLog.event(.check, item: "account/container", status: .failed, detail: "CloudKit container identifier is nil")
+                    updateSyncStatus(.error(CloudSyncError.missingDependency))
+                    return
+                }
+
+                // Account is good, proceed with sync
+                await startSync()
+
+            case .noAccount:
+                syncLog.event(.check, item: "account/status", status: .failed, detail: "No iCloud account configured")
+                updateSyncStatus(.error(CloudSyncError.noAccount))
+                // Post notification for UI to show helpful message
+                NotificationCenter.default.post(name: .iCloudSyncAccountNotAvailable, object: nil)
+
+            case .restricted:
+                syncLog.event(.check, item: "account/status", status: .failed, detail: "iCloud account restricted (e.g., parental controls)")
+                updateSyncStatus(.error(CloudSyncError.accountRestricted))
+                NotificationCenter.default.post(name: .iCloudSyncAccountRestricted, object: nil)
+
+            case .couldNotDetermine:
+                syncLog.event(.check, item: "account/status", status: .pending, detail: "Could not determine iCloud account status")
+                updateSyncStatus(.error(CloudSyncError.accountStatusUnknown))
+                // Retry after a short delay
+                Task {
+                    try await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+                    await checkAccountStatusAndSetupIfNeeded()
+                }
+
+            case .temporarilyUnavailable:
+                syncLog.event(.check, item: "account/status", status: .pending, detail: "iCloud account temporarily unavailable, will retry in 30s")
+                updateSyncStatus(.error(CloudSyncError.accountTemporarilyUnavailable))
+
+                // Schedule a retry after a delay
+                Task {
+                    try await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+                    await checkAccountStatusAndSetupIfNeeded()
+                }
+
+            @unknown default:
+                syncLog.event(.check, item: "account/status", status: .failed, detail: "Unknown iCloud account status: \(accountStatus.rawValue)")
+                updateSyncStatus(.error(CloudSyncError.accountStatusUnknown))
+            }
+
+        } catch {
+            syncLog.event(.check, item: "account/status", status: .failed, detail: error.localizedDescription)
+
+            // Provide more specific error handling
+            if let ckError = error as? CKError {
+                switch ckError.code {
+                case .networkUnavailable, .networkFailure:
+                    syncLog.event(.check, item: "account/network", status: .failed, detail: "Network unavailable while checking CloudKit account status")
+                    updateSyncStatus(.error(CloudSyncError.cloudKitError(error)))
+                case .serviceUnavailable:
+                    syncLog.event(.check, item: "account/service", status: .failed, detail: "CloudKit service unavailable, will retry later")
+                    updateSyncStatus(.error(CloudSyncError.cloudKitError(error)))
+                    Task {
+                        try await Task.sleep(nanoseconds: 30_000_000_000)
+                        await checkAccountStatusAndSetupIfNeeded()
+                    }
+                default:
+                    updateSyncStatus(.error(CloudSyncError.cloudKitError(error)))
+                }
+            } else {
+                updateSyncStatus(.error(CloudSyncError.cloudKitError(error)))
+            }
+        }
+    }
+
+    // MARK: - Notification Handlers
+    @MainActor
+    @objc private func handleGameAdded(_ notification: Notification) {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer else {
+            DLOG("CloudKit sync disabled or ROM syncer not available. Skipping game upload.")
+            return
+        }
+
+        // Skip CloudKit upload while emulation is active
+        if isPausedForEmulation {
+            DLOG("[SYNC] Skipping game-added upload (paused for emulation)")
+            return
+        }
+
+        // Extract filename from notification userInfo
+        let fileName = notification.userInfo?[PVNotificationUserInfoKeys.fileNameKey] as? String
+        let md5 = notification.userInfo?[PVNotificationUserInfoKeys.md5Key] as? String
+
+        DLOG("Game imported notification received: \(fileName ?? "nil") \(md5 ?? "nil")")
+
+        // Resolve the game on main actor (Realm observation requires it),
+        // then move the heavy upload work off-main to avoid blocking the UI.
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            guard let game = await self.resolveImportedGame(md5: md5, fileName: fileName) else {
+                if let md5 {
+                    DLOG("Game with MD5 \(md5) not found for upload (after waiting)")
+                } else if let fileName {
+                    DLOG("Game with filename \(fileName) not found for upload (after waiting)")
+                } else {
+                    DLOG("Missing fileName or md5 in gameAdded notification")
+                }
+                return
+            }
+
+            // Skip contentless placeholder games
+            if game.contentless {
+                DLOG("Skipping CloudKit upload for contentless placeholder game: \(game.title)")
+                return
+            }
+
+            // Skip games that came from CloudKit (they already have a cloud record and no local file)
+            if !game.isDownloaded {
+                DLOG("Skipping CloudKit upload for game without local file: \(game.title) (isDownloaded=false)")
+                return
+            }
+
+            // Skip games that already have a cloud record and haven't been modified locally
+            // (this prevents re-uploading games that were just synced from CloudKit)
+            if let cloudRecordID = game.cloudRecordID, !cloudRecordID.isEmpty, game.hasCloudAssets {
+                DLOG("Skipping CloudKit upload for game already synced: \(game.title) (cloudRecordID=\(cloudRecordID))")
+                return
+            }
+
+            // Verify the local file actually exists before attempting upload
+            if let fileURL = game.file?.url {
+                guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                    DLOG("Skipping CloudKit upload: local file does not exist for game \(game.title) at \(fileURL.path)")
+                    return
+                }
+            } else {
+                DLOG("Skipping CloudKit upload: game \(game.title) has no file reference")
+                return
+            }
+
+            // Freeze the game while still on main actor (safe Realm snapshot),
+            // then detach to perform the network upload off the main thread.
+            let frozenGame = game.freeze()
+            Self.syncLog.event(.upload, item: "rom/\(frozenGame.title)", status: .inProgress, detail: "MD5: \(frozenGame.md5Hash)")
+
+            Task.detached { [weak self] in
+                guard let self = self else { return }
+                do {
+                    try await self.uploadROM(for: frozenGame)
+                    Self.syncLog.event(.upload, item: "rom/\(frozenGame.title)", status: .ok, detail: "Newly imported game uploaded")
+                } catch {
+                    Self.syncLog.event(.upload, item: "rom/\(frozenGame.title)", status: .failed, detail: error.localizedDescription)
+                    await self.errorHandler.handle(error: error)
+                    self.updateSyncStatus(.error(error))
+                }
+            }
+        }
+    }
+
+    @objc private func handleGameWillBeDeleted(_ notification: Notification) {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer, let md5 = notification.userInfo?["md5"] as? String else { return }
+        DLOG("Game will be deleted, marking in CloudKit: MD5 \(md5)")
+        Task {
+            do {
+                try await romsSyncer.markGameAsDeleted(md5: md5)
+            } catch {
+                Self.syncLog.event(.delete, item: "rom/\(md5)", status: .failed, detail: error.localizedDescription)
+                await errorHandler.handle(error: error)
+                // Update status? Or rely on errorHandler?
+                updateSyncStatus(.error(error))
+            }
+        }
+    }
+
+    @objc private func handleSaveStateAdded(_ notification: Notification) {
+        guard Defaults[.iCloudSync], let saveState = notification.object as? PVSaveState else { return }
+        DLOG("Save state added, uploading: \(saveState.file?.fileName ?? "unknown") for game \(saveState.game.title)")
+        Task {
+            do {
+                try await uploadSaveState(for: saveState)
+            } catch {
+                // Error already logged and status updated in uploadSaveState
+                // errorHandler.handle(error: error) // Potentially redundant if uploadSaveState handles it
+            }
+        }
+    }
+
+    @objc private func handleSaveStateWillBeDeleted(_ notification: Notification) {
+        guard Defaults[.iCloudSync],
+              let saveStatesSyncer = saveStatesSyncer as? CloudKitSaveStatesSyncer,
+              let cloudRecordID = notification.userInfo?["cloudRecordID"] as? String else { return }
+        DLOG("Save state will be deleted, removing from CloudKit: \(cloudRecordID)")
+        Task {
+            do {
+                try await saveStatesSyncer.deleteSaveStateFromCloudKit(cloudRecordID: cloudRecordID)
+            } catch {
+                Self.syncLog.event(.delete, item: "save-state/\(cloudRecordID)", status: .failed, detail: error.localizedDescription)
+                await errorHandler.handle(error: error)
+            }
+        }
+    }
+
+    // MARK: - Realm Database Access (Example - adjust as needed)
+
+    // Example accessors - Replace with actual implementation if different
+    // Ensure these are accessible from this context
+    private var gameDatabase: RomDatabase {
+        return RomDatabase.sharedInstance
+    }
+
+    // MARK: - Missing ROM File Detection
+
+    /// Checks all PVGame objects to verify if their local files exist
+    /// If a file doesn't exist locally or lacks a CloudKit record, mark it for sync
+    /// - Parameter force: Force check even for games that are already marked as not downloaded
+    //@MainActor
+    public func checkForMissingROMFiles(force: Bool) async {
+        guard Defaults[.iCloudSync], let romsSyncer = romsSyncer else {
+            DLOG("iCloud sync disabled or syncer not available. Skipping missing ROM file check.")
+            return
+        }
+
+        let syncLog = Self.syncLog
+        syncLog.event(.check, item: "rom/missing-files", status: .inProgress)
+        updateSyncStatus(.syncing, info: ["action": "checking_missing_files"])
+
+        let fileManager = FileManager.default
+        var markedGamesCount = 0
+        let isPausedForEmulation = await MainActor.run(body: { self.isPausedForEmulation })
+
+        do {
+            // Filter out contentless games (virtual entries for systems that boot without ROMs)
+            let frozenGames: [PVGame]
+            do {
+                frozenGames = try await RealmContext.withRealm { realm in
+                    Array(realm.objects(PVGame.self)
+                        .filter("contentless == false")
+                        .map { $0.freeze() })
+                }
+            } catch {
+                syncLog.event(.check, item: "rom/missing-files", status: .failed, detail: "Failed to fetch games: \(error.localizedDescription)")
+                return
+            }
+            DLOG("Checking \(frozenGames.count) games for missing files (excluding contentless)")
+
+            let batchSize = 50
+            let totalGames = frozenGames.count
+            for batchStart in stride(from: 0, to: totalGames, by: batchSize) {
+                let batchEnd = min(batchStart + batchSize, totalGames)
+                let batch = Array(frozenGames[batchStart..<batchEnd])
+                var md5sToMarkForSync: [String] = []
+
+                for frozenGame in batch {
+                    let game = frozenGame
+                    // Skip games that are already marked as not downloaded unless forced
+                    if !force && !game.isDownloaded {
+                        continue
+                    }
+
+                    // Check if the file exists locally
+                    let fileExists = await checkIfGameFileExists(game)
+
+                    // Check if a CloudKit record exists for this game.
+                    //
+                    // IMPORTANT:
+                    // - Do NOT fetch per-game records from CloudKit here (that will hammer CK and keep the app busy for minutes).
+                    // - Use local state. ROM metadata bootstrap / remote change fetch is responsible for populating cloudRecordID.
+                    //
+                    // When emulation is running, CloudKit fetches are intentionally suppressed; treat record existence as "unknown".
+                    let recordExists: Bool
+                    if isPausedForEmulation {
+                        recordExists = true
+                    } else {
+                        recordExists = (game.cloudRecordID?.isEmpty == false)
+                    }
+
+                    // If the file doesn't exist locally but a record exists in CloudKit
+                    // OR if the game is marked as downloaded but the file is missing
+                    // THEN mark it for sync
+                    if (!fileExists && recordExists) || (game.isDownloaded && !fileExists) {
+                        md5sToMarkForSync.append(game.md5Hash.uppercased())
+                        markedGamesCount += 1
+                    }
+                }
+
+                if !md5sToMarkForSync.isEmpty {
+                    await markGamesForSync(md5s: md5sToMarkForSync)
+                }
+
+                // Yield to let the system breathe during long scans
+                try? await Task.sleep(nanoseconds: 5_000_000) // 5ms
+            }
+
+        } catch {
+            syncLog.event(.check, item: "rom/missing-files", status: .failed, detail: error.localizedDescription)
+            updateSyncStatus(.error(error))
+            return
+        }
+
+        syncLog.event(.check, item: "rom/missing-files", status: .ok, detail: "Marked \(markedGamesCount) games for sync")
+        updateSyncStatus(.idle)
+    }
+
+    /// Check if a game's file exists locally
+    /// - Parameter game: The game to check
+    /// - Returns: True if the file exists, false otherwise
+    private func checkIfGameFileExists(_ game: PVGame) async -> Bool {
+        guard let url = game.file?.url else {
+            DLOG("Game \(game.title) has no file URL.")
+            return false
+        }
+
+        let fileManager = FileManager.default
+        let exists = fileManager.fileExists(atPath: url.path)
+
+        if !exists {
+            DLOG("File not found for game \(game.title): \(url.path)")
+        }
+
+        return exists
+    }
+
+    /// Check if a CloudKit record exists for the game
+    /// - Parameters:
+    ///   - md5: The MD5 hash of the game
+    ///   - syncer: The ROM syncer to use
+    /// - Returns: True if a record exists, false otherwise
+    private func checkIfCloudRecordExists(md5: String, syncer: RomsSyncing) async -> Bool {
+        // Create record ID based on the MD5 hash using schema's conventions
+        let recordID = CloudKitSchema.RecordIDGenerator.romRecordID(md5: md5)
+
+        do {
+            // Using CloudKitRomsSyncer's existing method to fetch record
+            if let syncer = syncer as? CloudKitRomsSyncer {
+                let record = try await syncer.fetchRecord(recordID: recordID)
+                return record != nil
+            }
+            return false
+        } catch {
+            // Handle record not found gracefully without logging errors for expected cases
+            if let ckError = error as? CKError, ckError.code == .unknownItem {
+                DLOG("No CloudKit record found for game with MD5 \(md5)")
+                return false
+            }
+
+            Self.syncLog.event(.check, item: "rom/\(md5)", status: .failed, detail: "Error checking CloudKit record: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Mark a game as needing sync (not downloaded)
+    /// - Parameters:
+    ///   - game: The game to mark
+    ///   - realm: The Realm instance to use
+    @MainActor
+    private func markGameForSync(game: PVGame) {
+        let realm = RomDatabase.sharedInstance.realm
+
+        // Get live game reference on main thread
+        let liveGame: PVGame? = game.isFrozen ? game.thaw() : realm.object(ofType: PVGame.self, forPrimaryKey: game.md5Hash)
+
+        guard let gameToUpdate = liveGame else {
+            Self.syncLog.event(.sync, item: "rom/mark-for-sync", status: .failed, detail: "Game failed to resolve for sync marking")
+            return
+        }
+
+        do {
+            // Re-check file existence using FileLocationResolver with filename
+            // fallback so stale partialPath doesn't cause a spurious downgrade.
+            let candidates = GameFileStatusService.candidateFilenames(for: gameToUpdate)
+            let resolution = FileLocationResolver.shared.resolve(
+                partialPath: gameToUpdate.file?.partialPath,
+                systemIdentifier: gameToUpdate.systemIdentifier,
+                candidateFilenames: candidates
+            )
+            if let foundURL = resolution.url {
+                // Repair stale partialPath in-place so subsequent resolves hit directly.
+                if let repaired = FileLocationResolver.shared.relativePath(for: foundURL),
+                   gameToUpdate.file?.partialPath != repaired {
+                    try? realm.write {
+                        gameToUpdate.file?.partialPath = repaired
+                    }
+                }
+                Self.syncLog.event(.sync, item: "rom/\(gameToUpdate.title)", status: .ok, detail: "Skipped markForSync — file found via resolver")
+                return
+            }
+            try realm.write {
+                gameToUpdate.isDownloaded = false
+                gameToUpdate.requiresSync = true
+                gameToUpdate.lastCloudSyncDate = nil
+            }
+            Self.syncLog.event(.sync, item: "rom/\(gameToUpdate.title)", status: .ok, detail: "Marked for sync (MD5: \(gameToUpdate.md5Hash ?? "N/A"), isDownloaded=false, requiresSync=true)")
+        } catch {
+            Self.syncLog.event(.sync, item: "rom/\(gameToUpdate.title)", status: .failed, detail: "Failed to mark for sync: \(error.localizedDescription)")
+        }
+    }
+
+    /// Batch-mark games as needing sync (file missing locally, but CloudKit record is expected to exist).
+    /// This avoids per-game MainActor hops and per-game Realm write commits.
+    private func markGamesForSync(md5s: [String]) async {
+        guard !md5s.isEmpty else { return }
+
+        do {
+            try await RealmContext.withBackgroundRealm { realm in
+                try CloudKitRemoteApplyGuard.withApplyingRemoteChanges {
+                    try realm.write {
+                        for md5 in md5s {
+                            guard let game = realm.object(ofType: PVGame.self, forPrimaryKey: md5) else { continue }
+                            // Use combined resolver (partialPath + filename fallback) so a
+                            // stale partialPath doesn't cause a spurious downgrade.
+                            let candidates = GameFileStatusService.candidateFilenames(for: game)
+                            let resolution = FileLocationResolver.shared.resolve(
+                                partialPath: game.file?.partialPath,
+                                systemIdentifier: game.systemIdentifier,
+                                candidateFilenames: candidates
+                            )
+                            if let foundURL = resolution.url {
+                                if let repaired = FileLocationResolver.shared.relativePath(for: foundURL),
+                                   game.file?.partialPath != repaired {
+                                    game.file?.partialPath = repaired
+                                }
+                                DLOG("markGamesForSync: skipping \(game.title) — file found via resolver")
+                                continue
+                            }
+                            game.isDownloaded = false
+                            game.requiresSync = true
+                            game.lastCloudSyncDate = nil
+                        }
+                    }
+                }
+            }
+        } catch {
+            Self.syncLog.event(.sync, item: "rom/batch-mark", status: .failed, detail: "count=\(md5s.count): \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Imported Game Resolution Helpers
+
+    @MainActor
+    private func resolveImportedGame(md5: String?, fileName: String?, timeout: TimeInterval = 5) async -> PVGame? {
+        if let md5 = md5?.uppercased() {
+            let predicate = NSPredicate(format: "md5Hash == %@", md5)
+            if let game = await waitForGame(matching: predicate, timeout: timeout) {
+                return game
+            }
+        }
+
+        if let fileName = fileName {
+            let predicate = NSPredicate(format: "romPath CONTAINS[c] %@", fileName)
+            if let game = await waitForGame(matching: predicate, timeout: timeout) {
+                return game
+            }
+        }
+
+        return nil
+    }
+
+    @MainActor
+    private func waitForGame(matching predicate: NSPredicate, timeout: TimeInterval) async -> PVGame? {
+        let realm = RomDatabase.sharedInstance.realm
+        let results = realm.objects(PVGame.self).filter(predicate)
+
+        if let existing = results.first {
+            // Freeze immediately so the returned object is safe to read from any
+            // thread, even after the Realm read transaction ends.
+            return existing.freeze()
+        }
+
+        return await withCheckedContinuation { continuation in
+            var token: NotificationToken?
+            var hasResumed = false
+
+            func finish(with game: PVGame?) {
+                guard !hasResumed else { return }
+                hasResumed = true
+                token?.invalidate()
+                continuation.resume(returning: game)
+            }
+
+            token = results.observe { change in
+                switch change {
+                case .initial(let collection), .update(let collection, _, _, _):
+                    if let game = collection.first {
+                        // Freeze the live Realm object before handing it to the
+                        // continuation. `finish` may also be invoked from the
+                        // timeout Task on a different queue; a frozen object is
+                        // thread-safe and never invalidated.
+                        finish(with: game.freeze())
+                    }
+                case .error(let error):
+                    ELOG("Realm observation error while waiting for game: \(error.localizedDescription)")
+                    finish(with: nil)
+                }
+            }
+
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                await MainActor.run {
+                    if !hasResumed {
+                        WLOG("Timed out waiting for ROM to appear in Realm (predicate: \(predicate.predicateFormat))")
+                        finish(with: nil)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Emulation Pause/Resume (legacy wrappers)
+
+    /// Legacy convenience — delegates to `pause(reason: .emulation)`
+    @MainActor
+    public func pauseForEmulation() {
+        pause(reason: .emulation)
+    }
+
+    /// Legacy convenience — delegates to `resume(reason: .emulation)`
+    @MainActor
+    public func resumeFromEmulation() {
+        resume(reason: .emulation)
+    }
+}
+
+// MARK: - PausableService
+
+extension CloudSyncManager: PausableService {
+
+    public var serviceName: String { "CloudSyncManager" }
+
+    @MainActor
+    public func pause(reason: ServiceLifecycleReason) {
+        guard !activePauseReasons.contains(reason) else { return }
+        let wasRunning = activePauseReasons.isEmpty
+        activePauseReasons.insert(reason)
+
+        guard wasRunning else { return }
+
+        ILOG("CloudSyncManager: Pausing sync operations (reason: \(reason.rawValue))")
+
+        metadataBootstrapTask?.cancel()
+        integrityAuditTask?.cancel()
+        cancelAllActiveSyncTasks()
+
+        metadataQueue.isSuspended = true
+        romsQueue.isSuspended = true
+        saveStatesQueue.isSuspended = true
+        biosQueue.isSuspended = true
+        nonDbQueue.isSuspended = true
+
+        metadataQueue.cancelAllOperations()
+        romsQueue.cancelAllOperations()
+        saveStatesQueue.cancelAllOperations()
+        biosQueue.cancelAllOperations()
+        nonDbQueue.cancelAllOperations()
+
+        // Pause the task coordinator (stops all queued sync tasks)
+        Task { await taskCoordinator.pauseAll() }
+
+        romsSyncer?.workQueue?.isSuspended = true
+        saveStatesSyncer?.workQueue?.isSuspended = true
+        biosSyncer?.workQueue?.isSuspended = true
+
+        if reason == .emulation {
+            Task { await CloudKitUploadQueueActor.shared.setEmulatorSessionUploadsPaused(true) }
+        }
+    }
+
+    @MainActor
+    public func resume(reason: ServiceLifecycleReason) {
+        guard activePauseReasons.contains(reason) else { return }
+        activePauseReasons.remove(reason)
+
+        guard activePauseReasons.isEmpty else {
+            ILOG("CloudSyncManager: Cleared reason \(reason.rawValue) but still paused for: \(activePauseReasons.map(\.rawValue))")
+            return
+        }
+
+        ILOG("CloudSyncManager: Resuming sync operations (cleared: \(reason.rawValue))")
+
+        metadataQueue.isSuspended = false
+        romsQueue.isSuspended = false
+        saveStatesQueue.isSuspended = false
+        biosQueue.isSuspended = false
+        nonDbQueue.isSuspended = false
+
+        // Resume the task coordinator
+        Task { await taskCoordinator.resumeAll() }
+
+        romsSyncer?.workQueue?.isSuspended = false
+        saveStatesSyncer?.workQueue?.isSuspended = false
+        biosSyncer?.workQueue?.isSuspended = false
+
+        if Defaults[.iCloudSync] {
+            startMetadataBootstrap(reason: "resume-\(reason.rawValue)")
+        }
+
+        if reason == .emulation {
+            Task { await CloudKitUploadQueueActor.shared.setEmulatorSessionUploadsPaused(false) }
+        }
+    }
+}
+
+// MARK: - RxSwift to Swift Concurrency Helper (Placeholder)
+// TODO: Move this to a more appropriate location (e.g., Utils/Extensions)
+extension Completable {
+    func toAsync() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let disposable = self.subscribe(
+                onCompleted: { continuation.resume() },
+                onError: { continuation.resume(throwing: $0) }
+            )
+            // Note: This basic implementation doesn't handle cancellation propagation.
+            // Consider using Task.isCancelled within the Completable if needed,
+            // or managing the disposable lifecycle.
+            // disposable.dispose() // Don't dispose immediately
+        }
+    }
+}

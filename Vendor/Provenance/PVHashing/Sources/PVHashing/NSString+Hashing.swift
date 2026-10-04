@@ -1,0 +1,17 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+import Foundation
+
+public extension String {
+    var MD5: String {
+        let computed = Insecure.MD5.hash(data: data(using: .utf8)!)
+        return computed.map { String(format: "%02hhx", $0) }.joined()
+    }
+    
+    var md5Hash: String {
+        return self.MD5
+    }
+}

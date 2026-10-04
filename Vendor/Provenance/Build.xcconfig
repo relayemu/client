@@ -1,0 +1,130 @@
+// Configuration settings file format documentation can be found at:
+// https://help.apple.com/xcode/#/dev745c5c974
+
+MARKETING_VERSION = 3.4.0
+// Local build number. CI ignores this and overrides CURRENT_PROJECT_VERSION
+// with $(git rev-list --count HEAD) (.github/workflows/build.yml), so this
+// value only affects local builds. It had drifted to 2910 while CI shipped
+// ~9950, which meant a locally archived upload would be rejected by App Store
+// Connect as a lower build number than one already shipped. Bumped to the
+// commit count so local matches CI; it drifts behind as commits land, which is
+// harmless — only monotonic increase matters. Re-bump with:
+//   git rev-list --count HEAD
+CURRENT_PROJECT_VERSION = 9951
+
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) GLES_SILENCE_DEPRECATION=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) NONJAILBROKEN=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_DYNAMIC=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_CHEEVOS=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_RCHEEVOS=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_VULKAN=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_OPENAL=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_SDL2=1
+//GCC_PREPROCESSOR_DEFINITIONS = $(inherited) CITRA_ARCH_arm64 // Overrides boost
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) HAVE_COREAUDIO=1
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) ENABLE_VULKAN=1
+
+// ARM-only optimisation flags — these are rejected by clang on x86_64
+// (e.g. tvOS Simulator on Intel Macs, fat iOS sim builds). Gate them with
+// the [arch=arm64] specifier so they only apply to the ARM slice and the
+// x86_64 simulator slice can still build for development.
+OTHER_CFLAGS[arch=arm64] = $(inherited) -mcpu=apple-a10
+OTHER_CFLAGS[arch=arm64] = $(inherited) -mtune=apple-a12
+OTHER_CFLAGS[arch=arm64] = $(inherited) -march=armv8-a+simd+crc+crypto
+OTHER_CFLAGS = $(inherited) -ffast-math
+OTHER_CFLAGS = $(inherited) -ftree-vectorize
+OTHER_CFLAGS = $(inherited) -fno-strict-aliasing
+OTHER_CFLAGS = $(inherited) -fpermissive
+OTHER_CFLAGS = $(inherited) -fomit-frame-pointer
+OTHER_CFLAGS = $(inherited) -fPIC
+OTHER_CFLAGS = $(inherited) -fmodules
+OTHER_CFLAGS = $(inherited) -fcxx-modules
+OTHER_CFLAGS = $(inherited) -Wno-module-import-in-extern-c
+// Ensures generated Swift headers (e.g. PVCoreBridge-Swift.h referencing EAGLContext) compile without GLES deprecation noise in every TU.
+OTHER_CFLAGS = $(inherited) -DGLES_SILENCE_DEPRECATION=1
+
+// Vars to be overwritten by `CodeSigning.xcconfig` if exists
+DEVELOPMENT_TEAM = S32Z3HMYVQ
+ORG_IDENTIFIER = org.provenance-emu
+
+// Codesigning settings defined optionally, see `CodeSigning.xcconfig.example`
+#include? "CodeSigning.xcconfig"
+
+ORG_PREFIX = $(ORG_IDENTIFIER)
+
+PRODUCT_NAME = $(TARGET_NAME)
+//PRODUCT_NAME[configuration=Debug] = $(TARGET_NAME) 🐞
+
+ALPHA_BUNDLE_SUFFIX =
+_PRODUCT_BUNDLE_IDENTIFIER_ = $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX)
+PRODUCT_BUNDLE_IDENTIFIER = $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX)
+PRODUCT_BUNDLE_IDENTIFIER_LITE = $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX).lite
+//PRODUCT_BUNDLE_IDENTIFIER[configuration=Debug] = $(ORG_PREFIX).$(PROJECT_NAME:lower)-debug
+
+APP_GROUP_IDENTIFIER        = group.$(ORG_PREFIX).$(PROJECT_NAME:lower)
+ICLOUD_CONTAINER_IDENTIFIER = iCloud.$(ORG_PREFIX).$(PROJECT_NAME:lower)
+
+// ICONS
+ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = AppIcon-8bit1 AppIcon-8bit2 AppIcon-8bit3 AppIcon-8bit4 AppIcon-8bit5 AppIcon-Blue-Negative AppIcon-Blue AppIcon-Cyan AppIcon-Gem AppIcon-Gold AppIcon-Paint1 AppIcon-Paint2 AppIcon-Purple AppIcon-Seafoam AppIcon-Yellow
+ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = ProvenanceBlue
+
+// -- Entitlements based off of CodeSigning settings
+IOS_CODE_SIGN_ENTITLEMENTS_YES = Provenance/Provenance.entitlements
+IOS_CODE_SIGN_ENTITLEMENTS_AppStore = Provenance/Provenance-AppStore.entitlements
+IOS_CODE_SIGN_ENTITLEMENTS_JB = Provenance/Provenance-JB.entitlements
+IOS_CODE_SIGN_ENTITLEMENTS_NO = Provenance/Provenance-Free.entitlements
+IOS_CODE_SIGN_ENTITLEMENTS = $(IOS_CODE_SIGN_ENTITLEMENTS_$(DEVELOPER_ACCOUNT_PAID:default=NO))
+
+TVOS_CODE_SIGN_ENTITLEMENTS_YES = ProvenanceTV/ProvenanceTV.entitlements
+TVOS_CODE_SIGN_ENTITLEMENTS_AppStore = ProvenanceTV/ProvenanceTV-AppStore.entitlements
+TVOS_CODE_SIGN_ENTITLEMENTS_JB = ProvenanceTV/ProvenanceTV-JB.entitlements
+TVOS_CODE_SIGN_ENTITLEMENTS_NO = ProvenanceTV/ProvenanceTV-Free.entitlements
+TVOS_CODE_SIGN_ENTITLEMENTS = $(TVOS_CODE_SIGN_ENTITLEMENTS_$(DEVELOPER_ACCOUNT_PAID:default=NO))
+
+MAC_CODE_SIGN_ENTITLEMENTS_YES = Provenance/Provenance.entitlements
+MAC_CODE_SIGN_ENTITLEMENTS_NO = Provenance/Provenance-Free.entitlements
+MAC_CODE_SIGN_ENTITLEMENTS = $(MAC_CODE_SIGN_ENTITLEMENTS_$(DEVELOPER_ACCOUNT_VM_ACCESS:default=NO))
+
+CODE_SIGN_ENTITLEMENTS_iphoneos = $(IOS_CODE_SIGN_ENTITLEMENTS)
+CODE_SIGN_ENTITLEMENTS_appletvos = $(TVOS_CODE_SIGN_ENTITLEMENTS)
+CODE_SIGN_ENTITLEMENTS_macosx = $(MAC_CODE_SIGN_ENTITLEMENTS)
+
+CODE_SIGN_ENTITLEMENTS = $(CODE_SIGN_ENTITLEMENTS_$(PLATFORM_NAME))
+
+// CODE_SIGN_INJECT_BASE_ENTITLEMENTS = YES
+
+// -- Extension and Frameworks Bundle IDs --
+TOPSHELF_PRODUCT_BUNDLE_IDENTIFIER = $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX).topshelf
+SPOTLIGHT_PRODUCT_BUNDLE_IDENTIFIER = $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX).spotlight
+
+EXTENSION_PRODUCT_BUNDLE_IDENTIFIER =  $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX).$(PRODUCT_NAME:lower)
+
+WATCH_PRODUCT_BUNDLE_IDENTIFIER =  $(ORG_PREFIX).$(PROJECT_NAME:lower)$(ALPHA_BUNDLE_SUFFIX)-watch
+WATCH_APP_PRODUCT_BUNDLE_IDENTIFIER = $(WATCH_PRODUCT_BUNDLE_IDENTIFIER).watchkitapp
+WATCH_APP_EXTENSION_PRODUCT_BUNDLE_IDENTIFIER = $(WATCH_APP_PRODUCT_BUNDLE_IDENTIFIER).watchkitextension
+
+PVSUPPORT_PRODUCT_BUNDLE_IDENTIFIER = $(ORG_PREFIX).$(PROJECT_NAME:lower).PVSupport
+PVLIBRARY_PRODUCT_BUNDLE_IDENTIFIER = $(ORG_PREFIX).$(PROJECT_NAME:lower).PVLibrary
+
+// -- General Settings --
+ENABLE_BITCODE = NO
+
+// -- Simulator excludes --
+// Frameworks/xcframeworks that lack iOS/tvOS Simulator slices, plus heavy
+// cores (3DS, GC/Wii) that cannot usefully run in simulator anyway. These
+// names are matched against the basename in every build phase (link, embed,
+// copy resources), so listing them once here drops them from the AppStore
+// target's sim builds without affecting device. Other targets that don't
+// reference these names get a no-op. Round 2 can restore individual entries
+// after rebuilding the corresponding xcframework with a simulator slice
+// (e.g. OpenAL-Soft is small enough to ship sim slices).
+EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*] = libopenal.xcframework PVDolphin.framework PVEmuThree.framework PVAzahar.framework glslang.xcframework PVlibDolphin.xcframework PVDolphin.xcframework
+EXCLUDED_SOURCE_FILE_NAMES[sdk=appletvsimulator*] = libopenal.xcframework PVDolphin.framework PVEmuThree.framework PVAzahar.framework glslang.xcframework PVlibDolphin.xcframework PVDolphin.xcframework
+
+// -- Explicitly Built Modules (Xcode 16+) --
+// DISABLED: Explicit modules conflict with -fmodules/-fcxx-modules in OTHER_CFLAGS
+// and cause "Planning Swift module" to hang with 26+ local SPM packages.
+// The implicit module system handles this workspace's dependency graph much faster.
+// Re-enable only after removing -fmodules/-fcxx-modules from OTHER_CFLAGS.
+SWIFT_ENABLE_EXPLICIT_MODULES = NO
+//COMBINE_HIDPI_IMAGES = NO

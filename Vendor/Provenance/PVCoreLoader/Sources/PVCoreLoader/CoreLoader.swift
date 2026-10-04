@@ -1,0 +1,329 @@
+//  Converted to Swift 4 by Swiftify v4.1.6613 - https://objectivec2swift.com/
+//
+//  GameImporter.swift
+//  Provenance
+//
+//  Created by James Addyman on 01/04/2015.
+//  Copyright (c) 2015 James Addyman. All rights reserved.
+//
+
+import Foundation
+import os
+import PVSupport
+import PVCoreBridge
+import PVEmulatorCore
+import PVLogging
+import PVPlists
+
+public enum CoreLoaderError: Error {
+    case noCoresFound
+}
+
+public final class CoreLoader: Sendable {
+
+    public static let shared: CoreLoader = .init()
+    private init() {}
+
+    /// Thread-safe storage wrapping the cached core plists array.
+    /// `OSAllocatedUnfairLock` eliminates bare lock/unlock pairs and the associated
+    /// early-return deadlock risk present with `NSLock`.
+    private static let cacheStorage = OSAllocatedUnfairLock<[EmulatorCoreInfoPlist]?>(initialState: nil)
+
+    /// Clears the cached core plists, forcing a reload on next getCorePlists() call
+    /// This is primarily useful for testing or in rare cases where cores might change during runtime
+    static public func clearCoreListCache() {
+        cacheStorage.withLock { $0 = nil }
+        ILOG("Core plists cache cleared")
+    }
+
+//    public func parseCoresPlists(plists: [URL]) async -> [EmulatorCoreInfoPlist] {
+//        // Loading cores and calling `.corePlist` property on the `Class.self`
+//        let corePlistsStructs = plists.compactMap {
+//            do {
+//                return try EmulatorCoreInfoPlist(fromURL: $0)
+//            } catch {
+//                ELOG("\(error.localizedDescription) for URL: \($0.debugDescription)")
+//            }
+//            return nil
+//        }
+//        return corePlistsStructs
+//    }
+
+    static public func getCorePlists() -> [EmulatorCoreInfoPlist] {
+        /// Fast path: return cached value without doing I/O
+        if let cached = cacheStorage.withLock({ $0 }) {
+            DLOG("Returning cached core plists (\(cached.count) items)")
+            return cached
+        }
+
+        /// Load outside the lock so we don't block other threads during filesystem I/O
+        ILOG("Loading core plists from file system...")
+        let plists = loadCorePlists()
+
+        /// Store result — concurrent first-load races are benign (last writer wins)
+        cacheStorage.withLock { $0 = plists }
+
+        /// Populate the JIT requirement registry from each loaded plist.
+        /// This is the single place where Core.plist JIT data flows into the registry —
+        /// no hardcoded identifier list is needed anywhere else.
+        registerJITRequirements(from: plists)
+
+        ILOG("Cached \(plists.count) core plists for future use")
+        return plists
+    }
+
+    /// Reads `PVJITRequirement` from each plist and registers it in the shared registry.
+    /// The registry is cleared first so that entries for cores that are no longer present
+    /// in the active core list do not remain stale.
+    static private func registerJITRequirements(from plists: [EmulatorCoreInfoPlist]) {
+        let registry = PVJITRequirementRegistry.shared
+        registry.reset()
+        for plist in plists {
+            if let raw = plist.jitRequirementRawValue {
+                registry.register(rawValue: raw, forCoreIdentifier: plist.identifier)
+            }
+            if plist.jitDisabledWithoutJIT {
+                registry.registerJITDisabled(forCoreIdentifier: plist.identifier)
+            }
+            // Also handle sub-cores (e.g. libretro cores embedded in RetroArch's plist)
+            for subCore in plist.subCores ?? [] {
+                if let raw = subCore.jitRequirementRawValue {
+                    registry.register(rawValue: raw, forCoreIdentifier: subCore.identifier)
+                }
+                if subCore.jitDisabledWithoutJIT {
+                    registry.registerJITDisabled(forCoreIdentifier: subCore.identifier)
+                }
+            }
+        }
+    }
+
+    /// Returns identifiers of cores that are currently disabled solely because JIT is required.
+    ///
+    /// Call this after JIT is acquired to find cores that should be auto-enabled.
+    /// Part of the smart JIT acquisition flow (#2794).
+    public static func jitDisabledCoreIdentifiers() -> [String] {
+        PVJITRequirementRegistry.shared.jitDisabledCoreIdentifiers()
+    }
+
+    /// Internal method that actually loads the core plists
+    static private func loadCorePlists() -> [EmulatorCoreInfoPlist] {
+//        if #available(iOS 17, *) {
+//            return getCorePlistsFromDyload()
+//        } else {
+            var plists = getCorePlistsFromFileSystem()
+
+            /// When PVRetroArch.framework isn't linked (e.g. tvOS without the RA binary),
+            /// its sub-core metadata is missing. Load the bundled RetroArchCore.plist
+            /// symlink so system ↔ core associations, orphan checks, and missing-core
+            /// diagnostics still work.
+            if !hasStaticLibretroSubcoreRegistration(in: plists) {
+                if let fallback = loadEmbeddedRetroArchPlist() {
+                    ILOG("CoreLoader: PVRetroArch.framework absent — loaded embedded RetroArchCore.plist (\(fallback.subCores?.count ?? 0) sub-cores)")
+                    plists.append(fallback)
+                }
+            }
+
+            return applyRuntimeMetadataOverrides(on: plists)
+//        }
+    }
+
+    static private func getCorePlistsFromDyload() -> [EmulatorCoreInfoPlist] {
+        // Scan all subclasses of PVEmulator core, and get their metadata
+        // like their subclass name and the bundle they belong to
+        let coreClasses: [ClassInfo] = CoreClasses.coreClasses
+
+        let plists: [EmulatorCoreInfoPlist] = coreClasses.map { classInfo in
+            let plist: EmulatorCoreInfoPlist = classInfo.classObject.corePlist
+            return plist
+        }
+
+        return plists
+    }
+
+    /// Pre-filters `.framework` / `.bundle` directories by checking for
+    /// `Core.plist` existence via `access()` before attempting the more
+    /// expensive plist parse. Typical app bundles contain 100+ frameworks
+    /// but only ~15-20 are emulator cores — this avoids redundant work.
+    static private func getCorePlistsFromFileSystem() -> [EmulatorCoreInfoPlist] {
+        var plists: [EmulatorCoreInfoPlist] = []
+
+        let mainBundlePath = Bundle.main.bundleURL
+        let frameworksPath = mainBundlePath.appendingPathComponent("Frameworks")
+        let pathsToScan = [mainBundlePath, frameworksPath]
+
+        do {
+            for path in pathsToScan {
+                guard FileManager.default.fileExists(atPath: path.path) else { continue }
+
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: path,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: .skipsHiddenFiles
+                )
+
+                /// Pre-filter: only keep .framework/.bundle dirs that contain a Core.plist.
+                /// Uses POSIX `access(_, F_OK)` which is a single stat() syscall —
+                /// cheaper than `FileManager.fileExists` (no ObjC dispatch, no NSError).
+                var totalBundles = 0
+                let coreBundlePaths = contents.filter { url in
+                    let ext = url.pathExtension.lowercased()
+                    guard ext == "framework" || ext == "bundle" else { return false }
+                    totalBundles += 1
+                    return access(url.appendingPathComponent("Core.plist").path, F_OK) == 0
+                }
+
+                ILOG("CoreLoader: \(path.lastPathComponent) — \(coreBundlePaths.count) core bundles out of \(totalBundles) total")
+
+                for bundlePath in coreBundlePaths {
+                    if let plist = try loadCorePlist(from: bundlePath) {
+                        plists.append(plist)
+                        ILOG("Loaded Core.plist from \(bundlePath.lastPathComponent)")
+                    }
+                }
+            }
+
+            if let mainBundlePlist = try loadCorePlist(from: mainBundlePath) {
+                plists.append(mainBundlePlist)
+                ILOG("Loaded Core.plist from main bundle")
+            }
+
+        } catch {
+            ELOG("Error scanning for Core.plists: \(error)")
+        }
+
+        return plists
+    }
+
+    static private func applyRuntimeMetadataOverrides(on plists: [EmulatorCoreInfoPlist]) -> [EmulatorCoreInfoPlist] {
+        ILOG("RetroArch metadata: Applying runtime metadata overrides to \(plists.count) core plists")
+        var updatedCount = 0
+        var libretroCount = 0
+
+        let result = plists.map { plist -> EmulatorCoreInfoPlist in
+            /// Check if this plist has subCores (like PVRetroArch which contains all libretro cores)
+            if let subCores = plist.subCores, !subCores.isEmpty {
+                ILOG("RetroArch metadata: Processing \(subCores.count) sub-cores for \(plist.identifier)")
+                let updatedSubCores = subCores.map { subCore -> EmulatorCoreInfoPlist in
+                    /// Only process libretro sub-cores that have ".libretro.framework" in their identifier
+                    guard subCore.identifier.contains(".libretro.framework") else {
+                        return subCore
+                    }
+
+                    libretroCount += 1
+
+                    guard let metadata = LibretroMetadataReader.metadata(forIdentifier: subCore.identifier),
+                          !metadata.version.isEmpty else {
+                        DLOG("RetroArch metadata: No runtime metadata for \(subCore.identifier), using plist version: \(subCore.projectVersion)")
+                        return subCore
+                    }
+
+                    if metadata.version == subCore.projectVersion {
+                        DLOG("RetroArch metadata: Version unchanged for \(subCore.identifier): \(metadata.version)")
+                        return subCore
+                    }
+
+                    ILOG("RetroArch metadata: Updating \(subCore.identifier) version '\(subCore.projectVersion)' -> '\(metadata.version)'")
+                    updatedCount += 1
+                    return subCore.updating(projectVersion: metadata.version)
+                }
+
+                /// Return parent plist with updated subCores
+                return plist.updating(subCores: updatedSubCores)
+            }
+
+            /// Also check top-level plists for .libretro.framework pattern (in case they're not nested)
+            guard plist.identifier.contains(".libretro.framework") else {
+                return plist
+            }
+
+            libretroCount += 1
+
+            guard let metadata = LibretroMetadataReader.metadata(forIdentifier: plist.identifier),
+                  !metadata.version.isEmpty else {
+                DLOG("RetroArch metadata: No runtime metadata for \(plist.identifier), using plist version: \(plist.projectVersion)")
+                return plist
+            }
+
+            if metadata.version == plist.projectVersion {
+                DLOG("RetroArch metadata: Version unchanged for \(plist.identifier): \(metadata.version)")
+                return plist
+            }
+
+            ILOG("RetroArch metadata: Updating \(plist.identifier) version '\(plist.projectVersion)' -> '\(metadata.version)'")
+            updatedCount += 1
+            return plist.updating(projectVersion: metadata.version)
+        }
+
+        ILOG("RetroArch metadata: Complete - found \(libretroCount) libretro cores, updated \(updatedCount) versions")
+        return result
+    }
+
+    static private func loadCorePlist(from bundlePath: URL) throws -> EmulatorCoreInfoPlist? {
+        let plistPath = bundlePath.appendingPathComponent("Core.plist")
+
+        guard FileManager.default.fileExists(atPath: plistPath.path) else {
+            return nil
+        }
+
+        do {
+            let plist = try EmulatorCoreInfoPlist(fromURL: plistPath)
+            ILOG("Successfully loaded Core.plist from \(bundlePath.lastPathComponent)")
+            return plist
+        } catch {
+            ELOG("Failed to load Core.plist from \(bundlePath.lastPathComponent): \(error)")
+            return nil
+        }
+    }
+
+    /// True when any loaded plist still declares libretro sub-cores (e.g. PVRetroArch `PVCores` with `*.libretro.framework` identifiers).
+    /// When this is false — for example tvOS builds that omit the PVRetroArch framework — the dynamic libretro scanner must register cores from `Frameworks/` instead.
+    public static func hasStaticLibretroSubcoreRegistration(in plists: [EmulatorCoreInfoPlist]) -> Bool {
+        for plist in plists {
+            for sub in plist.subCores ?? [] where sub.identifier.contains(".libretro.framework") {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Loads the symlinked RetroArchCore.plist bundled inside PVCoreLoader's SPM resources.
+    /// Returns the parsed plist (with sub-cores) or nil if not found / parse failure.
+    static private func loadEmbeddedRetroArchPlist() -> EmulatorCoreInfoPlist? {
+        guard let url = Bundle.module.url(forResource: "RetroArchCore", withExtension: "plist") else {
+            DLOG("CoreLoader: RetroArchCore.plist not found in module bundle")
+            return nil
+        }
+        do {
+            let plist = try EmulatorCoreInfoPlist(fromURL: url)
+            ILOG("CoreLoader: loaded embedded RetroArchCore.plist — identifier=\(plist?.identifier ?? "nil")")
+            return plist
+        } catch {
+            ELOG("CoreLoader: failed to parse embedded RetroArchCore.plist: \(error)")
+            return nil
+        }
+    }
+}
+
+private extension EmulatorCoreInfoPlist {
+    func updating(projectVersion: String? = nil, subCores: [EmulatorCoreInfoPlist]? = nil) -> EmulatorCoreInfoPlist {
+        return EmulatorCoreInfoPlist(
+            identifier: identifier,
+            principleClass: principleClass,
+            supportedSystems: supportedSystems,
+            projectName: projectName,
+            projectURL: projectURL,
+            projectVersion: projectVersion ?? self.projectVersion,
+            disabled: disabled,
+            contentless: contentless,
+            appStoreDisabled: appStoreDisabled,
+            supportedCheatTypes: supportedCheatTypes,
+            subCores: subCores ?? self.subCores,
+            jitRequirementRawValue: jitRequirementRawValue,
+            jitDisabledWithoutJIT: jitDisabledWithoutJIT,
+            licenseName: licenseName,
+            licenseURL: licenseURL,
+            copyright: copyright,
+            capabilities: capabilities
+        )
+    }
+}

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100" role="img" aria-label="Relay">
+  <!--
+    The Baton — Relay's canonical mark.
+    Two equal capsules on a −45° diagonal: one hand finishing, one hand starting.
+    Geometry (canonical, do not redraw by eye):
+      group: translate(50 52) rotate(-45)
+      lead  capsule: x −46 → −2, y −18 → −4, radius 7   (44 × 14)
+      trail capsule: x   2 →  46, y   4 →  18, radius 7   (44 × 14)
+      gap along the bar 4 units · perpendicular offset 22 units
+    Colour: the lead capsule takes the surface's contrast colour, the trail
+    capsule is always Ember. Override with --relay-lead / --relay-trail.
+  -->
+  <g transform="translate(50 52) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="var(--relay-lead, #F5F2EE)"/>
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="var(--relay-trail, #FF6A45)"/>
+  </g>
+</svg>

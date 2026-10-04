@@ -1,0 +1,14 @@
+//
+// Prefix header for all source files of the 'Provenance Tests' target in the 'Provenance' project
+//
+
+#import <Availability.h>
+
+#ifdef __OBJC__
+    #if __has_include(<UIKit/UIKit.h>)
+    #import <UIKit/UIKit.h>
+    #else
+    #import <AppKit/AppKit.h>
+    #endif
+    #import <Foundation/Foundation.h>
+#endif

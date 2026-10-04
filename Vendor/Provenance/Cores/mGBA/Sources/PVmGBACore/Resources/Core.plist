@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PVCoreIdentifier</key>
+	<string>com.provenance.core.mGBA</string>
+	<key>PVPrincipleClass</key>
+	<string>PVmGBACore.PVmGBACore</string>
+	<key>PVSupportedSystems</key>
+	<array>
+		<string>com.provenance.gba</string>
+	</array>
+	<key>PVProjectName</key>
+	<string>mGBA</string>
+	<key>PVProjectURL</key>
+	<string>https://mgba.io/</string>
+	<key>PVProjectVersion</key>
+	<string>0.10.3</string>
+	<key>PVSupportedCheatTypes</key>
+	<array>
+		<string>Game Shark</string>
+		<string>Code Breaker</string>
+		<string>Pro Action Replay</string>
+	</array>
+	<key>PVCapabilities</key>
+	<array>
+		<string>highAccuracy</string>
+		<string>rumble</string>
+		<string>rewind</string>
+		<string>runAhead</string>
+	</array>
+	<key>PVLicenseName</key>
+	<string>MPL-2.0</string>
+	<key>PVLicenseURL</key>
+	<string>https://github.com/mgba-emu/mgba/blob/HEAD/LICENSE</string>
+	<key>PVCopyright</key>
+	<string>Copyright © 2013-2024 Jeffrey Pfau</string>
+</dict>
+</plist>

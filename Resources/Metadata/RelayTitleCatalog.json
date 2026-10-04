@@ -1,0 +1,92 @@
+{
+  "$comment": "Provenance of Relay's offline title catalog. Written by Scripts/relay-title-catalog.py; edit only the source block by hand, then run --update.",
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/libretro/libretro-database",
+    "revision": "6a23a64fea8b0498e69ab534dda1c602ed064544",
+    "license": "CC-BY-SA-4.0",
+    "licenseSHA256": "23ee78c8bae49cf08ea2f0c84945c66b987ebe4520881fb51b3dad4fb43d07c2"
+  },
+  "files": [
+    {
+      "system": "gb",
+      "path": "metadat/no-intro/Nintendo - Game Boy.dat",
+      "sha256": "6fa0187a63666d9cdf5af9bb50baeca392f9f2195bcb2371e56c0a00e62989de"
+    },
+    {
+      "system": "gbc",
+      "path": "metadat/no-intro/Nintendo - Game Boy Color.dat",
+      "sha256": "f884fb411b10cee473f5e5cd0aff7e3b485d1f19dc40d893b5c2d0a6d52d6a7e"
+    },
+    {
+      "system": "gba",
+      "path": "metadat/no-intro/Nintendo - Game Boy Advance.dat",
+      "sha256": "90188f6e4e481cb2be98eda6271844b7f56813575497bebaaeddf7b76a6353db"
+    },
+    {
+      "system": "nes",
+      "path": "metadat/no-intro/Nintendo - Nintendo Entertainment System.dat",
+      "sha256": "853ffc356c664d72ca6c17a8382a2d8dd533dfd8a7e4644b1438ec6979e621e1"
+    },
+    {
+      "system": "snes",
+      "path": "metadat/no-intro/Nintendo - Super Nintendo Entertainment System.dat",
+      "sha256": "175c69cc8b50dc60c84828ad570e581a7c03602518776540733636235aa0ff8a"
+    },
+    {
+      "system": "nds",
+      "path": "metadat/no-intro/Nintendo - Nintendo DS.dat",
+      "sha256": "f2ded9c3194b2e33f02ace388df9eef1ba8fc1b3130a8149613800e7c514dc4b"
+    },
+    {
+      "system": "sms",
+      "path": "metadat/no-intro/Sega - Master System - Mark III.dat",
+      "sha256": "f383714cf27e699eb6fa1df2b5bfa137dc036da0267f1b3eaa2eaf7a0d2f1a4a"
+    },
+    {
+      "system": "gg",
+      "path": "metadat/no-intro/Sega - Game Gear.dat",
+      "sha256": "c0e12bf30f5a3a24726aa22b2c9d93f939da8063c2d845d4799917ff1e7a2800"
+    },
+    {
+      "system": "pce",
+      "path": "metadat/no-intro/NEC - PC Engine - TurboGrafx 16.dat",
+      "sha256": "64e096e6a56a4ac1b25c05e2d98c2ba61dafc2219c27d1eaf86293f93cf8a1db"
+    },
+    {
+      "system": "ws",
+      "path": "metadat/no-intro/Bandai - WonderSwan.dat",
+      "sha256": "5790d97e09e94afafb17f1f03d04f20174497b901cac52b49746bd3d9699825c"
+    },
+    {
+      "system": "wsc",
+      "path": "metadat/no-intro/Bandai - WonderSwan Color.dat",
+      "sha256": "f18a748c87b4115b52f4439ebc1707a71be808c3da99af2faaf80ed54780b084"
+    },
+    {
+      "system": "ps1",
+      "path": "metadat/redump/Sony - PlayStation.dat",
+      "sha256": "55453a532d8a659b3723eaf818bce83afea2ba926b3a0021adc904d54f46ab11"
+    }
+  ],
+  "output": {
+    "path": "Packages/RelayTitleCatalog/Sources/RelayTitleCatalog/Resources/RelayTitles.sqlite",
+    "contentSHA256": "a06c6290e6af22c52aa2fd505ddffa9defbd0356bb523479d4309a4ebe17eeb2",
+    "titles": {
+      "gb": 2238,
+      "gba": 3691,
+      "gbc": 2535,
+      "gg": 915,
+      "nds": 7656,
+      "nes": 7053,
+      "pce": 495,
+      "ps1": 10239,
+      "sms": 1163,
+      "snes": 4267,
+      "ws": 219,
+      "wsc": 227
+    },
+    "roms": 47904,
+    "serials": 10821
+  }
+}

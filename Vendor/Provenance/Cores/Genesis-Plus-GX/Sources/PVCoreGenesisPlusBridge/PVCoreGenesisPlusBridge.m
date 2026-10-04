@@ -1,0 +1,1380 @@
+//
+//  PVGenesisEmulatorCore.m
+//  Provenance
+//
+//  Created by James Addyman on 07/08/2013.
+//  Copyright (c) 2013 James Addyman. All rights reserved.
+//
+
+#import "PVCoreGenesisPlusBridge.h"
+@import PVSupport;
+@import PVEmulatorCore;
+@import PVCoreBridge;
+@import PVCoreObjCBridge;
+@import PVLoggingObjC;
+@import PVSettings;
+#if SWIFT_MODULE
+@import libgenesisplus;
+#else
+#import <PVGenesis/PVGenesis-Swift.h>
+#include "types.h"
+#include "loadrom.h"
+#include "genesis.h"
+#include "system.h"
+#include "input.h"
+#include "io_ctrl.h"
+#include "zlib.h"
+#include "osd.h"
+#ifdef HAVE_YM3438_CORE
+#include "ym3438.h"
+#endif
+#endif
+@import PVAudio;
+
+#if !TARGET_OS_MACCATALYST && !TARGET_OS_OSX
+#import <OpenGLES/gltypes.h>
+#import <OpenGLES/ES3/gl.h>
+#import <OpenGLES/ES3/glext.h>
+#import <OpenGLES/EAGL.h>
+#else
+@import OpenGL;
+@import GLUT;
+#endif
+
+
+#include "libretro.h"
+
+//#include "shared.h"
+//#include "state.h"
+//#include "genesis.h"
+//#include "md_ntsc.h"
+//#include "sms_ntsc.h"
+//#include "osd.h"
+//#include "config.h"
+
+
+char GG_ROM[256];
+char AR_ROM[256];
+char SK_ROM[256];
+char SK_UPMEM[256];
+char MD_BIOS[256];
+char GG_BIOS[256];
+char MS_BIOS_EU[256];
+char MS_BIOS_JP[256];
+char MS_BIOS_US[256];
+char CD_BIOS_EU[256];
+char CD_BIOS_US[256];
+char CD_BIOS_JP[256];
+char CD_BRAM_JP[256];
+char CD_BRAM_US[256];
+char CD_BRAM_EU[256];
+char CART_BRAM[256];
+
+#undef  CHUNKSIZE
+#define CHUNKSIZE   (0x10000)
+
+static uint32_t brm_crc[2];
+static uint8_t brm_format[0x40] =
+{
+  0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x5f,0x00,0x00,0x00,0x00,0x40,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+  0x53,0x45,0x47,0x41,0x5f,0x43,0x44,0x5f,0x52,0x4f,0x4d,0x00,0x01,0x00,0x00,0x00,
+  0x52,0x41,0x4d,0x5f,0x43,0x41,0x52,0x54,0x52,0x49,0x44,0x47,0x45,0x5f,0x5f,0x5f
+};
+
+static void bram_load(void)
+{
+	FILE *fp;
+
+	/* automatically load internal backup RAM */
+	switch (region_code)
+	{
+	   case REGION_JAPAN_NTSC:
+		  fp = fopen(CD_BRAM_JP, "rb");
+		  break;
+	   case REGION_EUROPE:
+		  fp = fopen(CD_BRAM_EU, "rb");
+		  break;
+	   case REGION_USA:
+		  fp = fopen(CD_BRAM_US, "rb");
+		  break;
+	   default:
+		  return;
+	}
+
+	if (fp != NULL)
+	{
+	  fread(scd.bram, 0x2000, 1, fp);
+	  fclose(fp);
+
+	  /* update CRC */
+	  brm_crc[0] = crc32(0, scd.bram, 0x2000);
+	}
+	else
+	{
+	  /* force internal backup RAM format (does not use previous region backup RAM) */
+	  scd.bram[0x1fff] = 0;
+	}
+
+	/* check if internal backup RAM is correctly formatted */
+	if (memcmp(scd.bram + 0x2000 - 0x20, brm_format + 0x20, 0x20))
+	{
+	  /* clear internal backup RAM */
+	  memset(scd.bram, 0x00, 0x2000 - 0x40);
+
+	  /* internal Backup RAM size fields */
+	  brm_format[0x10] = brm_format[0x12] = brm_format[0x14] = brm_format[0x16] = 0x00;
+	  brm_format[0x11] = brm_format[0x13] = brm_format[0x15] = brm_format[0x17] = (sizeof(scd.bram) / 64) - 3;
+
+	  /* format internal backup RAM */
+	  memcpy(scd.bram + 0x2000 - 0x40, brm_format, 0x40);
+
+	  /* clear CRC to force file saving (in case previous region backup RAM was also formatted) */
+	  brm_crc[0] = 0;
+	}
+
+	/* automatically load cartridge backup RAM (if enabled) */
+	if (scd.cartridge.id)
+	{
+	  fp = fopen(CART_BRAM, "rb");
+	  if (fp != NULL)
+	  {
+		int filesize = scd.cartridge.mask + 1;
+		int done = 0;
+
+		/* Read into buffer (2k blocks) */
+		while (filesize > CHUNKSIZE)
+		{
+		  fread(scd.cartridge.area + done, CHUNKSIZE, 1, fp);
+		  done += CHUNKSIZE;
+		  filesize -= CHUNKSIZE;
+		}
+
+		/* Read remaining bytes */
+		if (filesize)
+		{
+		  fread(scd.cartridge.area + done, filesize, 1, fp);
+		}
+
+		/* close file */
+		fclose(fp);
+
+		/* update CRC */
+		brm_crc[1] = crc32(0, scd.cartridge.area, scd.cartridge.mask + 1);
+	  }
+
+	  /* check if cartridge backup RAM is correctly formatted */
+	  if (memcmp(scd.cartridge.area + scd.cartridge.mask + 1 - 0x20, brm_format + 0x20, 0x20))
+	  {
+		/* clear cartridge backup RAM */
+		memset(scd.cartridge.area, 0x00, scd.cartridge.mask + 1);
+
+		/* Cartridge Backup RAM size fields */
+		brm_format[0x10] = brm_format[0x12] = brm_format[0x14] = brm_format[0x16] = (((scd.cartridge.mask + 1) / 64) - 3) >> 8;
+		brm_format[0x11] = brm_format[0x13] = brm_format[0x15] = brm_format[0x17] = (((scd.cartridge.mask + 1) / 64) - 3) & 0xff;
+
+		/* format cartridge backup RAM */
+		memcpy(scd.cartridge.area + scd.cartridge.mask + 1 - 0x40, brm_format, 0x40);
+	  }
+	}
+}
+
+static void bram_save(void)
+{
+	FILE *fp;
+
+	/* verify that internal backup RAM has been modified */
+	if (crc32(0, scd.bram, 0x2000) != brm_crc[0])
+	{
+	  /* check if it is correctly formatted before saving */
+	  if (!memcmp(scd.bram + 0x2000 - 0x20, brm_format + 0x20, 0x20))
+	  {
+		switch (region_code)
+	{
+		case REGION_JAPAN_NTSC:
+			fp = fopen(CD_BRAM_JP, "wb");
+			break;
+		case REGION_EUROPE:
+			fp = fopen(CD_BRAM_EU, "wb");
+			break;
+		case REGION_USA:
+			fp = fopen(CD_BRAM_US, "wb");
+			break;
+		default:
+				return;
+	}
+		if (fp != NULL)
+		{
+		  fwrite(scd.bram, 0x2000, 1, fp);
+		  fclose(fp);
+
+		  /* update CRC */
+		  brm_crc[0] = crc32(0, scd.bram, 0x2000);
+		}
+	  }
+	}
+
+	/* verify that cartridge backup RAM has been modified */
+	if (scd.cartridge.id && (crc32(0, scd.cartridge.area, scd.cartridge.mask + 1) != brm_crc[1]))
+	{
+	  /* check if it is correctly formatted before saving */
+	  if (!memcmp(scd.cartridge.area + scd.cartridge.mask + 1 - 0x20, brm_format + 0x20, 0x20))
+	  {
+		fp = fopen(CART_BRAM, "wb");
+		if (fp != NULL)
+		{
+		  int filesize = scd.cartridge.mask + 1;
+		  int done = 0;
+
+		  /* Write to file (2k blocks) */
+		  while (filesize > CHUNKSIZE)
+		  {
+			fwrite(scd.cartridge.area + done, CHUNKSIZE, 1, fp);
+			done += CHUNKSIZE;
+			filesize -= CHUNKSIZE;
+		  }
+
+		  /* Write remaining bytes */
+		  if (filesize)
+		  {
+			fwrite(scd.cartridge.area + done, filesize, 1, fp);
+		  }
+
+		  /* Close file */
+		  fclose(fp);
+
+		  /* update CRC */
+		  brm_crc[1] = crc32(0, scd.cartridge.area, scd.cartridge.mask + 1);
+		}
+	  }
+	}
+}
+
+
+
+@interface PVCoreGenesisPlusBridge ()
+{
+    uint32_t *videoBuffer;
+    uint32_t *videoBufferA;
+    uint32_t *videoBufferB;
+
+	int _videoWidth, _videoHeight;
+	int16_t _pad[MAX_DEVICES][RETRO_DEVICE_ID_JOYPAD_R3 + 1];
+    int _multiTapPlayerCount; // 2 normally, 4 for TeamPlayer
+}
+@property (nonatomic, assign) GenesisCoreType subCoreType;
+@end
+
+__weak PVCoreGenesisPlusBridge *_current;
+
+@implementation PVCoreGenesisPlusBridge
+
+static void audio_callback(int16_t left, int16_t right)
+{
+	__strong PVCoreGenesisPlusBridge *strongCurrent = _current;
+	
+	[[strongCurrent ringBufferAtIndex:0] write:&left size:2];
+	[[strongCurrent ringBufferAtIndex:0] write:&right size:2];
+
+	strongCurrent = nil;
+}
+
+static size_t audio_batch_callback(const int16_t *data, size_t frames)
+{
+	__strong PVCoreGenesisPlusBridge *strongCurrent = _current;
+	
+	[[strongCurrent ringBufferAtIndex:0] write:data size:frames << 2];
+	
+	strongCurrent = nil;
+	
+	return frames;
+}
+
+static void video_callback(const void *data, unsigned width, unsigned height, size_t pitch)
+{
+	__strong PVCoreGenesisPlusBridge *strongCurrent = _current;
+	
+    strongCurrent->_videoWidth  = width;
+    strongCurrent->_videoHeight = height;
+    
+    static dispatch_queue_t memory_queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_queue_attr_t queueAttributes = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INTERACTIVE, 0);
+        memory_queue = dispatch_queue_create("com.provenance.video", queueAttributes);
+    });
+        
+    dispatch_apply(height, memory_queue, ^(size_t y){
+        const uint32_t *src = (uint32_t*)data + y * (pitch >> 2); //pitch is in bytes not pixels
+        uint32_t *dst = strongCurrent->videoBuffer + y * 720; //width
+        
+        memcpy(dst, src, sizeof(uint32_t)*width);
+    });
+	
+	strongCurrent = nil;
+}
+
+static void input_poll_callback(void)
+{
+	//DLOG(@"poll callback");
+}
+
+static int16_t input_state_callback(unsigned port, unsigned device, unsigned index, unsigned _id)
+{
+	__strong PVCoreGenesisPlusBridge *strongCurrent = _current;
+    int16_t value = 0;
+
+    if (device == RETRO_DEVICE_JOYPAD && port < (unsigned)MAX_DEVICES) {
+        value = [strongCurrent controllerValueForButtonID:_id forPlayer:(NSInteger)port];
+        if (value == 0 && _id <= RETRO_DEVICE_ID_JOYPAD_R3) {
+            value = strongCurrent->_pad[port][_id];
+        }
+    }
+
+	strongCurrent = nil;
+	return value;
+}
+
+static bool environment_callback(unsigned cmd, void *data)
+{
+    __strong PVCoreGenesisPlusBridge *strongCurrent = _current;
+    
+	switch(cmd)
+	{
+		case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY :
+		{
+			NSString *appSupportPath = [strongCurrent BIOSPath];
+			
+			*(const char **)data = [appSupportPath UTF8String];
+			DLOG(@"Environ SYSTEM_DIRECTORY: \"%@\".\n", appSupportPath);
+			break;
+		}
+		case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+		{
+			break;
+		}
+		default :
+			DLOG(@"Environ UNSUPPORTED (#%u).\n", cmd);
+			return false;
+	}
+	
+    strongCurrent = nil;
+    
+	return true;
+}
+
+- (instancetype)init {
+	if ((self = [super init])) {
+        videoBufferA = (uint32_t *)malloc(720 * 576 * sizeof(uint32_t));
+        videoBufferB = (uint32_t *)malloc(720 * 576 * sizeof(uint32_t));
+        _multiTapPlayerCount = 2;
+	}
+
+	_current = self;
+
+	return self;
+}
+- (void)initialize {
+    [super initialize];
+    NSString *coreID = [self systemIdentifier];
+    if ([coreID isEqualToString:@"com.provenance.mastersystem"]) {
+        self.subCoreType = GenesisCoreTypeMasterSystem;
+    } else if ([coreID isEqualToString:@"com.provenance.sg1000"]) {
+        self.subCoreType = GenesisCoreTypeSG1000;
+    } else if ([coreID isEqualToString:@"com.provenance.gamegear"]) {
+        self.subCoreType = GenesisCoreTypeGameGear;
+    } else if ([coreID isEqualToString:@"com.provenance.genesis"]) {
+        self.subCoreType = GenesisCoreTypeGenesis;
+    } else {
+        ELOG(@"Unknown sub core type %@", coreID);
+        NSAssert(false, @"Unknown sub core type %@", coreID);
+    }
+}
+
+- (void)dealloc {
+    free(videoBufferA);
+    videoBufferA = NULL;
+    free(videoBufferB);
+    videoBufferB = NULL;
+    videoBuffer = NULL;
+}
+
+#pragma mark - Execution
+
+- (void)resetEmulation
+{
+	retro_reset();
+}
+
+- (void)stopEmulation
+{
+	if ([self.batterySavesPath length])
+	{
+		[[NSFileManager defaultManager] createDirectoryAtPath:self.batterySavesPath withIntermediateDirectories:YES attributes:nil error:NULL];
+		NSString *filePath = [self.batterySavesPath stringByAppendingPathComponent:[self.romName stringByAppendingPathExtension:@"sav"]];
+		[self writeSaveFile:filePath forType:RETRO_MEMORY_SAVE_RAM];
+    }
+
+	[super stopEmulation];
+	
+	double delayInSeconds = 0.1;
+	dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+	dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
+		retro_unload_game();
+		retro_deinit();
+	});
+}
+
+- (void)executeFrame {
+    int aud;
+    
+    if (system_hw == SYSTEM_MCD)
+        system_frame_scd(0);
+    else if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+        system_frame_gen(0);
+    else
+        system_frame_sms(0);
+    
+    video_callback(bitmap.data, bitmap.viewport.w + (bitmap.viewport.x * 2), bitmap.viewport.h + (bitmap.viewport.y * 2), bitmap.pitch);
+    
+    aud = audio_update(soundbuffer) << 1;
+    audio_batch_callback(soundbuffer, aud >> 1);
+}
+
+- (void)executeFrameSkippingFrame:(BOOL)skip {
+    //int aud;
+    
+//    int skipI = skip ? 1 : 0;
+    
+    if (system_hw == SYSTEM_MCD)
+        system_frame_scd(0);
+    else if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+        system_frame_gen(0);
+    else
+        system_frame_sms(0);
+    
+    video_callback(bitmap.data, bitmap.viewport.w + (bitmap.viewport.x * 2), bitmap.viewport.h + (bitmap.viewport.y * 2), bitmap.pitch);
+    
+    int aud = audio_update(soundbuffer) << 1;
+    audio_batch_callback(soundbuffer, aud >> 1);
+}
+
+- (BOOL)loadFileAtPath:(NSString*)path error:(NSError**)error {
+	memset(_pad, 0, sizeof(_pad));
+    
+    const void *data;
+    size_t size;
+    self.romName = [[[path lastPathComponent] componentsSeparatedByString:@"."] objectAtIndex:0];
+    
+    //load cart, read bytes, get length
+    NSData* dataObj = [NSData dataWithContentsOfFile:[path stringByStandardizingPath]];
+    if (dataObj == nil)
+	{
+		if(error != NULL) {
+			NSDictionary *userInfo = @{
+									   NSLocalizedDescriptionKey: @"Failed to load game.",
+									   NSLocalizedFailureReasonErrorKey: @"File was unreadble.",
+									   NSLocalizedRecoverySuggestionErrorKey: @"Check the file isn't corrupt and exists."
+									   };
+
+			NSError *newError = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+													code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+												userInfo:userInfo];
+
+			*error = newError;
+		}
+		return false;
+	}
+    size = [dataObj length];
+    data = (uint8_t*)[dataObj bytes];
+    const char *meta = NULL;
+    
+    if (videoBufferA) {
+        free(videoBufferA);
+    }
+    videoBufferA = NULL;
+    
+    if (videoBufferB) {
+        free(videoBufferB);
+    }
+    videoBufferB = NULL;
+    
+    videoBuffer = NULL;
+    
+    videoBufferA = (uint8_t *)malloc(720 * 576 * sizeof(uint32_t));
+    videoBufferB = (uint8_t *)malloc(720 * 576 * sizeof(uint32_t));
+    
+    bitmap.data = (uint8_t *)videoBufferA;
+    videoBuffer = videoBufferB;
+    
+    retro_set_environment(environment_callback);
+	retro_init();
+	
+    retro_set_audio_sample(audio_callback);
+    retro_set_audio_sample_batch(audio_batch_callback);
+    retro_set_video_refresh(video_callback);
+    retro_set_input_poll(input_poll_callback);
+    retro_set_input_state(input_state_callback);
+    
+    const char *fullPath = [path UTF8String];
+    
+    struct retro_game_info info = {NULL};
+    info.path = fullPath;
+    info.data = data;
+    info.size = size;
+    info.meta = meta;
+
+	  /* input options — start with standard 2-player; multitap set after ROM load */
+	  input.system[0] = SYSTEM_GAMEPAD;
+	  input.system[1] = SYSTEM_GAMEPAD;
+	  for (int i=0; i<MAX_INPUTS; i++) {
+		config.input[i].padtype = DEVICE_PAD2B | DEVICE_PAD3B | DEVICE_PAD6B;
+	  }
+    _multiTapPlayerCount = 2;
+
+    [self readOptions];
+
+    if (retro_load_game(&info)) {
+
+        // Detect 4-player multitap peripherals after ROM load.
+        // rominfo is only populated inside retro_load_game, so we check it here.
+        //
+        // Two mutually exclusive multi-tap modes exist:
+        //   SYSTEM_TEAMPLAYER — Sega's adapter; port A only, virtual ports 0-3.
+        //   SYSTEM_WAYPLAY    — EA 4-Way Play adapter; BOTH ports must be set.
+        //
+        // Both are indicated by peripheral bit 7 ('4') in the ROM header, so
+        // we require that bit before doing the title-string lookup to identify
+        // EA 4-Way Play games, then fall back to Sega TeamPlayer for the rest.
+        static const uint16_t kMultiTapBit = (1 << 7); // 'Team Player' peripheral bit
+
+        // Known EA 4-Way Play titles (EA Sports, 1993-1996).
+        // Matched against the international ROM header string.
+        static const char * const kEA4WayPlayTitles[] = {
+            "FIFA INTERNATIONAL SOCCER",  // FIFA 1993/94
+            "FIFA SOCCER",                // FIFA 95/96/97
+            "NBA LIVE 95",
+            "NBA LIVE 96",
+            "MADDEN NFL 96",
+            "BILL WALSH",                 // Bill Walsh College Football 96
+            NULL
+        };
+
+        BOOL isWayPlay = NO;
+        if (rominfo.peripherals & kMultiTapBit) {
+            for (int i = 0; kEA4WayPlayTitles[i] != NULL; i++) {
+                if (strstr(rominfo.international, kEA4WayPlayTitles[i]) != NULL) {
+                    isWayPlay = YES;
+                    break;
+                }
+            }
+        }
+
+        if (isWayPlay) {
+            // EA 4-Way Play requires SYSTEM_WAYPLAY on BOTH controller ports.
+            // io_init() is idempotent and re-initialises the port handlers.
+            input.system[0] = SYSTEM_WAYPLAY;
+            input.system[1] = SYSTEM_WAYPLAY;
+            _multiTapPlayerCount = 4;
+            DLOG(@"GenesisPlusBridge: EA 4-Way Play detected for '%s', enabling 4-player mode",
+                 rominfo.international);
+            io_init();
+        } else if (rominfo.peripherals & kMultiTapBit) {
+            // Sega TeamPlayer: multi-tap on port A only, virtual ports 0-3.
+            // rominfo is only populated inside retro_load_game, so we set input.system[]
+            // after load and call io_init() again to re-initialise port handlers.
+            input.system[0] = SYSTEM_TEAMPLAYER;
+            input.system[1] = SYSTEM_GAMEPAD;
+            _multiTapPlayerCount = 4;
+            DLOG(@"GenesisPlusBridge: TeamPlayer detected for '%s', enabling 4-player mode",
+                 rominfo.international);
+            io_init();
+        } else {
+            _multiTapPlayerCount = 2;
+        }
+
+        if ([self.batterySavesPath length]) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:self.batterySavesPath withIntermediateDirectories:YES attributes:nil error:NULL];
+            
+            NSString *filePath = [self.batterySavesPath stringByAppendingPathComponent:[self.romName stringByAppendingPathExtension:@"sav"]];
+            
+            [self loadSaveFile:filePath forType:RETRO_MEMORY_SAVE_RAM];
+        }
+        
+        struct retro_system_av_info info;
+        retro_get_system_av_info(&info);
+        
+        _frameInterval = info.timing.fps;
+        _sampleRate = info.timing.sample_rate;
+        
+        retro_get_region();
+		
+//#warning "No clue what this does, JM"
+//		if (system_hw == SYSTEM_MCD)
+//			 bram_load();
+
+		[self executeFrame];
+        
+        return YES;
+    }
+
+	if(error != NULL) {
+		NSDictionary *userInfo = @{
+								   NSLocalizedDescriptionKey: @"Failed to load game.",
+								   NSLocalizedFailureReasonErrorKey: @"GenPlusGX failed to load game.",
+								   NSLocalizedRecoverySuggestionErrorKey: @"Check the file isn't corrupt and supported GenPlusGX ROM format."
+								   };
+
+		NSError *newError = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+												code:PVEmulatorCoreErrorCodeCouldNotLoadRom
+											userInfo:userInfo];
+
+		*error = newError;
+	}
+
+    return NO;
+}
+
+-(void)readOptions {
+    //    0 : enable only PSG output (power-on default)
+    //    1 : enable only FM output
+    //    2 : disable both PSG & FM output
+    //    3 : enable both PSG and FM output
+
+      /* sound options */
+  //      config.psg_preamp     = 150;
+  //      config.fm_preamp      = 100;
+    config.hq_fm              = PVCoreGenesisPlusOptions.hq_fm; /* high-quality FM resampling (slower) */
+    config.hq_psg         = PVCoreGenesisPlusOptions.hq_psg; /* high-quality PSG resampling (slower) */
+    config.filter         = PVCoreGenesisPlusOptions.filter; /* 0=off, 1=low pass, 2=3 band eq */
+  //      config.lp_range       = 0x8ccd; /* = 55% in 0.16 fixed point to match a Model1 VA2 US Genesis, was 0x7fff */
+  //      config.low_freq       = 880;
+  //      config.high_freq      = 5000;
+  //      config.lg             = 100;
+  //      config.mg             = 100;
+  //      config.hg             = 100;
+    config.ym2612         = PVCoreGenesisPlusOptions.ym2612; //YM2612_DISCRETE;
+    config.ym2413         = PVCoreGenesisPlusOptions.ym2413; /* 0: Off, 1:On, 2:AUTO */
+    config.mono           = PVCoreGenesisPlusOptions.mono; /* STEREO output */
+
+    #ifdef HAVE_YM3438_CORE
+       OPN2_SetChipType(ym3438_mode_ym2612);
+       config.ym3438         = 1;
+    #endif
+    #ifdef HAVE_OPLL_CORE
+       config.opll           = 1;
+    #endif
+
+        /* system options */
+  //      config.system         = 0; /* AUTO */
+  //      config.region_detect  = 0; /* AUTO */
+  //      config.vdp_mode       = 0; /* AUTO */
+  //      config.master_clock   = 0; /* AUTO */
+  //      config.force_dtack    = 0;
+  //      config.addr_error     = 1;
+  //      config.bios           = 0;
+  //      config.lock_on        = 0;
+     #ifdef HAVE_OVERCLOCK
+        config.overclock      = PVCoreGenesisPlusOptions.overclock;
+     #endif
+        config.no_sprite_limit = PVCoreGenesisPlusOptions.no_sprite_limit;
+
+        /* video options */
+        config.overscan = PVCoreGenesisPlusOptions.overscan; /* 0 = no borders , 1 = vertical borders only, 2 = horizontal borders only, 3 = full borders */
+  //      config.aspect_ratio = 0;
+        config.gg_extra = PVCoreGenesisPlusOptions.gg_extra; /* 1 = show extended Game Gear screen (256x192) */
+  //      config.ntsc     = 0;
+  //      config.lcd        = 0; /* 0.8 fixed point */
+  //      config.render   = 0;
+
+}
+
+- (void)loadSaveFile:(NSString *)path forType:(int)type {
+    size_t size = retro_get_memory_size(type);
+    void *ramData = retro_get_memory_data(type);
+    
+    if (size == 0 || !ramData)
+    {
+        return;
+    }
+    
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data || ![data length])
+    {
+        WLOG(@"Couldn't load save file.");
+    }
+    
+    [data getBytes:ramData length:size];
+}
+
+- (void *)systemRAMPtr {
+    return retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+}
+
+- (NSUInteger)systemRAMSize {
+    return (NSUInteger)retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+}
+
+- (BOOL)writeSaveFile:(NSString *)path forType:(int)type
+{
+    size_t size = retro_get_memory_size(type);
+    void *ramData = retro_get_memory_data(type);
+    
+    if (ramData && (size > 0))
+    {
+        retro_serialize(ramData, size);
+        NSData *data = [NSData dataWithBytes:ramData length:size];
+        BOOL success = [data writeToFile:path atomically:YES];
+        if (!success)
+        {
+            ELOG(@"Error writing save file");
+        }
+		return success;
+	} else {
+		return NO;
+	}
+}
+
+#pragma mark - Video
+
+- (void)swapBuffers {
+    if (bitmap.data == (uint8_t*)videoBufferA) {
+        videoBuffer = videoBufferA;
+        bitmap.data = (uint8_t*)videoBufferB;
+    } else {
+        videoBuffer = videoBufferB;
+        bitmap.data = (uint8_t*)videoBufferA;
+    }
+}
+
+- (const void *)videoBuffer {
+    return videoBuffer;
+}
+
+-(BOOL)isDoubleBuffered {
+    return YES;
+}
+
+- (float)screenRatio {
+    /* According to Chat GPT
+     To express these as the lowest integer values:
+
+     Sega Master System: 4:3
+     SG-1000: 4:3 (assumed)
+     Game Gear: 5:4
+     Genesis/Megadrive: 10:7
+     
+     With overscan:
+     Sega Master System: 4:3 (maintained)
+     SG-1000: 4:3 (assumed, maintained)
+     Game Gear: 5:4 (unchanged due to being a handheld LCD)
+     Genesis/Megadrive: 4:3 (adjusted from 10:7 due to overscan)
+     */
+    switch (self.subCoreType) {
+        case GenesisCoreTypeGameGear:
+            if (config.overscan == 0 && config.gg_extra == 0 )
+                return 6.0/5.0;
+            else
+                return 5.0/4.0;
+        case GenesisCoreTypeSG1000:
+            return 8.0/7.0;
+        case GenesisCoreTypeMasterSystem:
+            return 8.0/7.0;
+        case GenesisCoreTypeGenesis:
+            return 32.0 / 35.0;
+    }
+}
+
+/// Note: This is working when the following options are on
+/// GameGear extra space: true/false
+/// Video Overscan: full/none
+- (CGRect)screenRect {
+    // OEIntRectMake(bitmap.viewport.x, bitmap.viewport.y, bitmap.viewport.w, bitmap.viewport.h);
+
+    BOOL isGamegear = self.subCoreType == GenesisCoreTypeGameGear;
+    float ratio = self.screenRatio;
+
+    if(isGamegear) {
+        // 6/5
+//        return config.gg_extra ?
+//        CGRectMake(0, 0, 256, 192) :
+//        CGRectMake(0, 0, 160, 144);
+//        return CGRectMake(bitmap.viewport.x, bitmap.viewport.y, bitmap.viewport.w, bitmap.viewport.h);
+        return CGRectMake(0, 0, _videoWidth, _videoHeight);
+    } else {
+        return CGRectMake(0, 0, _videoWidth, _videoHeight);
+    }
+}
+
+- (CGSize)aspectSize {
+    int width = bitmap.viewport.w;
+    int height = bitmap.viewport.h;
+
+    // GameGear
+    if(self.subCoreType == GenesisCoreTypeGameGear) {
+        int vwidth  = bitmap.viewport.w + (bitmap.viewport.x * 2);
+        int vheight = bitmap.viewport.h + (bitmap.viewport.y * 2);
+
+        if (config.aspect_ratio == 0 && config.overscan == 0 && config.gg_extra == 0) {
+            return CGSizeMake(vwidth * (6.0 / 5.0), vheight);
+        }
+        return config.gg_extra ? CGSizeMake(256.0, 192.0): CGSizeMake(160.0, 144.0);
+    }
+    // Master System & SG1000
+    else if(self.subCoreType == GenesisCoreTypeMasterSystem
+            || self.subCoreType == GenesisCoreTypeSG1000) {
+        float ratio = self.screenRatio;
+        return CGSizeMake(256.0 * ratio, 192.0);
+    }
+    // Genesis/Megadrive
+    else {
+        return CGSizeMake(292, 224);
+    }
+}
+ 
+- (CGSize)bufferSize {
+    return CGSizeMake(720, 576);
+}
+
+- (GLenum)pixelFormat {
+    return GL_BGRA;
+}
+
+- (GLenum)pixelType {
+    return GL_UNSIGNED_BYTE;
+}
+
+- (GLenum)internalPixelFormat {
+    return GL_RGBA;
+}
+
+//- (GLenum)pixelFormat {
+//    return GL_RGB;
+//}
+//
+//- (GLenum)pixelType {
+//    return GL_UNSIGNED_SHORT_5_6_5;
+//}
+//
+//- (GLenum)internalPixelFormat {
+//    return GL_RGB;
+//}
+
+- (NSTimeInterval)frameInterval {
+    return _frameInterval ? _frameInterval : 59.92;
+}
+
+#pragma mark - Audio
+
+- (double)audioSampleRate {
+	return _sampleRate ? _sampleRate : 48000;
+}
+
+- (NSUInteger)channelCount {
+    BOOL isMono = PVCoreGenesisPlusOptions.mono;
+    NSUInteger channelCount = isMono ? 1 : 2;
+    return channelCount;
+}
+
+- (NSUInteger)maxNumberPlayers {
+    return (NSUInteger)_multiTapPlayerCount;
+}
+
+#pragma mark - Input
+
+// Mapping from PVSG1000Button enum values to libretro RETRO_DEVICE_ID_JOYPAD_* constants.
+// PVSG1000Button: b=0, c=1, start=2, up=3, down=4, left=5, right=6
+// Libretro:       B=0, Y=1, SELECT=2, START=3, UP=4, DOWN=5, LEFT=6, RIGHT=7, A=8
+static const int SG1000Map[] = {
+    RETRO_DEVICE_ID_JOYPAD_B,     // PVSG1000Button.b (0)     → RETRO_DEVICE_ID_JOYPAD_B (0)
+    RETRO_DEVICE_ID_JOYPAD_A,     // PVSG1000Button.c (1)     → RETRO_DEVICE_ID_JOYPAD_A (8)
+    RETRO_DEVICE_ID_JOYPAD_START, // PVSG1000Button.start (2) → RETRO_DEVICE_ID_JOYPAD_START (3)
+    RETRO_DEVICE_ID_JOYPAD_UP,    // PVSG1000Button.up (3)    → RETRO_DEVICE_ID_JOYPAD_UP (4)
+    RETRO_DEVICE_ID_JOYPAD_DOWN,  // PVSG1000Button.down (4)  → RETRO_DEVICE_ID_JOYPAD_DOWN (5)
+    RETRO_DEVICE_ID_JOYPAD_LEFT,  // PVSG1000Button.left (5)  → RETRO_DEVICE_ID_JOYPAD_LEFT (6)
+    RETRO_DEVICE_ID_JOYPAD_RIGHT, // PVSG1000Button.right (6) → RETRO_DEVICE_ID_JOYPAD_RIGHT (7)
+};
+
+- (void)didPushGenesisButton:(PVGenesisButton)button forPlayer:(NSInteger)player {
+	_pad[player][button] = 1;
+}
+
+- (void)didReleaseGenesisButton:(PVGenesisButton)button forPlayer:(NSInteger)player {
+	_pad[player][button] = 0;
+}
+
+- (void)didPushSG1000Button:(PVSG1000Button)button forPlayer:(NSInteger)player {
+    _pad[player][SG1000Map[button]] = 1;
+}
+
+- (void)didReleaseSG1000Button:(PVSG1000Button)button forPlayer:(NSInteger)player {
+    _pad[player][SG1000Map[button]] = 0;
+}
+
+- (NSInteger)controllerValueForButtonID:(unsigned)buttonID forPlayer:(NSInteger)player {
+    GCController *controller = nil;
+
+    switch (player) {
+        case 0:  controller = self.controller1; break;
+        case 1:  controller = self.controller2; break;
+        case 2:  controller = self.controller3; break;
+        case 3:  controller = self.controller4; break;
+        default: break;
+    }
+
+    // Sega SG-1000…
+    if (self.subCoreType == GenesisCoreTypeSG1000) {
+        if ([controller extendedGamepad]) {
+            GCExtendedGamepad *gamepad = [controller extendedGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed]?:[[[gamepad leftThumbstick] up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed]?:[[[gamepad leftThumbstick] down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed]?:[[[gamepad leftThumbstick] left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed]?:[[[gamepad leftThumbstick] right] isPressed];
+                case PVGenesisButtonB: // SG1000 ButtonL/1
+                    return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed]?:[[gamepad leftShoulder] isPressed]?:[[gamepad leftTrigger] isPressed];
+                case PVGenesisButtonC: // SG1000 ButtonR/2
+                    return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed]?:[[gamepad rightShoulder] isPressed]?:[[gamepad rightTrigger] isPressed];
+                default:
+                    break;
+            }
+            
+        } else if ([controller gamepad]) {
+            GCGamepad *gamepad = [controller gamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed];
+                case PVGenesisButtonB: // SG1000 ButtonL/1
+                    return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed]?:[[gamepad leftShoulder] isPressed];
+                case PVGenesisButtonC: // SG1000 ButtonR/2
+                    return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed]?:[[gamepad rightShoulder] isPressed];
+                default:
+                    break;
+            }
+        }
+        
+#if TARGET_OS_TV
+
+        else if ([controller microGamepad]) {
+            GCMicroGamepad *gamepad = [controller microGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] value] > 0.5;
+                    break;
+                case PVGenesisButtonDown:
+                    return [[dpad down] value] > 0.5;
+                    break;
+                case PVGenesisButtonLeft:
+                    return [[dpad left] value] > 0.5;
+                    break;
+                case PVGenesisButtonRight:
+                    return [[dpad right] value] > 0.5;
+                    break;
+                case PVGenesisButtonB: // SG1000 ButtonL/1
+                    return [[gamepad buttonA] isPressed];
+                    break;
+                case PVGenesisButtonC: // SG1000 ButtonR/2
+                    return [[gamepad buttonX] isPressed];
+                    break;
+                default:
+                    break;
+            }
+        }
+        
+#endif
+        
+    // Sega Master System…
+    } else if (self.subCoreType == GenesisCoreTypeMasterSystem) {
+       if ([controller extendedGamepad]) {
+           GCExtendedGamepad *gamepad = [controller extendedGamepad];
+           GCControllerDirectionPad *dpad = [gamepad dpad];
+           switch (buttonID) {
+               case PVGenesisButtonUp:
+                   return [[dpad up] isPressed]?:[[[gamepad leftThumbstick] up] isPressed];
+               case PVGenesisButtonDown:
+                   return [[dpad down] isPressed]?:[[[gamepad leftThumbstick] down] isPressed];
+               case PVGenesisButtonLeft:
+                   return [[dpad left] isPressed]?:[[[gamepad leftThumbstick] left] isPressed];
+               case PVGenesisButtonRight:
+                   return [[dpad right] isPressed]?:[[[gamepad leftThumbstick] right] isPressed];
+               case PVGenesisButtonB: // Button1
+                   return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed]?:[[gamepad rightShoulder] isPressed]?:[[gamepad rightTrigger] isPressed];
+               case PVGenesisButtonC: // Button2
+                   return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed]?:[[gamepad leftTrigger] isPressed];
+               case PVGenesisButtonStart: // MS Pause
+                   return [[gamepad leftShoulder] isPressed];
+               default:
+                   break;
+           }
+       } else if ([controller gamepad]) {
+           GCGamepad *gamepad = [controller gamepad];
+           GCControllerDirectionPad *dpad = [gamepad dpad];
+           switch (buttonID) {
+               case PVGenesisButtonUp:
+                   return [[dpad up] isPressed];
+               case PVGenesisButtonDown:
+                   return [[dpad down] isPressed];
+               case PVGenesisButtonLeft:
+                   return [[dpad left] isPressed];
+               case PVGenesisButtonRight:
+                   return [[dpad right] isPressed];
+               case PVGenesisButtonB: // Button1
+                   return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed]?:[[gamepad rightShoulder] isPressed];
+               case PVGenesisButtonC: // Button2
+                   return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed];
+               case PVGenesisButtonStart: // MS Pause
+                   return [[gamepad leftShoulder] isPressed];
+               default:
+                   break;
+           }
+       }
+#if TARGET_OS_TV
+       else if ([controller microGamepad]) {
+           GCMicroGamepad *gamepad = [controller microGamepad];
+           GCControllerDirectionPad *dpad = [gamepad dpad];
+           switch (buttonID) {
+               case PVGenesisButtonUp:
+                   return [[dpad up] value] > 0.5;
+                   break;
+               case PVGenesisButtonDown:
+                   return [[dpad down] value] > 0.5;
+                   break;
+               case PVGenesisButtonLeft:
+                   return [[dpad left] value] > 0.5;
+                   break;
+               case PVGenesisButtonRight:
+                   return [[dpad right] value] > 0.5;
+                   break;
+               case PVGenesisButtonB: // Button1
+                   return [[gamepad buttonA] isPressed];
+                   break;
+               case PVGenesisButtonC: // Button2
+                   return [[gamepad buttonX] isPressed];
+                   break;
+               // Siri Remote: do NOT bind MS Pause to buttonMenu — buttonMenu is
+               // owned by the pause-menu pipeline (controllerPausedHandler) and
+               // polling it from the bridge suppresses pause.
+               default:
+                   break;
+           }
+       }
+
+#endif
+        // Game Gear…
+    } else if (self.subCoreType == GenesisCoreTypeGameGear) {
+        if ([controller extendedGamepad]) {
+            GCExtendedGamepad *gamepad = [controller extendedGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed]?:[[[gamepad leftThumbstick] up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed]?:[[[gamepad leftThumbstick] down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed]?:[[[gamepad leftThumbstick] left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed]?:[[[gamepad leftThumbstick] right] isPressed];
+                case PVGenesisButtonB: // Button1
+                    return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed];
+                case PVGenesisButtonC: // Button2
+                    return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed];
+                case PVGenesisButtonStart: // GG Start
+                    return [[gamepad rightShoulder] isPressed]?:[[gamepad rightTrigger] isPressed];
+                default:
+                    break;
+            }
+            
+        } else if ([controller gamepad]) {
+            
+            GCGamepad *gamepad = [controller gamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed];
+                case PVGenesisButtonB: // Button1
+                    return [[gamepad buttonA] isPressed]?:[[gamepad buttonY] isPressed];
+                case PVGenesisButtonC: // Button2
+                    return [[gamepad buttonB] isPressed]?:[[gamepad buttonX] isPressed];
+                case PVGenesisButtonStart: // GG Start
+                    return [[gamepad rightShoulder] isPressed];
+                default:
+                    break;
+            }
+        }
+        
+#if TARGET_OS_TV
+        
+        else if ([controller microGamepad]) {
+            GCMicroGamepad *gamepad = [controller microGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] value] > 0.5;
+                    break;
+                case PVGenesisButtonDown:
+                    return [[dpad down] value] > 0.5;
+                    break;
+                case PVGenesisButtonLeft:
+                    return [[dpad left] value] > 0.5;
+                    break;
+                case PVGenesisButtonRight:
+                    return [[dpad right] value] > 0.5;
+                    break;
+                case PVGenesisButtonB: // Button1
+                    return [[gamepad buttonA] isPressed];
+                    break;
+                case PVGenesisButtonC: // Button2
+                    return [[gamepad buttonX] isPressed];
+                    break;
+                // Siri Remote: do NOT bind GG Start to buttonMenu — buttonMenu
+                // is owned by the pause-menu pipeline; polling it suppresses pause.
+                default:
+                    break;
+            }
+        }
+
+#endif
+
+    // Sega Genesis/Mega Drive, Sega/Mega CD, 32X…
+    } else {
+       
+        if ([controller extendedGamepad]) {
+            GCExtendedGamepad *gamepad = [controller extendedGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            if (PVSettingsWrapper.use8BitdoM30) // Maps the Sega Controls to the 8BitDo M30 if enabled in Settings / Controller
+            {switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[[gamepad leftThumbstick] up] value] > 0.1;
+                case PVGenesisButtonDown:
+                    return [[[gamepad leftThumbstick] down] value] > 0.1;
+                case PVGenesisButtonLeft:
+                    return [[[gamepad leftThumbstick] left] value] > 0.1;
+                case PVGenesisButtonRight:
+                    return [[[gamepad leftThumbstick] right] value] > 0.1;
+                case PVGenesisButtonA:
+                    return [[gamepad buttonA] isPressed];
+                case PVGenesisButtonB:
+                    return [[gamepad buttonB] isPressed];
+                case PVGenesisButtonC:
+                    return [[gamepad rightShoulder] isPressed];
+                case PVGenesisButtonX:
+                    return [[gamepad buttonX] isPressed];
+                case PVGenesisButtonY:
+                    return [[gamepad buttonY] isPressed];
+                case PVGenesisButtonZ:
+                    return [[gamepad leftShoulder] isPressed];
+                case PVGenesisButtonMode:
+                    return [[gamepad buttonOptions] isPressed];
+                case PVGenesisButtonStart:
+                    return [[gamepad rightTrigger] isPressed];
+                default:
+                    break;
+            }}
+            // Harmonized Sega 6-button MFi layout — see PicoDrive 32X bridge for the full
+            // rationale. Same physical button = same Sega button across every Sega-platform core.
+            //   buttonA  → A,  buttonB  → B,  rightShoulder → C
+            //   buttonX  → X,  buttonY  → Y,  leftShoulder  → Z
+            //   rightTrigger → Start  (tvOS pads without R2 cannot Start; do NOT poll buttonMenu — it owns pause)
+            //   leftTrigger  → Mode
+            { switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed]?:[[[gamepad leftThumbstick] up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed]?:[[[gamepad leftThumbstick] down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed]?:[[[gamepad leftThumbstick] left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed]?:[[[gamepad leftThumbstick] right] isPressed];
+                case PVGenesisButtonA:
+                    return [[gamepad buttonA] isPressed];
+                case PVGenesisButtonB:
+                    return [[gamepad buttonB] isPressed];
+                case PVGenesisButtonC:
+                    return [[gamepad rightShoulder] isPressed];
+                case PVGenesisButtonX:
+                    return [[gamepad buttonX] isPressed];
+                case PVGenesisButtonY:
+                    return [[gamepad buttonY] isPressed];
+                case PVGenesisButtonZ:
+                    return [[gamepad leftShoulder] isPressed];
+                case PVGenesisButtonMode:
+                    return [[gamepad leftTrigger] isPressed];
+                case PVGenesisButtonStart:
+                    // Do NOT fall back to buttonMenu on tvOS — buttonMenu is reserved
+                    // for the pause-menu pipeline (controllerPausedHandler / GCEventViewController),
+                    // and polling it from the bridge suppresses pause on Siri Remote
+                    // and on MFi pads that lack buttonOptions / thumbstick-button pause triggers.
+                    return [[gamepad rightTrigger] isPressed];
+                default:
+                   break;
+            }}
+            
+        } else if ([controller gamepad]) {
+            GCGamepad *gamepad = [controller gamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            // Legacy GCGamepad has only A/B/X/Y + L1/R1 — 6 buttons but Genesis needs 8
+            // (A/B/C/X/Y/Z + Start + Mode). Use L1+R1 as a modifier combo for Start/Mode,
+            // and qualify the shoulder-bound and face buttons with `!modifierPressed` so they
+            // don't fire while the combo is engaged. Face buttons map A→A, B→B, X→X, Y→Y to
+            // match the harmonized extended-gamepad layout shared with PicoDrive 32X.
+            bool modifierPressed = [[gamepad leftShoulder] isPressed] && [[gamepad rightShoulder] isPressed];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] isPressed];
+                case PVGenesisButtonDown:
+                    return [[dpad down] isPressed];
+                case PVGenesisButtonLeft:
+                    return [[dpad left] isPressed];
+                case PVGenesisButtonRight:
+                    return [[dpad right] isPressed];
+                case PVGenesisButtonA:
+                    return [[gamepad buttonA] isPressed] && !modifierPressed;
+                case PVGenesisButtonB:
+                    return [[gamepad buttonB] isPressed] && !modifierPressed;
+                case PVGenesisButtonC:
+                    return [[gamepad rightShoulder] isPressed] && !modifierPressed;
+                case PVGenesisButtonX:
+                    return [[gamepad buttonX] isPressed] && !modifierPressed;
+                case PVGenesisButtonY:
+                    return [[gamepad buttonY] isPressed] && !modifierPressed;
+                case PVGenesisButtonZ:
+                    return [[gamepad leftShoulder] isPressed] && !modifierPressed;
+                case PVGenesisButtonStart:
+                    return modifierPressed && [[gamepad buttonA] isPressed];
+                case PVGenesisButtonMode:
+                    return modifierPressed && [[gamepad buttonB] isPressed];
+                default:
+                    break;
+            }
+        }
+
+#if TARGET_OS_TV
+
+        else if ([controller microGamepad]) {
+            GCMicroGamepad *gamepad = [controller microGamepad];
+            GCControllerDirectionPad *dpad = [gamepad dpad];
+            switch (buttonID) {
+                case PVGenesisButtonUp:
+                    return [[dpad up] value] > 0.5;
+                    break;
+                case PVGenesisButtonDown:
+                    return [[dpad down] value] > 0.5;
+                    break;
+                case PVGenesisButtonLeft:
+                    return [[dpad left] value] > 0.5;
+                    break;
+                case PVGenesisButtonRight:
+                    return [[dpad right] value] > 0.5;
+                    break;
+                case PVGenesisButtonA:
+                    return [[gamepad buttonA] isPressed];
+                    break;
+                case PVGenesisButtonB:
+                    return [[gamepad buttonX] isPressed];
+                    break;
+                // Siri Remote: do NOT bind Start to buttonMenu — buttonMenu is
+                // owned by the pause-menu pipeline (controllerPausedHandler) and
+                // polling it from the bridge suppresses pause. Use a real MFi
+                // controller for Start on Genesis.
+                default:
+                    break;
+            }
+        }
+
+  #endif
+
+    }
+  
+    
+    return 0;
+}
+
+#pragma mark - State Saving
+
+- (BOOL)saveStateToFileAtPath:(NSString *)path error:(NSError *__autoreleasing *)error
+{
+    @synchronized(self) {
+        int serial_size = retro_serialize_size();
+        uint8_t *serial_data = (uint8_t *) malloc(serial_size);
+        
+        retro_serialize(serial_data, serial_size);
+        
+        NSError *error = nil;
+        NSData *saveStateData = [NSData dataWithBytes:serial_data length:serial_size];
+        free(serial_data);
+        BOOL success = [saveStateData writeToFile:path
+                                          options:NSDataWritingAtomic
+                                            error:&error];
+        if (!success) {
+            ELOG(@"Error saving state: %@", [error localizedDescription]);
+            return NO;
+        }
+        
+        return YES;
+    }
+}
+
+- (BOOL)loadStateFromFileAtPath:(NSString *)path error:(NSError *__autoreleasing *)error
+{
+    @synchronized(self) {
+        NSData *saveStateData = [NSData dataWithContentsOfFile:path];
+        if (!saveStateData)
+        {
+			if(error != NULL) {
+				NSDictionary *userInfo = @{
+										   NSLocalizedDescriptionKey: @"Failed to load save state.",
+										   NSLocalizedFailureReasonErrorKey: @"Genesis failed to read savestate data.",
+										   NSLocalizedRecoverySuggestionErrorKey: @"Check that the path is correct and file exists."
+										   };
+
+				NSError *newError = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+														code:PVEmulatorCoreErrorCodeCouldNotLoadState
+													userInfo:userInfo];
+				*error = newError;
+			}
+            ELOG(@"Unable to load save state from path: %@", path);
+            return NO;
+        }
+        
+        if (!retro_unserialize([saveStateData bytes], [saveStateData length]))
+        {
+			if(error != NULL) {
+				NSDictionary *userInfo = @{
+					NSLocalizedDescriptionKey: @"Failed to load save state.",
+					NSLocalizedFailureReasonErrorKey: @"Genesis failed to load savestate data.",
+					NSLocalizedRecoverySuggestionErrorKey: @"Check that the path is correct and file exists."
+				};
+
+				NSError *newError = [NSError errorWithDomain:PVEmulatorCoreErrorDomain
+														code:PVEmulatorCoreErrorCodeCouldNotLoadState
+													userInfo:userInfo];
+				*error = newError;
+			}
+            DLOG(@"Unable to load save state");
+            return NO;
+        }
+        
+        return YES;
+    }
+}
+
+@end

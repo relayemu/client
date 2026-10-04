@@ -1,0 +1,11 @@
+{
+  "upstream": "https://github.com/melonDS-emu/melonDS",
+  "commit": "906e9ebb27da8c6a715cd7abab4abfe8a8d29427",
+  "committedAt": "2026-08-23T22:29:01Z",
+  "archive": "https://github.com/melonDS-emu/melonDS/archive/906e9ebb27da8c6a715cd7abab4abfe8a8d29427.tar.gz",
+  "archiveSHA256": "5edcd49fe593df24e47f29eb27636c8c4d3698dc21ac224697708a8fcd9ea262",
+  "retrievedOn": "2026-09-04",
+  "license": "GPL-3.0-or-later",
+  "mechanism": "vendored-archive",
+  "note": "Exact upstream tree, unmodified. Relay builds src/ without ARMJIT, OpenGL, net, GDB stub and the Qt/SDL frontend; Relay-specific code is limited to Package.swift, RELAY_VENDOR.json and RelayBridge/ in this directory, plus Packages/RelayEmulation/Sources/RelayMelonAdapter."
+}

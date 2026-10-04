@@ -1,0 +1,832 @@
+//
+//  AudioUnitGameAudioEngine.swift
+//
+//  Created by Joseph Mattiello on 11/9/24.
+//
+
+import Foundation
+import os
+import AudioToolbox
+import AudioUnit
+import CoreGraphics
+import AVFoundation
+import CoreAudio
+import PVAudio
+import PVLogging
+import PVSettings
+import Accelerate
+import QuartzCore
+
+#if SWIFT_PACKAGE
+import PVCoreBridge
+#endif
+
+#if !os(macOS)
+
+extension AVAudioSession {
+    var isMuted: Bool {
+        let currentVolume = self.outputVolume
+        return currentVolume > 0 && (self.outputVolume == 0)
+    }
+}
+#endif
+
+public typealias AudioDeviceID = UInt32
+
+/// Audio context manages the buffer and format conversion for a single audio stream
+final class OEGameAudioContext {
+    /// Core audio properties
+    let buffer: RingBufferProtocol?
+    let channelCount: Int32
+    let bytesPerSample: Int32
+    let sourceFormat: AVAudioFormat
+    let outputFormat: AVAudioFormat
+    let converter: AVAudioConverter?
+    let sourceBuffer: AVAudioPCMBuffer?
+
+    /// Buffer management
+    var bufferUnderrunCount: Int = 0
+    var currentBufferFrames: UInt32 = 4096
+
+    /// Reference to audio engine for adjusting converter
+    weak var audioEngine: AudioUnitGameAudioEngine?
+
+    /// Performance tracking
+    private var performanceHistory: [Double] = []
+    private let maxHistorySize = 10
+
+    init(buffer: RingBufferProtocol?,
+         channelCount: Int32,
+         bytesPerSample: Int32,
+         sampleRate: Double,
+         audioEngine: AudioUnitGameAudioEngine) {
+        self.buffer = buffer
+        self.channelCount = channelCount
+        self.bytesPerSample = bytesPerSample
+        self.audioEngine = audioEngine
+
+        /// Setup source format based on input parameters
+        sourceFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: sampleRate,
+            channels: AVAudioChannelCount(channelCount),
+            interleaved: true
+        )!
+
+        /// Setup output format (44.1kHz stereo)
+        outputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 44100.0,
+            channels: 2,
+            interleaved: true
+        )!
+
+        converter = AVAudioConverter(from: sourceFormat, to: outputFormat)
+        sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: 4096)
+    }
+
+    /// Adjust buffer size based on performance
+    func adjustBufferSize(forFrames frames: UInt32) {
+        guard let audioEngine = audioEngine,
+              let converterUnit = audioEngine.auMetaData.mConverterUnit else { return }
+
+        if bufferUnderrunCount > 5 {
+            let optimalFrames = min(currentBufferFrames * 2, 8192)
+            if optimalFrames != currentBufferFrames {
+                var maxFrames = optimalFrames
+                let err = AudioUnitSetProperty(
+                    converterUnit,
+                    kAudioUnitProperty_MaximumFramesPerSlice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &maxFrames,
+                    UInt32(MemoryLayout<UInt32>.size)
+                )
+                if err == noErr {
+                    currentBufferFrames = optimalFrames
+                    DLOG("Adjusted buffer size to \(optimalFrames) frames")
+                }
+            }
+            bufferUnderrunCount = 0
+        }
+    }
+
+    /// Update buffer size based on performance history
+    func updateBufferSize() {
+        guard let audioEngine = audioEngine,
+              let converterUnit = audioEngine.auMetaData.mConverterUnit else { return }
+
+        let performanceRatio = Double(bufferUnderrunCount) / 100.0
+        performanceHistory.append(performanceRatio)
+        if performanceHistory.count > maxHistorySize {
+            performanceHistory.removeFirst()
+        }
+
+        let avgPerformance = performanceHistory.reduce(0.0, +) / Double(performanceHistory.count)
+
+        let idealFrameSize: UInt32
+        switch avgPerformance {
+        case 0...0.1:  /// Excellent performance
+            idealFrameSize = 1024
+        case 0.1...0.3:  /// Good performance
+            idealFrameSize = 2048
+        case 0.3...0.5:  /// Fair performance
+            idealFrameSize = 4096
+        default:  /// Poor performance
+            idealFrameSize = 8192
+        }
+
+        if idealFrameSize != currentBufferFrames {
+            adjustBufferSize(forFrames: idealFrameSize)
+        }
+    }
+}
+
+/// Render callback function for processing audio data
+func RenderCallback(inRefCon: UnsafeMutableRawPointer,
+                   ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                   inTimeStamp: UnsafePointer<AudioTimeStamp>,
+                   inBusNumber: UInt32,
+                   inNumberFrames: UInt32,
+                   ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+
+    let context = Unmanaged<OEGameAudioContext>.fromOpaque(inRefCon).takeUnretainedValue()
+
+    guard let buffer = context.buffer,
+          let outputData = ioData?.pointee.mBuffers.mData else {
+        return noErr
+    }
+
+    /// Calculate frames based on sample rates
+    let ratio = context.sourceFormat.sampleRate / context.outputFormat.sampleRate
+    let sourceFramesNeeded = UInt32(Double(inNumberFrames) * ratio)
+
+    /// Calculate bytes needed based on source format
+    let bytesPerFrame = Int(context.bytesPerSample * context.channelCount)
+    let bytesNeeded = Int(sourceFramesNeeded) * bytesPerFrame
+
+    /// Read from ring buffer
+    let availableBytes = buffer.availableBytesForReading
+    let bytesToRead = min(availableBytes, bytesNeeded)
+
+    if bytesToRead > 0 {
+        /// Read data
+        let bytesRead = buffer.read(outputData, preferredSize: bytesToRead)
+        
+        // Capture audio data for visualization if we have an audio engine reference
+        if let audioEngine = context.audioEngine {
+            audioEngine.captureAudioDataForVisualization(outputData, bytesRead, context.channelCount)
+        }
+
+        /// Update buffer size
+        ioData?.pointee.mBuffers.mDataByteSize = UInt32(bytesRead)
+
+        /// Handle underrun
+        if bytesRead < bytesNeeded {
+            DLOG("""
+                Buffer underrun:
+                - Bytes read: \(bytesRead)
+                - Bytes needed: \(bytesNeeded)
+                - Available bytes: \(availableBytes)
+                - Frames requested: \(inNumberFrames)
+                - Source frames needed: \(sourceFramesNeeded)
+                """)
+            context.bufferUnderrunCount += 1
+
+            /// Fill remaining space with silence
+            let remainingBytes = bytesNeeded - bytesRead
+            memset(outputData + bytesRead, 0, remainingBytes)
+            ioData?.pointee.mBuffers.mDataByteSize = UInt32(bytesNeeded)
+        } else {
+            context.bufferUnderrunCount = max(0, context.bufferUnderrunCount - 1)
+        }
+
+        context.updateBufferSize()
+    } else {
+        /// No data available, output silence
+        memset(outputData, 0, bytesNeeded)
+        ioData?.pointee.mBuffers.mDataByteSize = UInt32(bytesNeeded)
+    }
+
+    return noErr
+}
+
+@objc(OEGameAudioEngine)
+public final class AudioUnitGameAudioEngine: NSObject, AudioEngineProtocol {
+
+    /// Metadata for Audio Units and Graph
+    internal final class AUMetaData {
+        var mGraph: AUGraph? = nil
+        var mOutputNode: AUNode = 0
+        var mOutputUnit: AudioUnit? = nil
+        var mMixerNode: AUNode = 0
+        var mMixerUnit: AudioUnit? = nil
+        var mConverterNode: AUNode = 0
+        var mConverterUnit: AudioUnit? = nil
+        var mFilterNode: AUNode = 0
+        var mFilterUnit: AudioUnit? = nil
+
+        func uninitialize() {
+            if let mGraph = mGraph  {
+                AUGraphStop(mGraph)
+                AUGraphClose(mGraph)
+                AUGraphUninitialize(mGraph)
+            }
+            self.mGraph = nil
+        }
+    }
+
+    /// Audio engine properties
+    private var _contexts: [OEGameAudioContext] = [OEGameAudioContext]()
+    private var _outputDeviceID: UInt32 = 0
+    @objc public var running: Bool = false
+    internal var auMetaData: AUMetaData
+    private let muteSwitchMonitor = PVMuteSwitchMonitor()
+    
+    /// Audio buffer for waveform visualization
+    private var audioBufferForVisualization = [Float](repeating: 0, count: 4096)
+    private let audioBufferLock = OSAllocatedUnfairLock<Void>(initialState: ())
+
+    /// Volume control
+    @objc public var volume: Float = 1.0 {
+        didSet {
+            volumeUpdated()
+        }
+    }
+
+    public var respectsSilentMode: Bool = true {
+        didSet {
+            volumeUpdated()
+        }
+    }
+
+    /// Initialize audio engine
+    public override init() {
+        auMetaData = .init()
+        super.init()
+        _outputDeviceID = 0
+        volume = 1
+        setupAudioRouteChangeMonitoring()
+
+        // Start mute switch monitoring
+        muteSwitchMonitor.startMonitoring { [weak self] isMuted in
+            self?.volumeUpdated()
+        }
+
+        // Observe changes to respectMuteSwitch setting
+        Task {
+            for await newValue in Defaults.updates(Defaults.Keys.respectMuteSwitch) {
+                await MainActor.run { [weak self] in
+                    self?.volumeUpdated()
+                }
+            }
+        }
+    }
+
+    /// Cleanup resources
+    deinit {
+        muteSwitchMonitor.stopMonitoring()
+        let auMetaData = self.auMetaData
+        Task { @MainActor in
+            if let mGraph = auMetaData.mGraph {
+                AUGraphUninitialize(mGraph)
+                DisposeAUGraph(mGraph)
+            }
+        }
+    }
+
+    /// Audio control methods
+    @objc public func pauseAudio() {
+        stopAudio()
+        running = false
+        // Drain stale audio data after stopping the consumer (#3183).
+        // Use clear() instead of reset() to avoid deallocating/reinitialising
+        // the backing buffer while the emulator core may still be writing.
+        // Deduplicate by buffer identity so each ring buffer is cleared once,
+        // even if _contexts has grown across multiple setupAudioGraph calls.
+        var seen = Set<ObjectIdentifier>()
+        for context in _contexts {
+            guard let buf = context.buffer else { continue }
+            let id = ObjectIdentifier(buf as AnyObject)
+            guard seen.insert(id).inserted else { continue }
+            buf.clear()
+        }
+    }
+
+    @objc public func startAudio() throws {
+        var err: OSStatus
+
+        if let mgraph = auMetaData.mGraph {
+            err = AUGraphStart(mgraph)
+            if err != 0 {
+                ELOG("couldn't start graph")
+                running = false
+                throw AudioEngineError.failedToCreateAudioEngine(err)
+            } else {
+                running = true
+                volumeUpdated()
+                DLOG("Started the graph")
+            }
+        } else {
+            WLOG("Graph not created yet. Forget to call `setupAudioGraph()`?")
+            running = false
+        }
+    }
+
+    @objc public func stopAudio() {
+        if let mGraph = auMetaData.mGraph {
+            AUGraphStop(mGraph)
+            AUGraphClose(mGraph)
+            AUGraphUninitialize(mGraph)
+        }
+        running = false
+    }
+    
+    /// Captures audio data for visualization
+    internal func captureAudioDataForVisualization(_ buffer: UnsafeMutableRawPointer, _ byteCount: Int, _ channels: Int32) {
+        // Only process if we have enough data
+        guard byteCount > 0 else { return }
+        
+        audioBufferLock.withLock {
+            // Process 16-bit PCM audio data
+            let samples = buffer.bindMemory(to: Int16.self, capacity: byteCount / 2)
+            let sampleCount = min(byteCount / 2, audioBufferForVisualization.count)
+
+            // For stereo, average the channels
+            if channels == 2 {
+                for i in 0..<(sampleCount / 2) {
+                    let leftSample = Float(samples[i * 2]) / Float(Int16.max)
+                    let rightSample = Float(samples[i * 2 + 1]) / Float(Int16.max)
+                    audioBufferForVisualization[i] = (leftSample + rightSample) / 2.0
+                }
+            } else {
+                // For mono, just convert to float
+                for i in 0..<sampleCount {
+                    audioBufferForVisualization[i] = Float(samples[i]) / Float(Int16.max)
+                }
+            }
+        }
+    }
+
+    /// Get waveform data for visualization
+    public func getWaveformData(numberOfPoints: Int) -> WaveformData {
+        audioBufferLock.withLock {
+            // Create a result array of the requested size
+            var result = [Float](repeating: 0, count: numberOfPoints)
+
+            // If we don't have enough data or engine isn't running, return zeros
+            guard running, !audioBufferForVisualization.isEmpty else {
+                return WaveformData(amplitudes: result)
+            }
+
+            // Use Accelerate framework to downsample the audio buffer to the requested number of points
+            let inputLength = vDSP_Length(audioBufferForVisualization.count)
+            let stride = max(1, Int(inputLength) / numberOfPoints)
+
+            for i in 0..<numberOfPoints {
+                let startIdx = i * stride
+                let endIdx = min(startIdx + stride, audioBufferForVisualization.count)
+
+                if startIdx < endIdx {
+                    // Take absolute values for visualization
+                    var absValues = [Float](repeating: 0, count: endIdx - startIdx)
+                    vDSP_vabs(Array(audioBufferForVisualization[startIdx..<endIdx]), 1, &absValues, 1, vDSP_Length(endIdx - startIdx))
+
+                    // Find the maximum value in this segment
+                    var maxValue: Float = 0
+                    vDSP_maxv(absValues, 1, &maxValue, vDSP_Length(absValues.count))
+
+                    result[i] = maxValue
+                }
+            }
+
+            return WaveformData(amplitudes: result)
+        }
+    }
+
+    /// iOS audio session setup
+    private func configureAudioSession() {
+        #if !os(macOS)
+        do {
+            let session = AVAudioSession.sharedInstance()
+            // Use .playback category when ignoring mute switch, .ambient otherwise
+            let category: AVAudioSession.Category = Defaults[.respectMuteSwitch] ? .ambient : .playback
+            try session.setCategory(category,
+                                  mode: .default,
+                                  options: [.mixWithOthers])
+            let bufferDuration = Defaults[.audioLatency] / 1000.0
+            try session.setPreferredIOBufferDuration(bufferDuration)
+            try session.setActive(true)
+        } catch {
+            ELOG("Failed to configure audio session: \(error.localizedDescription)")
+        }
+        #endif
+    }
+
+    private func setupAudioSession() throws {
+        #if !os(macOS)
+        try configureAudioSession()
+        ILOG("Successfully set audio session to \(Defaults[.respectMuteSwitch] ? ".ambient" : ".playback")")
+        #endif
+    }
+
+    /// Setup the audio processing graph
+    public func setupAudioGraph(for gameCore: EmulatorCoreAudioDataSource) throws {
+        #if !os(macOS)
+        try setupAudioSession()
+        #endif
+
+        var err: OSStatus
+        auMetaData.uninitialize()
+
+        /// Create new AUGraph
+        var graph: AUGraph?
+        err = NewAUGraph(&graph)
+        if err != noErr {
+            ELOG("Error creating AUGraph: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+        auMetaData.mGraph = graph
+
+        guard let mGraph = auMetaData.mGraph else {
+            ELOG("Failed to create AUGraph")
+            throw AudioEngineError.failedToCreateAudioEngine(-1)
+        }
+
+        /// Setup output node
+        #if os(iOS) || os(tvOS)
+        let componentSubType = kAudioUnitSubType_RemoteIO
+        #else
+        let componentSubType = kAudioUnitSubType_DefaultOutput
+        #endif
+
+        var outputcd = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: componentSubType,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+
+        err = AUGraphAddNode(mGraph, &outputcd, &auMetaData.mOutputNode)
+        if err != noErr {
+            ELOG("Error adding output node: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Setup mixer node
+        var mixercd = AudioComponentDescription(
+            componentType: kAudioUnitType_Mixer,
+            componentSubType: kAudioUnitSubType_MultiChannelMixer,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+
+        err = AUGraphAddNode(mGraph, &mixercd, &auMetaData.mMixerNode)
+        if err != noErr {
+            ELOG("Error adding mixer node: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Setup converter node
+        var convertercd = AudioComponentDescription(
+            componentType: kAudioUnitType_FormatConverter,
+            componentSubType: kAudioUnitSubType_AUConverter,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+
+        err = AUGraphAddNode(mGraph, &convertercd, &auMetaData.mConverterNode)
+        if err != noErr {
+            ELOG("Error adding converter node: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Setup filter node
+        var filtercd = AudioComponentDescription(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: kAudioUnitSubType_LowPassFilter,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+
+        err = AUGraphAddNode(mGraph, &filtercd, &auMetaData.mFilterNode)
+        if err != noErr {
+            ELOG("Error adding filter node: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Open graph to get audio units
+        err = AUGraphOpen(mGraph)
+        if err != noErr {
+            ELOG("Error opening graph: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Get audio units
+        err = AUGraphNodeInfo(mGraph, auMetaData.mOutputNode, nil, &auMetaData.mOutputUnit)
+        if err != noErr {
+            ELOG("Error getting output unit: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AUGraphNodeInfo(mGraph, auMetaData.mMixerNode, nil, &auMetaData.mMixerUnit)
+        if err != noErr {
+            ELOG("Error getting mixer unit: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AUGraphNodeInfo(mGraph, auMetaData.mConverterNode, nil, &auMetaData.mConverterUnit)
+        if err != noErr {
+            ELOG("Error getting converter unit: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AUGraphNodeInfo(mGraph, auMetaData.mFilterNode, nil, &auMetaData.mFilterUnit)
+        if err != noErr {
+            ELOG("Error getting filter unit: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Setup formats
+        let channelCount = gameCore.channelCount(forBuffer: 0)
+        let bytesPerSample = gameCore.audioBitDepth / 8
+
+        var streamFormat = AudioStreamBasicDescription(
+            mSampleRate: gameCore.audioSampleRate(forBuffer: 0),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channelCount * bytesPerSample),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channelCount * bytesPerSample),
+            mChannelsPerFrame: UInt32(channelCount),
+            mBitsPerChannel: UInt32(gameCore.audioBitDepth),
+            mReserved: 0
+        )
+
+        var outputFormat = AudioStreamBasicDescription(
+            mSampleRate: 44100.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagsCanonical,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+
+        /// Log formats
+        logAudioFormat(streamFormat, label: "Source Format")
+        logAudioFormat(outputFormat, label: "Output Format")
+
+        /// Set formats on converter
+        err = AudioUnitSetProperty(
+            auMetaData.mConverterUnit!,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input,
+            0,
+            &streamFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        if err != noErr {
+            ELOG("Error setting converter input format: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AudioUnitSetProperty(
+            auMetaData.mConverterUnit!,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output,
+            0,
+            &outputFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        if err != noErr {
+            ELOG("Error setting converter output format: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Connect nodes: Converter -> Mixer -> Filter -> Output
+        err = AUGraphConnectNodeInput(mGraph,
+                                    auMetaData.mConverterNode, 0,
+                                    auMetaData.mMixerNode, 0)
+        if err != noErr {
+            ELOG("Error connecting converter to mixer: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AUGraphConnectNodeInput(mGraph,
+                                    auMetaData.mMixerNode, 0,
+                                    auMetaData.mFilterNode, 0)
+        if err != noErr {
+            ELOG("Error connecting mixer to filter: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        err = AUGraphConnectNodeInput(mGraph,
+                                    auMetaData.mFilterNode, 0,
+                                    auMetaData.mOutputNode, 0)
+        if err != noErr {
+            ELOG("Error connecting filter to output: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Create and setup audio context
+        let context = OEGameAudioContext(
+            buffer: gameCore.ringBuffer(atIndex: 0),
+            channelCount: Int32(channelCount),
+            bytesPerSample: Int32(bytesPerSample),
+            sampleRate: gameCore.audioSampleRate(forBuffer: 0),
+            audioEngine: self
+        )
+        _contexts.append(context)
+
+        /// Setup render callback
+        var input = AURenderCallbackStruct(
+            inputProc: RenderCallback,
+            inputProcRefCon: Unmanaged.passRetained(context).toOpaque()
+        )
+
+        err = AUGraphSetNodeInputCallback(mGraph,
+                                        auMetaData.mConverterNode,
+                                        0,
+                                        &input)
+        if err != noErr {
+            ELOG("Error setting input callback: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        /// Initialize graph
+        err = AUGraphInitialize(mGraph)
+        if err != noErr {
+            ELOG("Error initializing graph: \(err)")
+            throw AudioEngineError.failedToCreateAudioEngine(err)
+        }
+
+        ILOG("Audio graph setup complete")
+    }
+
+    /// Volume control methods
+    private func shouldMuteAudio() -> Bool {
+        #if os(macOS)
+        return false
+        #else
+        guard respectsSilentMode else { return false }
+
+        let audioSession = AVAudioSession.sharedInstance()
+        let currentRoute = audioSession.currentRoute
+
+        return audioSession.isSilentModeEnabled &&
+               !currentRoute.isOutputtingToExternalDevice
+        #endif
+    }
+
+    private func volumeUpdated() {
+        if running, let mMixerUnit = auMetaData.mMixerUnit {
+            let effectiveVolume = (Defaults[.respectMuteSwitch] && muteSwitchMonitor.isMuted) ? 0 : volume
+            AudioUnitSetParameter(
+                mMixerUnit,
+                kMultiChannelMixerParam_Volume,
+                kAudioUnitScope_Input,
+                0,
+                effectiveVolume,
+                0
+            )
+        }
+    }
+
+    @objc public func volumeUp() {
+        volume = min(volume + 0.1, 1.0)
+    }
+
+    @objc public func volumeDown() {
+        volume = max(volume - 0.1, 0.0)
+    }
+
+    public func setVolume(_ volume: Float) {
+        self.volume = volume
+    }
+
+    /// Device management
+    @objc public var outputDeviceID: AudioDeviceID = 0 {
+        didSet {
+            try? setOutputDeviceID(outputDeviceID)
+        }
+    }
+
+    public func setOutputDeviceID(_ outputDeviceID: AudioDeviceID) throws {
+        var outputDeviceID = outputDeviceID
+        let currentID = self.outputDeviceID
+        if outputDeviceID != currentID {
+            _outputDeviceID = outputDeviceID
+
+            if let mOutputUnit = auMetaData.mOutputUnit {
+                let err = AudioUnitSetProperty(
+                    mOutputUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &outputDeviceID,
+                    UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+
+                if err != 0 {
+                    ELOG("couldn't set current output device ID")
+                    throw AudioEngineError.failedToCreateAudioEngine(err)
+                } else {
+                    DLOG("Set current output device ID to \(outputDeviceID)")
+                }
+            }
+        }
+    }
+
+    /// Filter control
+    public func setFilterEnabled(_ enabled: Bool) {
+        guard let filterUnit = auMetaData.mFilterUnit else { return }
+
+        var bypass: UInt32 = enabled ? 0 : 1
+        AudioUnitSetProperty(
+            filterUnit,
+            kAudioUnitProperty_BypassEffect,
+            kAudioUnitScope_Global,
+            0,
+            &bypass,
+            UInt32(MemoryLayout<UInt32>.size)
+        )
+    }
+
+    /// Format logging
+    private func logAudioFormat(_ format: AudioStreamBasicDescription, label: String) {
+        DLOG("\(label):")
+        DLOG("- Sample Rate: \(format.mSampleRate)")
+        DLOG("- Channels: \(format.mChannelsPerFrame)")
+        DLOG("- Bits: \(format.mBitsPerChannel)")
+        DLOG("- Bytes/Frame: \(format.mBytesPerFrame)")
+        DLOG("- Bytes/Packet: \(format.mBytesPerPacket)")
+        DLOG("- Frames/Packet: \(format.mFramesPerPacket)")
+        DLOG("- Format ID: \(format.mFormatID)")
+        DLOG("- Format Flags: \(format.mFormatFlags)")
+    }
+
+    /// Error handling
+    private func handleAudioError(_ error: Error) {
+        ELOG("Audio error occurred: \(error.localizedDescription)")
+
+        do {
+            stopAudio()
+            Thread.sleep(forTimeInterval: 0.1)
+
+            #if !os(macOS)
+            try setupAudioSession()
+            #endif
+
+            try startAudio()
+            DLOG("Successfully recovered from audio error")
+        } catch {
+            ELOG("Failed to recover from audio error: \(error.localizedDescription)")
+            NotificationCenter.default.post(
+                name: NSNotification.Name("AudioEngineErrorNotification"),
+                object: self,
+                userInfo: ["error": error]
+            )
+        }
+    }
+
+    /// iOS route change handling
+    private func setupAudioRouteChangeMonitoring() {
+        #if !os(macOS)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+        #endif
+    }
+
+    @objc private func handleAudioRouteChange(notification: Notification) {
+        #if !os(macOS)
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+        else { return }
+
+        switch reason {
+        case .newDeviceAvailable, .oldDeviceUnavailable:
+            do {
+                try configureAudioSession()
+                try startAudio()
+                volumeUpdated() // Update volume based on new route
+            } catch {
+                handleAudioError(error)
+            }
+        default:
+            break
+        }
+        #endif
+    }
+}

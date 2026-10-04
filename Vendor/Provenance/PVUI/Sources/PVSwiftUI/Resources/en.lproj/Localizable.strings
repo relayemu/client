@@ -1,0 +1,454 @@
+"DeleteGameTitle" = "Delete Game?";
+"DeleteGameBody" = "Are you sure you want to delete game \"%@\"?";
+"OK" = "OK";
+"Cancel" = "Cancel";
+"Delete" = "Delete";
+"Error" = "Error";
+"Warning" = "Warning";
+
+// MARK: - Settings (SettingsSwiftUI.swift)
+"settings.title" = "SETTINGS";
+"settings.subtitle" = "CONFIGURE YOUR EXPERIENCE";
+"settings.done" = "DONE";
+"settings.help" = "HELP";
+
+"settings.tab.general" = "GENERAL";
+"settings.tab.emulation" = "EMULATION";
+"settings.tab.controller" = "CONTROLLER";
+"settings.tab.about" = "ABOUT";
+"settings.tab.advanced" = "ADVANCED";
+
+"settings.section.app" = "App";
+"settings.section.core_options" = "Core Options";
+"settings.section.saves" = "Saves";
+"settings.section.social" = "Social";
+"settings.section.documentation" = "Documentation";
+"settings.section.build_information" = "Build Information";
+"settings.section.third_party_legal" = "3rd Party & Legal";
+"settings.section.audio" = "Audio";
+"settings.section.video" = "Video";
+"settings.section.recording_streaming" = "Recording & Streaming";
+
+"settings.section.controllers" = "Controllers";
+"settings.section.analog_deadzone" = "Analog Deadzone";
+"settings.section.haptics_rumble" = "Haptics & Rumble";
+"settings.section.on_screen_controller" = "On-Screen Controller";
+"settings.section.library" = "Library";
+"settings.section.library_management" = "Library Management";
+"settings.section.advanced" = "Advanced";
+"settings.section.retroachievements" = "RetroAchievements";
+
+"settings.app.change_app_icon" = "Change App Icon";
+
+"settings.saves.auto_save_time" = "Auto-save Time";
+"settings.saves.auto_save_time_label" = "Auto-save Time";
+"settings.saves.min_1" = "1m";
+"settings.saves.min_30" = "30m";
+
+"settings.legal.view_licenses_title" = "View Licenses";
+"settings.legal.view_licenses_message" = "Licenses are available in the iOS/iPadOS app or at:\nhttps://provenance-emu.com/licenses/";
+"settings.legal.privacy_policy_title" = "Privacy Policy";
+"settings.legal.privacy_policy_message" = "Visit our privacy policy at:\nhttps://provenance-emu.com/privacy/";
+"settings.legal.eula_title" = "EULA";
+"settings.legal.eula_message" = "Apple's standard EULA is available at:\nhttps://www.apple.com/legal/internet-services/itunes/dev/stdeula/";
+
+"settings.audio.volume" = "Volume";
+"settings.audio.volume_level" = "Volume Level";
+"settings.audio.volume_description" = "System-wide volume level for games.";
+
+"settings.controller.deadzone" = "Deadzone";
+"settings.controller.core_compatibility" = "Core Compatibility";
+"settings.controller.coordinated" = "Coordinated";
+"settings.controller.coming_soon" = "Coming Soon";
+"settings.controller.intensity" = "Intensity";
+"settings.controller.test_rumble" = "Test Rumble";
+"settings.controller.test_rumble_description" = "Fire a short rumble on connected controllers and/or device.";
+
+"settings.on_screen.controller_opacity" = "Controller Opacity";
+"settings.on_screen.transparency_description" = "Transparency amount of on-screen controls overlays.";
+
+"settings.skins.skin_mode" = "SKIN MODE";
+"settings.skins.download_more" = "Download more skins from DeltaStyles";
+"settings.skins.visit_deltastyles" = "Visit DeltaStyles.com";
+
+"settings.plus.active_title" = "PROVENANCE PLUS ACTIVE";
+"settings.plus.thank_you" = "Thank you for your support!";
+"settings.plus.upgrade_title" = "UPGRADE TO PROVENANCE PLUS";
+"settings.plus.upgrade_description" = "Unlock cloud sync, premium themes & more";
+
+// MARK: - Cloud Sync (CloudSyncSettingsView.swift)
+"cloud_sync.title_tvos" = "CLOUD SYNC";
+"cloud_sync.title" = "Cloud Sync";
+"cloud_sync.syncing" = "Syncing...";
+
+"cloud_sync.account.issue_title" = "iCloud Account Issue";
+"cloud_sync.account.issue_description" = "CloudKit sync requires a valid iCloud account. Please check your iCloud settings in System Settings.";
+
+"cloud_sync.logs.title" = "Sync Logs";
+
+"cloud_sync.activity.title" = "Sync Activity (Uploads - Last 7 Days)";
+"cloud_sync.activity.no_recent" = "No recent sync activity found.";
+
+"cloud_sync.status.title" = "Sync Status";
+"cloud_sync.status.refresh" = "Refresh";
+"cloud_sync.status.mode %@" = "Mode: %@";
+"cloud_sync.status.local_files" = "Local Files";
+"cloud_sync.status.icloud_files" = "iCloud Files";
+"cloud_sync.status.differences" = "Differences";
+"cloud_sync.status.load_diagnostics" = "Load Diagnostics";
+
+"cloud_sync.records.cloudkit" = "CloudKit Records";
+"cloud_sync.records.total" = "Total Records:";
+"cloud_sync.records.storage_distribution" = "Storage Distribution";
+
+
+"cloud_sync.progress.title" = "Sync Progress";
+"cloud_sync.progress.current_file" = "Current File:";
+"cloud_sync.progress.current_file_format %@" = "Current File: %@";
+"cloud_sync.progress.progress_label" = "Progress:";
+// Pluralized via Localizable.stringsdict: cloud_sync.progress.files_progress
+"cloud_sync.progress.completed" = "Completed";
+"cloud_sync.progress.total" = "Total";
+"cloud_sync.progress.remaining" = "Remaining";
+
+"cloud_sync.records.roms" = "ROMs:";
+"cloud_sync.records.save_states" = "Save States:";
+"cloud_sync.records.bios" = "BIOS:";
+"cloud_sync.records.battery_states" = "Battery States:";
+"cloud_sync.records.screenshots" = "Screenshots:";
+"cloud_sync.records.delta_skins" = "Delta Skins:";
+
+"cloud_sync.actions.title" = "Sync Actions";
+"cloud_sync.actions.sync_all" = "Sync All Content";
+"cloud_sync.actions.reset" = "Reset Cloud Sync";
+
+"cloud_sync.reset.alert_title" = "Reset Cloud Sync";
+"cloud_sync.reset.alert_message" = "This will delete all cloud sync data and restart the sync process. Are you sure you want to continue?";
+"cloud_sync.reset.confirm" = "Reset";
+
+"cloud_sync.pagination.directory" = "Directory";
+"cloud_sync.pagination.local_header" = "Local";
+"cloud_sync.pagination.icloud_header" = "iCloud";
+"cloud_sync.pagination.local_count %lld" = "Local: %lld";
+"cloud_sync.pagination.icloud_count %lld" = "iCloud: %lld";
+"cloud_sync.pagination.total_files" = "Total Files";
+
+// Pluralized via Localizable.stringsdict: cloud_sync.diff.header
+"cloud_sync.diff.no_differences" = "No differences found";
+"cloud_sync.diff.unknown" = "Unknown";
+"cloud_sync.diff.directory_unknown" = "Directory: Unknown";
+"cloud_sync.diff.local_only" = "Local Only";
+"cloud_sync.diff.icloud_only" = "iCloud Only";
+"cloud_sync.diff.different" = "Different";
+"cloud_sync.diff.synced" = "Synced";
+
+"cloud_sync.network.title" = "Network Settings";
+"cloud_sync.network.sync_mode" = "Sync Network Mode";
+"cloud_sync.network.max_cellular_size" = "Max Cellular File Size";
+
+"cloud_sync.frequency.title" = "Sync Frequency";
+"cloud_sync.frequency.check_for_changes" = "Check for Changes";
+
+"cloud_sync.content.title" = "Content Types";
+"cloud_sync.content.what_to_sync" = "What to Sync";
+
+"cloud_sync.power.title" = "Power Management";
+"cloud_sync.performance.title" = "Performance";
+"cloud_sync.advanced.title" = "Advanced";
+"cloud_sync.diagnostics.title" = "Diagnostics";
+
+// MARK: - TV Media Main View (TVMediaMainView.swift)
+"tv_media.hint.swipe_navigation" = "Swipe left or press Menu for navigation";
+"tv_media.help_wiki" = "HELP & WIKI";
+"tv_media.filter.clear" = "CLEAR FILTER";
+"tv_media.filter.by_system" = "FILTER BY SYSTEM";
+"tv_media.filter.select_systems" = "Select systems to show saves from";
+"tv_media.library.loading" = "LOADING LIBRARY";
+"tv_media.library.no_games" = "NO GAMES YET";
+"tv_media.library.add_roms_hint" = "Add ROMs via Web Server or CloudKit sync from an iPhone, iPad or Macintosh";
+"tv_media.library.icloud_in_progress" = "iCloud sync may be in progress";
+"tv_media.games" = "GAMES";
+// Pluralized via Localizable.stringsdict: tv_media.games_count
+"tv_media.all_system_games %@" = "ALL %@ GAMES";
+"tv_media.saves.view_all" = "VIEW ALL";
+// Pluralized via Localizable.stringsdict: tv_media.saves.count
+"tv_media.search.recent" = "RECENT";
+"tv_media.search.recent_searches" = "RECENT SEARCHES";
+"tv_media.search.clear_all" = "CLEAR ALL";
+"tv_media.search.searching" = "SEARCHING...";
+"tv_media.search.prompt" = "SEARCH YOUR LIBRARY";
+"tv_media.search.type_hint" = "Type to find games by title";
+"tv_media.search.no_results" = "NO RESULTS";
+"tv_media.search.try_recent" = "Try one of your recent searches above";
+"tv_media.favorites.no_favorites" = "No Favorites";
+"tv_media.favorites.mark_hint" = "Mark games as favorites to see them here.";
+"tv_media.imports.title" = "IMPORTS";
+"tv_media.imports.choose_option" = "Choose an option";
+"tv_media.imports.queue" = "Import Queue";
+"tv_media.imports.queue_subtitle" = "View active and completed imports";
+"tv_media.imports.free_roms" = "Free ROMs";
+"tv_media.imports.free_roms_subtitle" = "Browse open-source and public domain ROMs";
+"tv_media.imports.how_to_add" = "How to Add ROMs";
+"tv_media.imports.how_to_add_subtitle" = "Web server, AirDrop, and more";
+"tv_media.artwork.choose_source_title" = "Choose Artwork Source";
+"tv_media.artwork.choose_source_message" = "Select artwork from your photo library or search online sources";
+"tv_media.artwork.search_online" = "Search Online";
+"tv_media.artwork.select_from_photos" = "Select from Photos";
+"tv_media.status.importing" = "IMPORTING";
+"tv_media.status.syncing" = "SYNCING";
+"tv_media.status.processing" = "PROCESSING";
+"tv_media.roms.adding" = "ADDING ROMS";
+"tv_media.roms.several_ways" = "There are several ways to add ROMs to Provenance";
+"tv_media.roms.start_web_server" = "Start the web server from Settings to see the URL";
+"tv_media.roms.full_documentation" = "FULL DOCUMENTATION";
+"tv_media.import_queue.title" = "IMPORT QUEUE";
+"tv_media.import_queue.close" = "CLOSE";
+// Pluralized via Localizable.stringsdict: tv_media.import_queue.files_in_queue
+"tv_media.import_queue.no_pending" = "NO PENDING IMPORTS";
+"tv_media.import_queue.all_processed" = "All files have been processed";
+"tv_media.icloud_sync.title" = "iCLOUD SYNC";
+
+// MARK: - Retro Menu View (RetroMenuView.swift)
+"retro_menu.skins.session" = "Session";
+"retro_menu.skins.this_game" = "This Game";
+"retro_menu.skins.system" = "System";
+"retro_menu.filter.done" = "DONE";
+"retro_menu.filter.screen_filters" = "SCREEN FILTERS";
+"retro_menu.saves.no_screenshots" = "No Screenshots";
+"retro_menu.saves.screenshots_hint" = "Use \"Save Screenshot\" from the pause menu to capture screenshots.";
+"retro_menu.saves.no_save_states" = "No Save States";
+"retro_menu.saves.save_states_hint" = "Use \"Save State\" from the pause menu to create saves.";
+"retro_menu.saves.auto_save_to_photos" = "Auto-Save to Photos";
+"retro_menu.plus.badge" = "PLUS";
+
+// MARK: - Save Import Wizard (SaveImportWizardView.swift)
+
+// Navigation titles
+"save_import.nav.file_selection" = "Import Save";
+"save_import.nav.game_matching" = "Match Game";
+"save_import.nav.summary" = "Confirm Import";
+"save_import.nav.progress" = "Importing\u2026";
+"save_import.nav.done" = "Done";
+
+// File selection step
+"save_import.step1.title" = "IMPORT SAVE";
+"save_import.step1.importing_for" = "Importing save for:";
+"save_import.step1.description" = "Choose a .zip save bundle or a battery save file (.sav, .srm, .ram) to import.";
+"save_import.step1.choose_file" = "Choose File";
+
+// tvOS fallback hint
+"save_import.tvos.icloud_hint" = "On Apple TV, saves arrive via iCloud Drive sync. Enable iCloud sync in Cloud Settings and share a save bundle from another device to import it here.";
+
+// Game matching step
+"save_import.matching.finding" = "Finding matching game\u2026";
+"save_import.matching.exact" = "Exact Match";
+"save_import.matching.probable" = "Probable Match";
+"save_import.matching.manual" = "Manual Selection";
+"save_import.matching.no_match" = "No matching game found";
+"save_import.matching.use_this" = "Use This Game";
+"save_import.matching.select_game" = "Select Game";
+"save_import.matching.choose_different" = "Choose Different Game";
+
+// Summary step
+"save_import.summary.ready_for" = "Ready to import saves for";
+"save_import.summary.file_label" = "File";
+"save_import.summary.type_label" = "Type";
+"save_import.summary.bundle_type" = "Save Bundle (.%@)";
+"save_import.summary.battery_type" = "Battery Save (.%@)";
+"save_import.summary.import_now" = "Import Now";
+"save_import.summary.overwrite_singular" = "This game has %d existing save state. Importing may overwrite matching files.";
+"save_import.summary.overwrite_plural" = "This game has %d existing save states. Importing may overwrite matching files.";
+
+// Progress step
+"save_import.progress.title" = "IMPORTING\u2026";
+
+// Done step
+"save_import.done.success_title" = "IMPORT COMPLETE";
+"save_import.done.success_message" = "Saves restored successfully.\nThey will appear after a library refresh or app relaunch.";
+"save_import.done.states_restored" = "%d save state(s) restored";
+"save_import.done.sram_restored" = "Battery save restored";
+"save_import.done.failure_title" = "IMPORT FAILED";
+"save_import.done.button" = "Done";
+
+// Game picker sheet
+"save_import.picker.title" = "Select Game";
+"save_import.picker.search_prompt" = "Search games\u2026";
+// MARK: - External Emulator Migration (ExternalEmulatorMigrationView.swift)
+"migration.nav.title" = "Import from Another Emulator";
+"migration.header.title" = "Bring Your Saves Over";
+"migration.header.subtitle.ios" = "Tap an emulator below for step-by-step instructions to export and import your saves.";
+"migration.header.subtitle.tvos" = "Transfer save files to Provenance from another device using the web server.";
+"migration.section.detected" = "Detected Emulators";
+"migration.section.not_detected.ios" = "No Emulators Detected";
+"migration.section.not_detected.tvos" = "Third-Party Emulators";
+"migration.section.manual" = "Manual Import";
+"migration.section.ecosystem" = "Ecosystem Apps";
+"migration.empty.body.ios" = "Delta, RetroArch, PPSSPP, Manic EMU, Consoles, and Gamma were not found on this device.";
+"migration.empty.body.tvos" = "Third-party emulators are not available on Apple TV.";
+"migration.empty.footer.ios" = "You can still import save files manually using Files.app.";
+"migration.empty.footer.tvos" = "Use the Web Server to transfer save files from another device.";
+"migration.empty.want_instructions" = "Want step-by-step instructions anyway?";
+"migration.manual.title.ios" = "Import via Files.app";
+"migration.manual.title.tvos" = "Import via Web Server";
+"migration.manual.subtitle.ios" = "Copy .sav / .srm / .state files into Provenance's folder using the Files app";
+"migration.manual.subtitle.tvos" = "Transfer .sav / .srm / .state files into Provenance using the Web Server";
+"migration.save_formats.title" = "Save & State Extensions";
+"migration.save_formats.battery" = "Battery saves: %@";
+"migration.save_formats.states" = "Save states: %@";
+"migration.save_formats.retroarch_note" = "Save states use numbered extensions (.state0, .state1…). Battery saves use .srm.";
+"migration.guide.export_step1_title" = "Step 1 — Export from %@";
+"migration.guide.import_step2_title" = "Step 2 — Import into Provenance";
+"migration.guide.export_from" = "Export from %@";
+"migration.guide.done" = "Done";
+"migration.settings.nav_title" = "Import from Another Emulator";
+"migration.settings.row.subtitle.ios" = "Step-by-step guide to migrate saves from Delta, RetroArch, Manic EMU, Consoles, PPSSPP, or Gamma.";
+"migration.settings.row.subtitle.tvos" = "Transfer save files to Provenance using the built-in web server.";
+
+// MARK: - Ecosystem Integration (EcosystemIntegrationView.swift)
+"ecosystem.nav.title" = "Ecosystem Apps";
+"ecosystem.header.title" = "Launch via Ecosystem Apps";
+"ecosystem.header.subtitle" = "Open games directly in XeniOS, MeloNX, or MeloCafe from your Manic EMU library.";
+"ecosystem.section.detected" = "Available Apps";
+"ecosystem.section.not_detected" = "No Ecosystem Apps Found";
+"ecosystem.empty.body" = "XeniOS, MeloNX, and MeloCafe were not found on this device.";
+"ecosystem.empty.footer" = "Install these apps to enable cross-app game launching.";
+"ecosystem.section.not_installed" = "Not Installed";
+"ecosystem.action.open" = "Open %@";
+"ecosystem.action.query_library" = "Browse %@ Library";
+"ecosystem.app.xenios.description" = "Launch Xbox 360 games directly in XeniOS";
+"ecosystem.app.melonx.description" = "Launch Switch games directly in MeloNX";
+"ecosystem.app.melocafe.description" = "Launch Wii U games directly in MeloCafe";
+"ecosystem.feature_flag.note" = "This feature is experimental. Enable or disable it in Settings → Advanced → Feature Flags.";
+
+// MARK: - Migration export steps (per-emulator)
+"migration.delta.export.step1" = "Open Delta and go to the game you want to export.";
+"migration.delta.export.step2" = "Long-press the game thumbnail to reveal the context menu.";
+"migration.delta.export.step3" = "Tap 'Save States' to see your saves.";
+"migration.delta.export.step4" = "Tap the share icon (square with arrow) on the save you want.";
+"migration.delta.export.step5" = "Use the share sheet to send the file to Files.app or AirDrop to your Mac.";
+"migration.delta.export.step6" = "Repeat for each game you want to migrate.";
+"migration.manicemu.export.step1" = "Open Manic EMU and navigate to your game library.";
+"migration.manicemu.export.step2" = "Long-press a game to bring up options.";
+"migration.manicemu.export.step3" = "Tap 'Export Save' or 'Share Save'.";
+"migration.manicemu.export.step4" = "Save the .sav file to the Files app (iCloud Drive or local storage).";
+"migration.manicemu.export.step5" = "Repeat for each game.";
+"migration.consoles.export.step1" = "Open Consoles and navigate to your game library.";
+"migration.consoles.export.step2" = "Long-press a game to bring up options.";
+"migration.consoles.export.step3" = "Tap 'Export Save' or 'Share Save'.";
+"migration.consoles.export.step4" = "Save the .sav file to the Files app (iCloud Drive or local storage).";
+"migration.consoles.export.step5" = "Repeat for each game.";
+"migration.retroarch.export.step1" = "Open RetroArch and go to Main Menu → Load Content, then load your game.";
+"migration.retroarch.export.step2" = "Open the Quick Menu (tap the screen or press the menu button).";
+"migration.retroarch.export.step3" = "Tap 'Save State' to ensure a state is saved, then return to Quick Menu.";
+"migration.retroarch.export.step4" = "Go to Quick Menu → Close Content to return to the main menu.";
+"migration.retroarch.export.step5" = "In the main menu, navigate to 'Load Content' path to find your saves folder.";
+"migration.retroarch.export.step6" = "Use the RetroArch file browser or Files.app to locate the 'saves' folder inside the RetroArch app group.";
+"migration.retroarch.export.step7" = "Copy the .srm (battery save) or .state files to a location accessible to Provenance.";
+"migration.ppsspp.export.step1" = "Open PPSSPP and navigate to your UMD images.";
+"migration.ppsspp.export.step2" = "Tap the game to open its settings page.";
+"migration.ppsspp.export.step3" = "Look for 'Save State' or check PPSSPP's memstick/PSP/SAVEDATA folder.";
+"migration.ppsspp.export.step4" = "Use Files.app to navigate to PPSSPP's folder and copy .ppst files.";
+"migration.ppsspp.export.step5" = "Note: PSP save data (.VMP files) may need conversion — standard .ppst states import directly.";
+"migration.gamma.export.step1" = "Open Gamma and go to your game library.";
+"migration.gamma.export.step2" = "Long-press a game to see options.";
+"migration.gamma.export.step3" = "Tap 'Share Save' to export the .sav file.";
+"migration.gamma.export.step4" = "Save it to Files.app (iCloud Drive recommended for easy access).";
+"migration.gamma.export.step5" = "Repeat for each GB/GBC game.";
+
+// MARK: - Migration import steps (shared)
+"migration.import.step1.ios" = "Open Provenance and launch the web server via Settings → Library → Web Server, or use Files.app.";
+"migration.import.step1.tvos" = "Open Provenance and launch the web server via Settings → Library → Web Server.";
+"migration.import.step2" = "Navigate to the ROM directory for the matching system (e.g. ROMs/GBA/).";
+"migration.import.step3" = "Place the save file in the same folder as the ROM, with the same filename (only the extension differs).";
+"migration.import.step4" = "For example: 'MyGame.gba' needs 'MyGame.srm' or 'MyGame.sav' alongside it.";
+"migration.import.step5" = "Launch the game in Provenance — it will automatically detect and load the save.";
+"migration.import.step6" = "If the save does not load, verify the filename matches the ROM exactly (case-sensitive on some systems).";
+
+// MARK: - Manual file import guide
+"manual.nav.title" = "Manual Import";
+"manual.header.title" = "Manual Save Import";
+"manual.header.subtitle" = "Import .sav, .srm, or .state files from any source";
+"manual.method.webserver.title" = "Via Web Server (recommended)";
+"manual.method.webserver.step1" = "Open Provenance and go to Settings → Library.";
+"manual.method.webserver.step2" = "Select 'Launch Web Server' and note the IP address shown.";
+"manual.method.webserver.step3" = "On your computer, open a browser and go to that address.";
+"manual.method.webserver.step4" = "Upload your save files through the web interface.";
+"manual.method.webserver.step5" = "Place each file in the same ROM directory as the matching game.";
+"manual.method.webserver.step6" = "Ensure the save filename matches the ROM filename (different extension only).";
+"manual.method.filesapp.title" = "Via Files.app (iPhone/iPad)";
+"manual.method.filesapp.step1" = "Open the Files app on your iPhone or iPad.";
+"manual.method.filesapp.step2" = "Navigate to 'On My iPhone' (or iPad) → Provenance.";
+"manual.method.filesapp.step3" = "Find the ROMs folder for the relevant system.";
+"manual.method.filesapp.step4" = "Copy or move your .sav / .srm / .state file here.";
+"manual.method.filesapp.step5" = "Name the file to match the ROM exactly (same base name, different extension).";
+"manual.method.filesapp.step6" = "Launch the game in Provenance — the save loads automatically.";
+"manual.tip.title" = "Naming Convention";
+"manual.tip.rom_example" = "ROM: Super Mario World (USA).sfc";
+"manual.tip.save_example" = "Save: Super Mario World (USA).srm";
+"manual.tip.note" = "Only the file extension changes — the base name must match exactly.";
+
+// MARK: - Disc Ripper (DiscRipperView.swift)
+"disc_ripper.nav_title" = "Rip Disc";
+"disc_ripper.cancel" = "Cancel";
+"disc_ripper.loading_toc" = "Reading disc…";
+"disc_ripper.error.title" = "Could Not Read Disc";
+"disc_ripper.unavailable.title" = "Optical Drive Not Supported";
+"disc_ripper.unavailable.description" = "USB optical drives are only supported on iPad with USB-C.";
+"disc_ripper.disc_info_header" = "Disc Info";
+"disc_ripper.disc_type" = "Disc Type";
+"disc_ripper.total_tracks" = "Tracks";
+"disc_ripper.total_sectors" = "Sectors";
+"disc_ripper.tracks_header" = "Tracks";
+"disc_ripper.tracks_footer" = "Select the tracks to include in the disc image.";
+"disc_ripper.select_all" = "Select All";
+"disc_ripper.deselect_all" = "Deselect All";
+"disc_ripper.rip_button" = "Rip";
+"disc_ripper.track_type.audio" = "Audio";
+"disc_ripper.track_type.data" = "Data";
+
+// Disc Ripper — Drive Status
+"disc_ripper.drive_status_header" = "Drive Status";
+"disc_ripper.status.no_drive" = "No Drive";
+"disc_ripper.status.no_disc" = "No Disc";
+"disc_ripper.status.tray_open" = "Tray Open";
+"disc_ripper.status.disc_ready" = "Disc Ready";
+"disc_ripper.status.reading" = "Reading";
+"disc_ripper.status.no_drive.subtitle" = "Connect a USB optical drive to continue.";
+"disc_ripper.status.no_disc.subtitle" = "Insert a disc into the drive.";
+"disc_ripper.status.tray_open.subtitle" = "Close the drive tray to continue.";
+"disc_ripper.status.disc_ready.subtitle" = "Disc detected. Ready to rip.";
+"disc_ripper.status.reading.subtitle" = "Reading disc table of contents…";
+
+// Disc Ripper — Drive Status Badges
+"disc_ripper.badge.no_drive" = "No Drive";
+"disc_ripper.badge.no_disc" = "No Disc";
+"disc_ripper.badge.tray_open" = "Open";
+"disc_ripper.badge.ready" = "Ready";
+"disc_ripper.badge.reading" = "Reading";
+
+// Disc Ripper — Actions
+"disc_ripper.retry" = "Retry";
+"disc_ripper.total_size" = "Total Size";
+"disc_ripper.recent_rips_header" = "Recent Rips";
+"disc_ripper.track_title" = "Track %1$d (%2$@)";
+"disc_ripper.rip_error.title" = "Rip Failed";
+"disc_ripper.rip_error.dismiss" = "OK";
+
+// Ripper Progress Sheet
+"ripper_sheet.title" = "Ripping Disc";
+"ripper_sheet.cancel_confirm.title" = "Stop Ripping?";
+"ripper_sheet.cancel_confirm.stop" = "Stop Ripping";
+"ripper_sheet.cancel_confirm.continue" = "Keep Ripping";
+"ripper_sheet.cancel_confirm.message" = "Stopping now will discard the partial disc image.";
+"ripper_sheet.cancel_rip" = "Stop Ripping";
+"ripper_sheet.stat.sectors" = "Sectors";
+"ripper_sheet.stat.tracks" = "Tracks";
+"ripper_sheet.stat.speed" = "Speed";
+"ripper_sheet.stat.eta" = "ETA";
+
+// External file URL import (Open in Provenance — copy / skin import, not import queue)
+"external_import.unknown_file" = "File";
+"external_import.skin.title" = "SKIN IMPORTED";
+"external_import.skin.subtitle" = "%@";
+"external_import.file.title" = "FILE ADDED";
+"external_import.file.subtitle" = "%@ was copied to imports.";

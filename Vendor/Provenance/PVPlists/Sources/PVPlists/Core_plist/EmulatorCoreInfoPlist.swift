@@ -1,0 +1,242 @@
+//
+//  EmulatorCoreInfoPlist.swift
+//  PVCoreBridge
+//
+//  Created by Joseph Mattiello on 8/6/24.
+//
+
+import Foundation
+import PVLogging
+import PVPrimitives
+
+#if canImport(ObjectiveC)
+@objc
+@objcMembers
+#endif
+public final class EmulatorCoreInfoPlist: NSObject, Sendable {
+    public let identifier: String
+    public let principleClass: String
+
+    public let supportedSystems: [String]
+
+    public let projectName: String
+    public let projectURL: String
+    public let projectVersion: String
+    public let disabled: Bool
+    public let contentless: Bool
+    public let appStoreDisabled: Bool
+    /// The cheat code formats supported by this core, parsed from `PVSupportedCheatTypes`.
+    public let supportedCheatTypes: [CheatCodeTypes]
+    public let subCores:  [EmulatorCoreInfoPlist]?
+    /// Raw `PVJITRequirement` string from `Core.plist` (e.g. `"required"`, `"optional"`).
+    /// `nil` means the key was absent — callers should treat `nil` as *not required*.
+    public let jitRequirementRawValue: String?
+    /// When `true`, the core is currently disabled *only* because it requires JIT and
+    /// JIT was unavailable at packaging time.  The app layer should auto-enable this
+    /// core when JIT is successfully acquired.
+    /// Maps to the `PVJITDisabledWithoutJIT` key in `Core.plist`.
+    public let jitDisabledWithoutJIT: Bool
+    /// SPDX license identifier for this core (e.g. `"GPL-2.0-only"`, `"MIT"`).
+    /// Maps to the `PVLicenseName` key in `Core.plist`. `nil` if absent.
+    public let licenseName: String?
+    /// URL pointing to the full license text for this core.
+    /// Maps to the `PVLicenseURL` key in `Core.plist`. `nil` if absent.
+    public let licenseURL: String?
+    /// Copyright statement(s) for this core.
+    /// Maps to the `PVCopyright` key in `Core.plist`. `nil` if absent.
+    public let copyright: String?
+    /// Explicit capability declarations from `Core.plist` (`PVCapabilities` key).
+    ///
+    /// This is the authoritative per-core source.  `CoreCapabilities.json`
+    /// enriches entries that don't declare capabilities here.  An empty array
+    /// means the plist did not provide capabilities (not that the core has none).
+    ///
+    /// Auto-derived capabilities (from `supportedCheatTypes`, `jitRequirementRawValue`,
+    /// etc.) are available via `CoreRecommendationEngine`'s manifest-building logic
+    /// and are NOT reflected in this property.
+    public let capabilities: [String]
+
+    public init(identifier: String, principleClass: String, supportedSystems: [String],
+                projectName: String, projectURL: String, projectVersion: String,
+                disabled: Bool = false, contentless: Bool = false, appStoreDisabled: Bool = false,
+                supportedCheatTypes: [CheatCodeTypes] = [], subCores: [EmulatorCoreInfoPlist]? = nil,
+                jitRequirementRawValue: String? = nil,
+                jitDisabledWithoutJIT: Bool = false,
+                licenseName: String? = nil, licenseURL: String? = nil, copyright: String? = nil,
+                capabilities: [String] = []) {
+        self.identifier = identifier
+        self.principleClass = principleClass
+        self.supportedSystems = supportedSystems
+        self.projectName = projectName
+        self.projectURL = projectURL
+        self.projectVersion = projectVersion
+        self.disabled = disabled
+        self.contentless = contentless
+        self.appStoreDisabled = appStoreDisabled
+        self.supportedCheatTypes = supportedCheatTypes
+        self.subCores = subCores
+        self.jitRequirementRawValue = jitRequirementRawValue
+        self.jitDisabledWithoutJIT = jitDisabledWithoutJIT
+        self.licenseName = licenseName
+        self.licenseURL = licenseURL
+        self.copyright = copyright
+        self.capabilities = capabilities
+    }
+
+    public init?(fromInfoDictionary dict: [String: Any]) {
+        // Identifier
+        guard let identifier = dict["PVCoreIdentifier"] as? String else {
+            return nil
+        }
+        self.identifier = identifier
+
+        // Principle Class
+        guard let principleClass = dict["PVPrincipleClass"] as? String else {
+            return nil
+        }
+        self.principleClass = principleClass
+
+        // Supported systems
+        guard let supportedSystems = dict["PVSupportedSystems"] as? [String] else {
+            return nil
+        }
+        self.supportedSystems = supportedSystems
+
+        // Project name
+        guard let projectName = dict["PVProjectName"] as? String else {
+            return nil
+        }
+        self.projectName = projectName
+
+        // Project URL
+        guard let projectURL = dict["PVProjectURL"] as? String else {
+            return nil
+        }
+        self.projectURL = projectURL
+
+        // Project Version
+        guard let projectVersion = dict["PVProjectVersion"] as? String else {
+            return nil
+        }
+        self.projectVersion = projectVersion
+
+        // Disabled
+        self.disabled = dict["PVDisabled"] as? Bool ?? false
+
+        // Contentless
+        self.contentless = dict["PVContentless"] as? Bool ?? false
+
+        // AppStore Disabled
+        self.appStoreDisabled = dict["PVAppStoreDisabled"] as? Bool ?? false
+
+        // Supported cheat types — parse display-name strings into typed enum values.
+        if let rawCheatTypes = dict["PVSupportedCheatTypes"] as? [Any] {
+            let stringCheatTypes = rawCheatTypes.compactMap { $0 as? String }
+            if stringCheatTypes.count != rawCheatTypes.count {
+                ELOG("Ignoring non-string PVSupportedCheatTypes elements for core \(identifier)")
+            }
+            var parsed: [CheatCodeTypes] = []
+            for string in stringCheatTypes {
+                if let type = CheatCodeTypes(string: string) {
+                    parsed.append(type)
+                } else {
+                    ELOG("Unknown PVSupportedCheatTypes value '\(string)' for core \(identifier)")
+                }
+            }
+            self.supportedCheatTypes = parsed
+        } else {
+            self.supportedCheatTypes = []
+        }
+
+        // Subcores
+        if let subCores = dict["PVCores"] as? [[String:Any]] {
+            self.subCores = subCores.compactMap {
+                return Self.init(fromInfoDictionary: $0)
+            }
+        } else {
+            self.subCores = nil
+        }
+
+        // JIT requirement — optional key; absent means notRequired
+        self.jitRequirementRawValue = dict["PVJITRequirement"] as? String
+
+        // JIT-disabled flag — core disabled specifically because JIT is unavailable
+        self.jitDisabledWithoutJIT = dict["PVJITDisabledWithoutJIT"] as? Bool ?? false
+
+        // License metadata — all optional
+        self.licenseName = dict["PVLicenseName"] as? String
+        self.licenseURL = dict["PVLicenseURL"] as? String
+        self.copyright = dict["PVCopyright"] as? String
+
+        // Explicit capabilities declared in Core.plist — optional key
+        self.capabilities = dict["PVCapabilities"] as? [String] ?? []
+    }
+
+    public convenience init?(fromURL plistPath: URL) throws {
+        guard let data = try? Data(contentsOf: plistPath) else {
+            ELOG("Could not read Core.plist")
+            throw EmulatorCoreInfoPlistError.couldNotReadPlist
+        }
+
+        guard let plistObject = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            ELOG("Could not generate parse Core.plist")
+            throw EmulatorCoreInfoPlistError.couldNotParsePlist
+        }
+
+        self.init(fromInfoDictionary: plistObject)
+    }
+}
+
+public extension EmulatorCoreInfoPlist {
+    convenience init(_ corePlistEntry: CorePlistEntry) {
+        let e = corePlistEntry
+        let subCores = corePlistEntry.PVCores?.map { EmulatorCoreInfoPlist($0) }
+        // Convert raw plist strings back to typed enum values.
+        let cheatTypes: [CheatCodeTypes] = (e.PVSupportedCheatTypes ?? []).compactMap {
+            CheatCodeTypes(string: $0)
+        }
+        self.init(
+            identifier: e.PVCoreIdentifier,
+            principleClass: e.PVPrincipleClass,
+            supportedSystems: e.PVSupportedSystems,
+            projectName: e.PVProjectName,
+            projectURL: e.PVProjectURL,
+            projectVersion: e.PVProjectVersion,
+            disabled: e.PVDisabled ?? false,
+            contentless: e.PVContentless ?? false,
+            appStoreDisabled: e.PVAppStoreDisabled ?? false,
+            supportedCheatTypes: cheatTypes,
+            subCores: subCores,
+            jitRequirementRawValue: e.PVJITRequirement,
+            jitDisabledWithoutJIT: e.PVJITDisabledWithoutJIT ?? false,
+            licenseName: e.PVLicenseName,
+            licenseURL: e.PVLicenseURL,
+            copyright: e.PVCopyright,
+            capabilities: e.PVCapabilities ?? []
+        )
+    }
+}
+
+func ==(lhs: EmulatorCoreInfoPlist, rhs: CorePlistEntry) -> Bool {
+    let subCores: [EmulatorCoreInfoPlist]? = rhs.PVCores?.map { EmulatorCoreInfoPlist($0) }
+    let rhsCheatTypes: [CheatCodeTypes] = (rhs.PVSupportedCheatTypes ?? []).compactMap {
+        CheatCodeTypes(string: $0)
+    }
+    return lhs.identifier == rhs.PVCoreIdentifier
+    && lhs.principleClass == rhs.PVPrincipleClass
+    && lhs.supportedSystems == rhs.PVSupportedSystems
+    && lhs.projectName == rhs.PVProjectName
+    && lhs.projectURL == rhs.PVProjectURL
+    && lhs.projectVersion == rhs.PVProjectVersion
+    && lhs.disabled == (rhs.PVDisabled ?? false)
+    && lhs.contentless == (rhs.PVContentless ?? false)
+    && lhs.appStoreDisabled == (rhs.PVAppStoreDisabled ?? false)
+    && lhs.supportedCheatTypes == rhsCheatTypes
+    && lhs.subCores == subCores
+    && lhs.jitRequirementRawValue == rhs.PVJITRequirement
+    && lhs.jitDisabledWithoutJIT == (rhs.PVJITDisabledWithoutJIT ?? false)
+    && lhs.licenseName == rhs.PVLicenseName
+    && lhs.licenseURL == rhs.PVLicenseURL
+    && lhs.copyright == rhs.PVCopyright
+    && lhs.capabilities == (rhs.PVCapabilities ?? [])
+}

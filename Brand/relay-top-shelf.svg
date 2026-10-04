@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 720" width="1920" height="720">
+  <!--
+    Default Top Shelf, 1920 × 720: the lockup centred. tvOS masks and shifts the
+    shelf behind the focused icon and the edges of the plate are never guaranteed,
+    so nothing that must be read sits outside the central 1740 × 600. The mark is
+    260 units tall (scale 2.87), the wordmark and the promise sit to its right, and
+    the whole group is centred as one object.
+  -->
+  <defs>
+    <radialGradient id="ground" cx="0.5" cy="0.1" r="1.1">
+      <stop offset="0" stop-color="#28241F"/>
+      <stop offset="0.6" stop-color="#1C1917"/>
+      <stop offset="1" stop-color="#121110"/>
+    </radialGradient>
+  </defs>
+  <rect width="1920" height="720" fill="url(#ground)"/>
+  <g transform="translate(630 366) scale(2.87) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="#F5F2EE"/>
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="#FF6A45"/>
+  </g>
+  <text x="810" y="352" font-family="-apple-system, SF Pro Display, Helvetica Neue, Arial" font-size="118" font-weight="600" letter-spacing="-3" fill="#F5F2EE">Relay</text>
+  <text x="812" y="424" font-family="-apple-system, SF Pro Text, Helvetica Neue, Arial" font-size="44" fill="#F5F2EE" fill-opacity="0.66">Your games. Every Apple screen.</text>
+</svg>

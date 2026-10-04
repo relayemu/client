@@ -1,0 +1,34 @@
+{
+  "originHash": "0a77dfeba7b5baedcf3d497ad6d50ceeffaca126568b31751e703c0718e135f4",
+  "pins": [
+    {
+      "identity": "defaults",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/sindresorhus/Defaults.git",
+      "state": {
+        "revision": "5bfac4928f000fabdbef7e4ed0251399bb0841c9",
+        "version": "9.0.8",
+        "branch": null
+      }
+    },
+    {
+      "identity": "swift-syntax",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/swiftlang/swift-syntax",
+      "state": {
+        "revision": "0687f71944021d616d34d922343dcef086855920",
+        "version": "600.0.1"
+      }
+    },
+    {
+      "identity": "xctest-dynamic-overlay",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/xctest-dynamic-overlay",
+      "state": {
+        "revision": "dfd70507def84cb5fb821278448a262c6ff2bbad",
+        "version": "1.9.0"
+      }
+    }
+  ],
+  "version": 3
+}

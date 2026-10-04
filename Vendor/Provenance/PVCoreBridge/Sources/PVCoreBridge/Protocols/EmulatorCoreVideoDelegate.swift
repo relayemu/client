@@ -1,0 +1,86 @@
+//
+//  EmulatorCoreVideoDelegate.swift
+//  PVCoreBridge
+//
+//  Created by Joseph Mattiello on 8/12/24.
+//
+
+import Foundation
+import PVPrimitives
+
+#if canImport(OpenGLES) || canImport(OpenGL)
+@objc public enum GLESVersion: Int {
+    @objc(GLESVersion1)
+    case version1
+    @objc(GLESVersion2)
+    case version2
+    @objc(GLESVersion3)
+    case version3
+}
+#endif
+
+@objc public protocol EmulatorCoreVideoDelegate {
+    @objc dynamic var alwaysUseMetal: Bool { get }
+    @objc dynamic var alwaysUseGL: Bool { get }
+    @objc dynamic var aspectSize: CGSize  { get }
+    @objc dynamic var emulationFPS: Double { get }
+    @objc dynamic var isDoubleBuffered: Bool { get }
+    @objc dynamic var renderFPS: Double { get }
+    @objc dynamic var rendersToOpenGL: Bool { get }
+    /// YES when the core renders via Vulkan HW context (MoltenVK → Metal interop).
+    @objc dynamic var rendersToVulkan: Bool { get }
+    @objc dynamic var screenRect: CGRect  { get }
+    @objc dynamic var videoBuffer: UnsafeRawPointer? { get }
+
+    @objc dynamic var bufferSize: CGSize { get }
+
+    /// `true` once the underlying core has reported real game-pixel geometry
+    /// (e.g. via `SET_SYSTEM_AV_INFO` / `SET_GEOMETRY` on a libretro core, or
+    /// the first delivered frame). Bridges that always expose true game-pixel
+    /// dimensions (most native cores) should return `true`. Bridges that
+    /// initialise `aspectSize` from `UIScreen.bounds` until the first frame
+    /// arrives (RetroArch wrapper) should return `false` until the geometry
+    /// has been updated, so consumers know not to clamp the reported aspect.
+    @objc optional var hasReceivedAspectFromCore: Bool { get }
+    
+//    @objc dynamic var videoBufferSize: CGSize { get }
+    
+    @objc dynamic weak var renderDelegate: PVRenderDelegate? { get set }
+    
+    @objc func executeFrame()
+    @objc optional func swapBuffers()
+
+#if canImport(OpenGLES) || canImport(OpenGL)
+    @objc dynamic var depthFormat: GLenum  { get }
+    @objc dynamic var glesVersion: GLESVersion { get }
+    @objc dynamic var internalPixelFormat: GLenum { get }
+    @objc dynamic var pixelFormat: GLenum  { get }
+    @objc dynamic var pixelType: GLenum  { get }
+#endif
+}
+
+/// Optional: Bridges that can position their internal render view within a parent touch view (e.g. RetroArch)
+@objc public protocol EmulatorCoreViewportPositioning {
+    @objc func setUseCustomRenderViewLayout(_ enabled: Bool)
+    @objc func applyRenderViewFrameInTouchView(_ frame: CGRect)
+    /// Returns true when bridge teardown has started and delayed viewport work should be skipped.
+    @objc optional func isShuttingDownForViewportUpdates() -> Bool
+}
+
+//public extension EmulatorCoreVideoDelegate {
+//    var emulationFPS: Double { 0.0 }
+//    var renderFPS: Double { 0.0 }
+//    var isDoubleBuffered: Bool { false }
+//    var rendersToOpenGL: Bool { false }
+//#if canImport(OpenGLES) || canImport(OpenGL)
+//    var glesVersion: GLESVersion  { .version3 }
+//    var pixelFormat: GLenum  { 0 }
+//    var pixelType: GLenum {  0 }
+//    var internalPixelFormat: GLenum  { 0 }
+//    var depthFormat: GLenum { 0 }
+//#endif
+//    var screenRect: CGRect { .zero }
+//    var aspectSize: CGSize { .zero }
+//    var bufferSize: CGSize { .zero }
+//    var alwaysUseMetal: Bool { false }
+//}

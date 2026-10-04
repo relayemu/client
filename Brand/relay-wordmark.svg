@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 120" width="420" height="120" role="img" aria-label="Relay">
+  <!--
+    Horizontal lockup: mark, a gap of half the mark's height, then the wordmark.
+    The wordmark is set in the platform system face (SF Pro Display Semibold,
+    tracking −2%); the text element below resolves to SF on Apple devices.
+    Clear space around the lockup is the height of the mark on all sides.
+  -->
+  <g transform="translate(10 14) scale(0.92)">
+    <g transform="translate(50 52) rotate(-45)">
+      <rect x="-46" y="-18" width="44" height="14" rx="7" fill="var(--relay-lead, #1A1816)"/>
+      <rect x="2" y="4" width="44" height="14" rx="7" fill="var(--relay-trail, #C93D25)"/>
+    </g>
+  </g>
+  <text x="128" y="78" font-family="-apple-system, SF Pro Display, Helvetica Neue, Arial, sans-serif"
+        font-size="72" font-weight="600" letter-spacing="-1.44" fill="var(--relay-lead, #1A1816)">Relay</text>
+</svg>

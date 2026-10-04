@@ -1,0 +1,254 @@
+// swift-tools-version:6.0
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+import PackageDescription
+
+#if swift(>=5.9)
+let swiftSettings: [SwiftSetting] = [
+    //    .interoperabilityMode(.Cxx)
+]
+#else
+let swiftSettings: [SwiftSetting] = [
+]
+#endif
+
+let linkerSettings: [LinkerSetting] = [
+    .linkedFramework("Foundation"),
+    .linkedFramework("CoreGraphics"),
+    .linkedFramework("CoreSpotlight"),
+    .linkedFramework("GameController", .when(platforms: [.iOS, .tvOS, .macCatalyst])),
+    .linkedFramework("UIKit", .when(platforms: [.iOS, .tvOS, .watchOS, .macCatalyst])),
+    .linkedFramework("WatchKit", .when(platforms: [.watchOS]))
+]
+
+let package = Package(
+    name: "PVLibrary",
+    platforms: [
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v10),
+        .macOS(.v14),
+        .macCatalyst(.v17),
+        .visionOS(.v1)
+    ],
+    products: [
+        // Products define the executables and libraries a package produces, and make them visible to other packages.
+        .library(
+            name: "PVLibrary",
+            targets: ["PVLibrary"]
+        ),
+        .library(
+            name: "PVLibrary-Static",
+            type: .static,
+            targets: ["PVLibrary"]
+        ),
+        .library(
+            name: "PVLibrary-Dynamic",
+            type: .dynamic,
+            targets: ["PVLibrary"]
+        ),
+        /// Exposes `PVMediaCache` (including the shared `MissingArtworkGenerator`
+        /// retrowave placeholder) so other packages and app extensions can
+        /// `import PVMediaCache` directly without relying on PVLibrary's
+        /// `@_exported import` (which the IDE indexer doesn't reliably
+        /// propagate across package boundaries).
+        .library(
+            name: "PVMediaCache",
+            targets: ["PVMediaCache"]
+        ),
+    ],
+    dependencies:
+        ["Support", "Logging", "Hashing",
+         "EmulatorCore", "CoreLoader", "Primitives",
+         "Plists", "Lookup", "Settings", "FeatureFlags", "Patching",
+         "Archiving"]
+        .map { .package(path: "../PV\($0)") }
+        + [
+        .package(url: "https://github.com/ReactiveX/RxSwift.git",
+                 .upToNextMajor(from: "6.7.1")),
+        .package(url: "https://github.com/RxSwiftCommunity/RxRealm.git",
+                 revision: "a7c89c2a0ce72946a2842f1b2645d2ded84a9c69"),
+        .package(url: "https://github.com/ZipArchive/ZipArchive.git",
+                 exact: "2.4.3"),
+        .package(url: "https://github.com/OlehKulykov/PLzmaSDK.git",
+                 revision: "1.2.5"),
+//        .package(url: "https://github.com/tsolomko/SWCompression.git",
+//                 .upToNextMinor(from: "4.8.6")),
+        .package(name: "SWCompression", path: "../Dependencies/SWCompression"),
+        .package(url: "https://github.com/apple/swift-async-algorithms",
+                 from: "1.0.0"),
+        .package(url: "https://github.com/Provenance-Emu/SwiftGenPlugin.git",
+                 from: "1.1.3"),
+        .package(url: "https://github.com/stephencelis/SQLite.swift.git",
+                 .upToNextMajor(from: "0.15.3")),
+        /// https://github.com/mtgto/Unrar.swift
+        .package(url: "https://github.com/mtgto/Unrar.swift.git",
+                    .upToNextMajor(from: "0.3.16")),
+        .package(name: "LzhArchive", path: "../Dependencies/LzhArchive"),
+        .package(url: "https://github.com/realm/realm-swift.git",
+                 from: "20.0.0"),
+    ],
+
+    targets: [
+        // MARK: ------------ SwiftCloudDrive ------------
+        .target(
+            name: "SwiftCloudDrive",
+            dependencies: [
+                "PVLogging"
+            ]
+        ),
+        // MARK: ------------ PVLibrary ------------
+        .target(
+            name: "PVLibrary",
+            dependencies: [
+                "PVSupport",
+                "PLzmaSDK",
+                "SWCompression",
+                "PVLogging",
+                "PVHashing",
+                .product(name: "PVPlists", package: "pvplists"),
+                "PVLookup",
+                .product(name: "LibretroCheatDB", package: "PVLookup"),
+                "PVPrimitives",
+                "PVRealm",
+                "PVFeatureFlags",
+                "Extractor",
+                "PVFileSystem",
+                "PVMediaCache",
+                "PVSettings",
+                "PVEmulatorCore",
+                "PVCoreLoader",
+                "PVPatching",
+                "PVArchiving",
+                .product(name: "Unrar", package: "Unrar.swift"),
+                .product(name: "ZipArchive", package: "ZipArchive"),
+                .product(name: "SQLite", package: "SQLite.swift"),
+                .product(name: "RxCocoa", package: "RxSwift"),
+                .product(name: "RxSwift", package: "RxSwift"),
+                .product(name: "RxRealm", package: "RxRealm"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+            ],
+            resources: [
+                // TODO: Move Cheats to PVLookup
+                .process("Resources/cheatbase.sqlite"),
+                .process("Resources/systems.plist")
+            ],
+            plugins: [
+                .plugin(name: "SwiftGenPlugin", package: "SwiftGenPlugin")
+            ]),
+        // MARK: ------------ PVRealm ------------
+        .target(
+            name: "PVRealm",
+            dependencies: [
+                "PVSupport",
+                "PLzmaSDK",
+                "SWCompression",
+                "PVLogging",
+                "PVHashing",
+                .product(name: "PVPlists", package: "pvplists"),
+                "PVLookup",
+                "PVPrimitives",
+                "PVMediaCache",
+                "PVFileSystem",
+                "PVPatching",
+                .product(name: "PVEmulatorCore", package: "PVEmulatorCore"),
+                .product(name: "PVCoreLoader", package: "PVCoreLoader"),
+                .product(name: "SQLite", package: "SQLite.swift"),
+                .product(name: "RxCocoa", package: "RxSwift"),
+                .product(name: "RxSwift", package: "RxSwift"),
+                .product(name: "RxRealm", package: "RxRealm"),
+                .product(name: "RealmSwift", package: "realm-swift"),
+                .product(name: "ZipArchive", package: "ZipArchive"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+            ]),
+        // MARK: ------------ PVMediaCache ------------
+        .target(
+            name: "PVMediaCache",
+            dependencies: [
+                "PVSupport",
+                "PVLogging",
+                "PVHashing",
+                .product(name: "PVPlists", package: "pvplists"),
+                "PVLookup",
+                "PVPrimitives",
+                "PVFileSystem",
+                .product(name: "RxCocoa", package: "RxSwift"),
+                .product(name: "RxSwift", package: "RxSwift"),
+                .product(name: "RxRealm", package: "RxRealm"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+        ]),
+        // MARK: ------------ PVFileSystem ------------
+        .target(
+            name: "PVFileSystem",
+            dependencies: [
+                "PVSupport",
+                "PVLogging",
+                "PVHashing",
+                .product(name: "PVPlists", package: "pvplists"),
+                "PVLookup",
+                "PVPrimitives",
+                "PVPatching",
+                "PVSettings",
+                "SwiftCloudDrive",
+                .product(name: "RxCocoa", package: "RxSwift"),
+                .product(name: "RxSwift", package: "RxSwift"),
+                .product(name: "RxRealm", package: "RxRealm"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+        ]),
+//        // MARK: ------------ DirectoryWatcher ------------
+//        .target(
+//            name: "DirectoryWatcher",
+//            dependencies: [
+//                "PVSupport",
+//                "PVLogging",
+//                "PVHashing",
+//                "PVLookup",
+//                "PVPrimitives",
+//                "Extractor",
+//                "PVFileSystem",
+//                .product(name: "RxCocoa", package: "RxSwift"),
+//                .product(name: "RxSwift", package: "RxSwift"),
+//                .product(name: "RxRealm", package: "RxRealm"),
+//                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+//        ]),
+        // MARK: ------------ Extractor ------------
+        .target(
+            name: "Extractor",
+            dependencies: [
+                "PVSupport",
+                "PLzmaSDK",
+                "SWCompression",
+                "PVLogging",
+                "PVHashing",
+                .product(name: "PVPlists", package: "pvplists"),
+                "PVLookup",
+                "PVPrimitives",
+                "LzhArchive",
+                .product(name: "Unrar", package: "Unrar.swift"),
+                .product(name: "PVEmulatorCore", package: "PVEmulatorCore"),
+                .product(name: "PVCoreLoader", package: "PVCoreLoader"),
+                .product(name: "SQLite", package: "SQLite.swift"),
+                .product(name: "RxCocoa", package: "RxSwift"),
+                .product(name: "RxSwift", package: "RxSwift"),
+                .product(name: "RxRealm", package: "RxRealm"),
+                .product(name: "ZipArchive", package: "ZipArchive"),
+                .product(name: "AsyncAlgorithms", package: "swift-async-algorithms"),
+            ]),
+        // MARK: ------------ Tests ------------
+        .testTarget(
+            name: "PVLibraryTests",
+            dependencies: [
+                "PVLibrary",
+                "PVFeatureFlags",
+                "PVRealm",
+                "PVLookup",
+                "PVPrimitives",
+                "PVFileSystem",
+                .product(name: "RealmSwift", package: "realm-swift"),
+                .product(name: "ZipArchive", package: "ZipArchive"),
+            ]
+        ),
+    ],
+    swiftLanguageModes: [.v5],
+    cLanguageStandard: .gnu18,
+    cxxLanguageStandard: .gnucxx20
+)

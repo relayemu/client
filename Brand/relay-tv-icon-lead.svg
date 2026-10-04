@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 240" width="400" height="240">
+  <!--
+    tvOS layered icon, middle layer: the lead capsule. The Baton is composed for
+    the landscape plate: scale 2.0 gives the rotated mark a 181-unit box, 75 % of
+    the plate's height, centred on the plate's optical centre (200, 122). On a
+    phone the mark is 62 % of a square; on the television plate this size reads as
+    the identity of the tile rather than a pin on an empty plate, and it stays
+    inside the parallax safe zone.
+  -->
+  <g transform="translate(200 122) scale(2.0) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="#F5F2EE"/>
+  </g>
+</svg>

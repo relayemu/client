@@ -1,0 +1,32 @@
+{
+  "upstream": "https://github.com/RetroAchievements/rcheevos",
+  "tag": "v12.4.0",
+  "revision": "2ad0b8672f68a48148620164510b963039e49eb1",
+  "archiveURL": "https://codeload.github.com/RetroAchievements/rcheevos/tar.gz/2ad0b8672f68a48148620164510b963039e49eb1",
+  "archiveSHA256": "b8e3e834d15c327085154315c49dea85b081ad48592ba1740f323ac953e1bfec",
+  "license": "MIT AND Zlib",
+  "licenseNotes": "rcheevos is MIT; src/rhash/md5.c and md5.h retain the Aladdin Enterprises zlib-style notice. The unlicensed/public-domain AES implementation is preserved upstream but is not compiled. Runtime, hashing, API and test sources are unmodified.",
+  "relayAdditions": [
+    "RELAY_VENDOR.json",
+    "include/RelayRcheevos.h",
+    "upstream-build/Package.swift",
+    "upstream-build/include/module.modulemap"
+  ],
+  "features": [
+    "rc_client",
+    "cartridge hashing",
+    "official Connect API"
+  ],
+  "disabled": [
+    "RAIntegration DLL",
+    "external clients",
+    "disc hashing",
+    "ZIP hashing",
+    "encrypted hashing"
+  ],
+  "appleBuildNotes": "AvailabilityMacros.h is force-included before upstream C headers; the Apple module redundant nested import diagnostic is disabled. Upstream C sources are unmodified.",
+  "relayModifications": {
+    "Package.swift": "Apple-only product, source selection and compatibility flags; original retained in upstream-build/Package.swift",
+    "include/module.modulemap": "Relay umbrella and module name; original retained in upstream-build/include/module.modulemap"
+  }
+}

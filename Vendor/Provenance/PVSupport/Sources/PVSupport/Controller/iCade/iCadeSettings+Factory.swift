@@ -1,0 +1,36 @@
+//
+//  iCadeSettings+Factory.swift
+//  PVSupport
+//
+//  Created by Joseph Mattiello on 8/8/24.
+//
+
+#if canImport(UIKit) && canImport(GameController)
+import PVSettings
+
+public extension iCadeControllerSetting {
+    nonisolated
+    func createController() -> PViCadeController? {
+        switch self {
+        case .disabled:
+            return nil
+        case .standard:
+            return PViCadeController()
+        case .eightBitdo:
+            return PViCade8BitdoController()
+        case .eightBitdoZero:
+            return PViCade8BitdoZeroController()
+        case .steelSeries:
+            return PViCadeSteelSeriesController()
+        case .mocute:
+            return PViCadeMocuteController()
+        case .eightBitdoSNES30:
+            return PViCade8BitdoSNES30Controller()
+        case .eightBitdoSN30Pro:
+            return PViCade8BitdoSN30ProController()
+        }
+    }
+
+}
+
+#endif

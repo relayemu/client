@@ -1,0 +1,477 @@
+//
+//  PVToastManager.swift
+//  PVUI
+//
+//  Created by Claude on 2026-03-13.
+//  Copyright © 2026 Provenance Emu. All rights reserved.
+//
+
+import Foundation
+import Combine
+import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+
+// MARK: - Toast Handle
+
+/// An opaque handle returned by `showPersistent` that can be used to dismiss a specific toast.
+///
+/// `PVToastHandle` is `Sendable` and its `dismiss()` is `nonisolated`, so it can
+/// be called from any concurrency context (background actors, ObjC bridges, etc.)
+/// without `await`.
+public final class PVToastHandle: Sendable {
+    public let id: String
+
+    init(id: String) {
+        self.id = id
+    }
+
+    /// Dismiss the associated persistent toast.
+    /// Safe to call from any actor or thread — internally hops to `@MainActor`
+    /// via `PVToastManager.shared.dismissAsync(id:)`.
+    public nonisolated func dismiss() {
+        PVToastManager.shared.dismissAsync(id: id)
+    }
+}
+
+// MARK: - Toast Manager
+
+/// Singleton responsible for queuing and auto-dismissing in-game toast notifications.
+///
+/// ## Why `@MainActor`?
+/// `PVToastManager` is `@MainActor` because its state drives SwiftUI via
+/// `ObservableObject`/`@Published`, all mutations use `withAnimation`, and
+/// `UIAccessibility.post` is main-thread-only.  The annotation is **correct**
+/// — it is not a concession.
+///
+/// ## Calling from non-`@MainActor` contexts
+/// Use the `nonisolated` fire-and-forget helpers (no `await` required):
+/// ```swift
+/// // From any thread, actor, or Obj-C bridge:
+/// PVToastManager.post("Save state created", type: .success)
+/// PVToastManager.postPersistent("JIT active", id: "jit", type: .jit)
+/// PVToastManager.shared.dismissAsync(id: "jit")
+/// ```
+///
+/// ## Calling from `@MainActor` or SwiftUI contexts
+/// The synchronous API is available directly:
+/// ```swift
+/// PVToastManager.shared.show("Save state created", type: .success)
+/// let handle = PVToastManager.shared.showPersistent("JIT active", id: "jit", type: .jit)
+/// handle.dismiss()
+/// ```
+@MainActor
+public final class PVToastManager: ObservableObject {
+    // MARK: Singleton
+    public static let shared = PVToastManager()
+
+    // MARK: - Configuration
+
+    /// Maximum number of toasts visible at once. Older toasts are auto-dismissed when exceeded.
+    public static var maxVisibleToasts: Int = 4
+
+    /// Maximum number of messages allowed within `rateLimitWindow`. Excess messages are queued.
+    public static var rateLimitMaxMessages: Int = 3
+
+    /// Sliding window duration (in seconds) for rate limiting.
+    public static var rateLimitWindow: TimeInterval = 2.0
+
+    /// Window (in seconds) during which a duplicate message text is collapsed with a count badge.
+    public static var deduplicationWindow: TimeInterval = 5.0
+
+    /// When `true`, messages with the same `category` are collapsed into a single grouped toast.
+    public static var enableGrouping: Bool = true
+
+    // MARK: Published state
+    /// Current toast queue, oldest first (newest at the end).
+    @Published public private(set) var toasts: [PVToast] = []
+
+    // MARK: Private state
+    private var dismissTimers: [String: Task<Void, Never>] = [:]
+
+    /// Sliding window of recent message timestamps for rate limiting.
+    private var recentTimestamps: [Date] = []
+
+    /// Queue of messages waiting to be shown when the rate limit window clears.
+    private var pendingQueue: [PVToast] = []
+
+    /// Task that drains the pending queue after the rate window clears.
+    private var drainTask: Task<Void, Never>?
+
+    private init() {}
+
+    // MARK: - Synchronous API (requires @MainActor)
+
+    /// Show a transient toast that auto-dismisses after `duration` seconds.
+    public func show(
+        _ message: String,
+        type: PVToastType = .info,
+        duration: TimeInterval = 3.0,
+        icon: String? = nil,
+        category: String? = nil,
+        replaceKey: String? = nil,
+        progress: Double? = nil
+    ) {
+        // If a replaceKey is provided, update the existing toast in-place
+        // instead of creating a new one (for progress messages, etc.)
+        if let replaceKey {
+            if let idx = toasts.firstIndex(where: { $0.id == replaceKey }) {
+                withAnimation {
+                    toasts[idx] = PVToast(id: replaceKey, message: message, type: type, icon: icon, duration: duration, isPersistent: false, category: category, progress: progress)
+                }
+                // Reset the dismiss timer so the toast stays visible while updates arrive
+                dismissTimers[replaceKey]?.cancel()
+                scheduleAutoDismiss(id: replaceKey, after: duration)
+                return
+            }
+            // No existing toast with this key — create one with the key as ID.
+            // Bypass processToast to skip category grouping (replaceKey has its own dedup).
+            let toast = PVToast(id: replaceKey, message: message, type: type, icon: icon, duration: duration, isPersistent: false, category: category, progress: progress)
+            recordTimestamp()
+            enqueue(toast)
+            scheduleAutoDismiss(id: toast.id, after: toast.duration)
+            postAccessibilityAnnouncement(toast)
+            enforceMaxVisible()
+            return
+        }
+        let toast = PVToast(message: message, type: type, icon: icon, duration: duration, isPersistent: false, category: category, progress: progress)
+        processToast(toast)
+    }
+
+    /// Show a persistent toast that remains until explicitly dismissed.
+    /// - Parameters:
+    ///   - id: Stable identifier so callers can dismiss or deduplicate this toast.
+    /// - Returns: A handle that can be used to dismiss the toast later.
+    @discardableResult
+    public func showPersistent(
+        _ message: String,
+        id: String,
+        type: PVToastType = .info,
+        icon: String? = nil
+    ) -> PVToastHandle {
+        // Deduplicate: remove any existing toast with the same id first
+        removeToast(withID: id)
+        let toast = PVToast(id: id, message: message, type: type, icon: icon, duration: .infinity, isPersistent: true)
+        enqueue(toast)
+        postAccessibilityAnnouncement(toast)
+        return PVToastHandle(id: id)
+    }
+
+    /// Dismiss a toast by its string id.
+    public func dismiss(id: String) {
+        removeToast(withID: id)
+    }
+
+    /// Dismiss all toasts immediately.
+    public func dismissAll() {
+        dismissTimers.values.forEach { $0.cancel() }
+        dismissTimers.removeAll()
+        pendingQueue.removeAll()
+        drainTask?.cancel()
+        drainTask = nil
+        withAnimation { toasts.removeAll() }
+    }
+
+    // MARK: - Core processing pipeline
+
+    /// Processes a transient toast through deduplication, grouping, rate limiting, and max-visible enforcement.
+    private func processToast(_ toast: PVToast) {
+        // 1. Deduplication: check for an existing toast with the same message text within the window
+        if tryDeduplicate(toast) {
+            return
+        }
+
+        // 2. Grouping: if enabled and category is set, collapse into an existing group toast
+        if Self.enableGrouping, let category = toast.category, tryGroup(toast, category: category) {
+            return
+        }
+
+        // 3. Rate limiting: check sliding window
+        if isRateLimited() {
+            pendingQueue.append(toast)
+            scheduleDrainIfNeeded()
+            return
+        }
+
+        // 4. Enqueue the toast
+        recordTimestamp()
+        enqueue(toast)
+        scheduleAutoDismiss(id: toast.id, after: toast.duration)
+        postAccessibilityAnnouncement(toast)
+        enforceMaxVisible()
+    }
+
+    // MARK: - Deduplication
+
+    /// Looks for an existing visible toast with the same message text posted within `deduplicationWindow`.
+    /// If found, increments its repeat count and resets its dismiss timer. Returns `true` if deduplicated.
+    private func tryDeduplicate(_ toast: PVToast) -> Bool {
+        guard let index = toasts.lastIndex(where: { existing in
+            existing.message == toast.message && !existing.isPersistent
+        }) else {
+            return false
+        }
+
+        // If the existing toast is still visible (in the array and not yet dismissed),
+        // it falls within the deduplication window.
+        var existing = toasts[index]
+        existing.repeatCount += 1
+        withAnimation { toasts[index] = existing }
+
+        // Reset the dismiss timer to give the updated toast fresh duration
+        dismissTimers[existing.id]?.cancel()
+        scheduleAutoDismiss(id: existing.id, after: toast.duration)
+        return true
+    }
+
+    // MARK: - Grouping
+
+    /// Looks for an existing toast with the same category and type to collapse into a group.
+    /// Returns `true` if the toast was grouped into an existing one.
+    private func tryGroup(_ toast: PVToast, category: String) -> Bool {
+        guard let index = toasts.lastIndex(where: { existing in
+            existing.category == category && existing.type == toast.type && !existing.isPersistent
+        }) else {
+            return false
+        }
+
+        var existing = toasts[index]
+        existing.repeatCount += 1
+        withAnimation { toasts[index] = existing }
+
+        // Reset the dismiss timer
+        dismissTimers[existing.id]?.cancel()
+        scheduleAutoDismiss(id: existing.id, after: toast.duration)
+        return true
+    }
+
+    // MARK: - Rate Limiting
+
+    /// Prunes old timestamps and checks whether we've exceeded the rate limit.
+    private func isRateLimited() -> Bool {
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-Self.rateLimitWindow)
+        recentTimestamps.removeAll { $0 < windowStart }
+        return recentTimestamps.count >= Self.rateLimitMaxMessages
+    }
+
+    /// Records the current timestamp in the sliding window.
+    private func recordTimestamp() {
+        recentTimestamps.append(Date())
+    }
+
+    /// Schedules a task to drain the pending queue once the rate window has capacity.
+    private func scheduleDrainIfNeeded() {
+        guard drainTask == nil, !pendingQueue.isEmpty else { return }
+
+        drainTask = Task { [weak self] in
+            // Wait for the rate window to pass
+            let delayNs = UInt64(Self.rateLimitWindow * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.drainPendingQueue()
+            }
+        }
+    }
+
+    /// Processes queued messages that were rate-limited, up to the rate limit per window.
+    private func drainPendingQueue() {
+        drainTask = nil
+        guard !pendingQueue.isEmpty else { return }
+
+        var processed = 0
+        while !pendingQueue.isEmpty && processed < Self.rateLimitMaxMessages {
+            let toast = pendingQueue.removeFirst()
+            // Run through dedup/grouping again since the queue may contain duplicates
+            if tryDeduplicate(toast) {
+                // Deduplicated into an existing toast, doesn't count against rate limit
+                continue
+            }
+            if Self.enableGrouping, let category = toast.category, tryGroup(toast, category: category) {
+                continue
+            }
+            recordTimestamp()
+            enqueue(toast)
+            scheduleAutoDismiss(id: toast.id, after: toast.duration)
+            postAccessibilityAnnouncement(toast)
+            processed += 1
+        }
+        enforceMaxVisible()
+
+        // If there are still pending messages, schedule another drain
+        if !pendingQueue.isEmpty {
+            scheduleDrainIfNeeded()
+        }
+    }
+
+    // MARK: - Max Visible Enforcement
+
+    /// Dismisses the oldest non-persistent toasts when the visible count exceeds the limit.
+    private func enforceMaxVisible() {
+        while toasts.count > Self.maxVisibleToasts {
+            // Find the oldest non-persistent toast to dismiss
+            guard let oldestIndex = toasts.firstIndex(where: { !$0.isPersistent }) else {
+                break // All remaining are persistent, don't dismiss
+            }
+            let oldestID = toasts[oldestIndex].id
+            removeToast(withID: oldestID)
+        }
+    }
+
+    // MARK: - Private helpers
+
+    private func enqueue(_ toast: PVToast) {
+        withAnimation { toasts.append(toast) }
+    }
+
+    private func removeToast(withID id: String) {
+        dismissTimers[id]?.cancel()
+        dismissTimers.removeValue(forKey: id)
+        withAnimation { toasts.removeAll { $0.id == id } }
+    }
+
+    private func scheduleAutoDismiss(id: String, after duration: TimeInterval) {
+        // Treat non-positive durations as "immediate dismiss"
+        if duration <= 0 {
+            Task { @MainActor [weak self] in
+                self?.removeToast(withID: id)
+            }
+            return
+        }
+
+        // Clamp duration to avoid overflow when converting to UInt64 nanoseconds
+        let maxDurationSeconds = TimeInterval(UInt64.max) / 1_000_000_000.0
+        let clampedDuration = min(duration, maxDurationSeconds)
+        let nanosecondsDouble = min(clampedDuration * 1_000_000_000.0, Double(UInt64.max))
+        let delayNanoseconds = UInt64(nanosecondsDouble)
+
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.removeToast(withID: id)
+            }
+        }
+        dismissTimers[id] = task
+    }
+
+    private func postAccessibilityAnnouncement(_ toast: PVToast) {
+        let announcement = "\(toast.type.accessibilityLabel): \(toast.displayMessage)"
+        #if os(iOS) || os(tvOS)
+        UIAccessibility.post(notification: .announcement, argument: announcement)
+        #endif
+    }
+}
+
+// MARK: - nonisolated fire-and-forget API (callable from any context)
+
+public extension PVToastManager {
+    /// Post a transient toast from **any** concurrency context — no `await` needed.
+    ///
+    /// Internally dispatches to `@MainActor` via an unstructured `Task`.
+    /// This is the preferred call site for emulator core bridges, audio callbacks,
+    /// and other non-`@MainActor` code.
+    ///
+    /// ```swift
+    /// // In ObjC bridge or background actor — no await, no Task boilerplate:
+    /// PVToastManager.post("Cheat applied", type: .success)
+    /// ```
+    nonisolated static func post(
+        _ message: String,
+        type: PVToastType = .info,
+        duration: TimeInterval = 3.0,
+        icon: String? = nil,
+        category: String? = nil,
+        replaceKey: String? = nil,
+        progress: Double? = nil
+    ) {
+        Task { @MainActor in
+            PVToastManager.shared.show(message, type: type, duration: duration, icon: icon, category: category, replaceKey: replaceKey, progress: progress)
+        }
+    }
+
+    /// Post a persistent toast from **any** concurrency context — no `await` needed.
+    ///
+    /// Returns `Void` (fire-and-forget). If you need the dismiss handle, call
+    /// `showPersistent` from a `@MainActor` context instead.
+    nonisolated static func postPersistent(
+        _ message: String,
+        id: String,
+        type: PVToastType = .info,
+        icon: String? = nil
+    ) {
+        Task { @MainActor in
+            PVToastManager.shared.showPersistent(message, id: id, type: type, icon: icon)
+        }
+    }
+
+    /// Dismiss a toast by id from **any** concurrency context — no `await` needed.
+    nonisolated func dismissAsync(id: String) {
+        Task { @MainActor [weak self] in
+            self?.dismiss(id: id)
+        }
+    }
+
+    /// Dismiss all toasts from **any** concurrency context — no `await` needed.
+    nonisolated func dismissAllAsync() {
+        Task { @MainActor [weak self] in
+            self?.dismissAll()
+        }
+    }
+}
+
+// MARK: - Typed app-level events
+
+/// Strongly-typed toast events so call sites don't use raw strings.
+/// Add new cases here as new toast-worthy events are added to the app.
+public enum PVToastEvent: Sendable {
+    /// A `.deltaskin` / `.manicskin` was imported via `DeltaSkinManager`.
+    case skinImported(fileName: String)
+    /// A file was copied into the ROM import directory from an incoming URL.
+    case fileImported(fileName: String)
+    /// A cloud-synced ROM finished downloading.
+    case cloudDownloadComplete(fileName: String)
+    /// Generic import error.
+    case importError(fileName: String, error: String)
+
+    var message: String {
+        switch self {
+        case .skinImported(let name):       return "Skin imported: \(name)"
+        case .fileImported(let name):       return "File imported: \(name)"
+        case .cloudDownloadComplete(let n): return "Download complete: \(n)"
+        case .importError(let name, let e): return "Import failed: \(name) — \(e)"
+        }
+    }
+
+    var type: PVToastType {
+        switch self {
+        case .skinImported, .fileImported, .cloudDownloadComplete: return .success
+        case .importError: return .error
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .skinImported:        return "paintbrush.fill"
+        case .fileImported:        return "doc.badge.plus"
+        case .cloudDownloadComplete: return "icloud.and.arrow.down.fill"
+        case .importError:         return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var duration: TimeInterval {
+        switch self {
+        case .importError: return 5.0
+        default:           return 3.5
+        }
+    }
+}
+
+public extension PVToastManager {
+    /// Post a typed app-level event from any context — no `await` needed.
+    nonisolated static func post(_ event: PVToastEvent) {
+        post(event.message, type: event.type, duration: event.duration, icon: event.icon)
+    }
+}

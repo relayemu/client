@@ -1,0 +1,5 @@
+module PVmGBABridge {
+    header "../mGBAGameCoreBridge.h"
+    header "../mGBAGameCoreBridge+Achievements.h"
+    export *
+}

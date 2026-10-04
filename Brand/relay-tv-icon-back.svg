@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 240" width="400" height="240">
+  <!--
+    tvOS layered icon, back layer: the Ink ground alone. All three layers share
+    the 400 × 240 (5 : 3) plate; the parallax effect scales and shifts them, so
+    everything that must stay whole lives inside the central 90 % (the platform's
+    safe zone) and the ground runs edge to edge so no layer edge ever shows.
+  -->
+  <defs>
+    <radialGradient id="ground" cx="0.24" cy="0.14" r="1.1">
+      <stop offset="0" stop-color="#28241F"/>
+      <stop offset="0.62" stop-color="#1D1A18"/>
+      <stop offset="1" stop-color="#131110"/>
+    </radialGradient>
+  </defs>
+  <rect width="400" height="240" fill="url(#ground)"/>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <!-- Browser tab and touch icon: the app icon, squared off for small sizes. -->
+  <rect width="100" height="100" rx="22" fill="#1D1A18"/>
+  <g transform="translate(50 52) scale(0.72) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="#F5F2EE"/>
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="#FF6A45"/>
+  </g>
+</svg>

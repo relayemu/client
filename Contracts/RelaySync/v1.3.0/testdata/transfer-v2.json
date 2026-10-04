@@ -1,0 +1,35 @@
+{
+  "channel": "relay-transfer/2",
+  "hello": {
+    "type": "hello",
+    "version": 2,
+    "files": [
+      {
+        "id": "f0",
+        "name": "Fixture0.bin",
+        "size": 3,
+        "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      },
+      {
+        "id": "f1",
+        "name": "Fixture1.bin",
+        "size": 6,
+        "sha256": "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92"
+      }
+    ]
+  },
+  "framesHex": [
+    "000000006162",
+    "00000001313233",
+    "0000000063",
+    "00000001343536"
+  ],
+  "payloadsHex": [
+    "616263",
+    "313233343536"
+  ],
+  "endIDs": [
+    "f0",
+    "f1"
+  ]
+}

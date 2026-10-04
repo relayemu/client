@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Relay app icon, default (Any Appearance). Ink ground, the Baton at 62% of the width. -->
+  <defs>
+    <radialGradient id="ground" cx="0.24" cy="0.18" r="1.05">
+      <stop offset="0" stop-color="#26221F"/>
+      <stop offset="0.62" stop-color="#1D1A18"/>
+      <stop offset="1" stop-color="#141210"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#ground)"/>
+  <g transform="translate(512 532) scale(7.016) rotate(-45)">
+    <rect x="-46" y="-18" width="44" height="14" rx="7" fill="#F5F2EE"/>
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="#FF6A45"/>
+  </g>
+</svg>

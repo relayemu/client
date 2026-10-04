@@ -1,0 +1,18 @@
+{
+  "operations": [
+    {
+      "operationId": "10000000-0000-4000-8000-000000000010",
+      "schema": 1,
+      "kind": "game",
+      "action": "upsert",
+      "object": {
+        "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "systemID": "gba",
+        "title": "Example Game",
+        "isFavorite": false,
+        "addedAt": 1788520000000,
+        "updatedAt": 1788520000000
+      }
+    }
+  ]
+}

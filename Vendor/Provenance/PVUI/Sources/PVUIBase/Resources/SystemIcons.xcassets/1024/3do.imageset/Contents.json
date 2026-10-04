@@ -1,0 +1,16 @@
+{
+  "images" : [
+    {
+      "filename" : "The 3DO Company - 3DO.svg",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  },
+  "properties" : {
+    "preserves-vector-representation" : true,
+    "template-rendering-intent" : "template"
+  }
+}

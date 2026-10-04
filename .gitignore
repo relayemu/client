@@ -1,0 +1,15 @@
+build/
+test-artefacts/
+.build/
+.swiftpm/
+**/Artifacts/
+**/xcuserdata/
+*.xcuserstate
+.DS_Store
+.env
+.env.*
+*.p12
+*.p8
+*.mobileprovision
+__pycache__/
+*.pyc

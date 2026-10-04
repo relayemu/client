@@ -1,0 +1,409 @@
+// swift-tools-version: 6.0
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import PackageDescription
+
+let USE_DISPLAY_LINK = false
+
+let package = Package(
+    name: "PVUI",
+    defaultLocalization: "en",
+    platforms: [
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v9),
+        .macOS(.v14),
+        .macCatalyst(.v17),
+        .visionOS(.v1)
+    ],
+    products: [
+        // Products define the executables and libraries a package produces, making them visible to other packages.
+        .library(
+            name: "PVUI",
+            targets: ["PVUIKit", "PVSwiftUI"]),
+    ],
+    dependencies: [
+        .package(path: "../PVAppIntents"),
+        .package(path: "../PVLiveActivities"),
+        .package(path: "../PVAudio"),
+        .package(path: "../PVFeatureFlags"),
+        .package(path: "../PVNetplay"),
+        .package(path: "../PVHelp"),
+        .package(path: "../PVCoreAudio"),
+        .package(path: "../PVCoreBridge"),
+        .package(path: "../PVCoreLoader"),
+        .package(path: "../PVEmulatorCore"),
+        .package(path: "../PVArchiving"),
+        .package(path: "../PVLibrary"),
+        /// Direct dependency so `PVUIBase` can `import PVSystems` (`SystemIdentifier` cheat lookup helpers).
+        .package(path: "../PVPrimitives"),
+        .package(path: "../PVLogging"),
+        .package(path: "../PVPatreon"),
+        .package(path: "../PVSupport"),
+        .package(path: "../PVSettings"),
+        .package(path: "../PVShaders"),
+        .package(path: "../PVThemes"),
+        .package(path: "../PVWebServer"),
+        .package(path: "../PVOpticalDiscReader"),
+        .package(path: "../PVJIT"),
+        .package(path: "../PVCheevos"),
+        /// `RcheevosHash` (console-aware ROM hashing) lives in PVRcheevos and is used
+        /// by `PVEmulatorViewController+Achievements.swift` as the fallback when the
+        /// stored file MD5 doesn't match the RA database (CD-based systems).
+        .package(path: "../PVRcheevos"),
+        .package(path: "../External/Reachability.swift"),
+        //.package(url: "https://github.com/ashleymills/Reachability.swift.git", from: "5.2.4"),
+        .package(url: "https://github.com/RxSwiftCommunity/RxDataSources.git", from: "5.0.2"),
+        .package(url: "https://github.com/jdg/MBProgressHUD.git", from: "1.2.0"),
+//        .package(url: "https://github.com/pointfreeco/swift-dependencies", from: "1.4.0"),
+        /// https://github.com/DimaRU/BuildEnvironment
+        .package(url: "https://github.com/DimaRU/BuildEnvironment.git", from: "1.0.0"),
+//        .package(path: "../PackageBuildInfo")
+        /// Upstream DimaRU/PackageBuildInfo — vendored at ../External/PackageBuildInfo (Swift tool; git stderr discarded).
+//        .package(url: "https://github.com/JoeMatt/PackageBuildInfo", branch: "master"),
+        .package(path: "../External/PackageBuildInfo"),
+        /// Sentry crash reporting. Declared here so the `#if canImport(Sentry)` blocks in
+        /// `PVSwiftUI/App Delegate/Bootstrap/` compile against the real SDK in EVERY
+        /// configuration — previously the module was only visible in CI archive builds
+        /// (via the app target's package ref), letting broken code ship for weeks.
+        /// URL + version intentionally match Provenance.xcodeproj's XCRemoteSwiftPackageReference.
+        .package(url: "https://github.com/getsentry/sentry-cocoa", .upToNextMajor(from: "8.43.0")),
+        /// FreemiumKit
+        .package(url: "https://github.com/FlineDev/FreemiumKit.git", from: "1.19.0"),
+        /// SwiftUIKit
+        .package(url: "https://github.com/danielsaidi/SwiftUIKit.git", from: "5.0.0"),
+        /// SwiftUIX
+        /// https://github.com/SwiftUIX/SwiftUIX/wiki
+        .package(url: "https://github.com/SwiftUIX/SwiftUIX.git", from: "0.2.3"),
+        .package(url: "https://github.com/theappcapital/SiriusRating-iOS.git", from: "1.0.8"),
+        /// https://github.com/exyte/ScalingHeaderScrollView
+//        .package(url:"https://github.com/exyte/ScalingHeaderScrollView.git", from: "1.1.5"),
+
+        /// https://github.com/exyte/AnimatedGradient
+        .package(url: "https://github.com/exyte/AnimatedGradient.git", from: "1.0.0"),
+
+        /// https://github.com/exyte/FloatingButton
+        .package(url: "https://github.com/exyte/FloatingButton.git", from: "1.3.0"),
+
+        /// https://github.com/exyte/ActivityIndicatorView
+        .package(url: "https://github.com/exyte/ActivityIndicatorView.git", from: "1.1.1"),
+
+        /// https://github.com/exyte/PopupView
+//        .package(url: "https://github.com/exyte/PopupView.git", from: "3.1.4"),
+
+        /// https://github.com/DominikButz/SwipeCellSUI.git
+        .package(url: "https://github.com/DominikButz/SwipeCellSUI.git", from: "2.1.4"),
+
+        /// https://github.com/MrAsterisco/DateRangePicker
+        .package(url: "https://github.com/MrAsterisco/DateRangePicker", from: "1.0.2"),
+
+
+        /// https://swiftpackageindex.com/SvenTiigi/WhatsNewKit
+        .package(url: "https://github.com/SvenTiigi/WhatsNewKit.git", from: "2.2.1"),
+
+        /// https://swiftpackageindex.com/LiYanan2004/MarkdownView
+        .package(url: "https://github.com/LiYanan2004/MarkdownView.git", from: "1.7.0"),
+
+        // MARK: Snapshot testing (Milestone 3 — Screenshot Automation)
+        /// Prefire: generates snapshot tests from SwiftUI #Preview macros.
+        /// https://github.com/BarredEwe/Prefire
+        .package(url: "https://github.com/BarredEwe/Prefire", from: "2.1.0"),
+        /// swift-snapshot-testing: underlying snapshot diffing used by Prefire.
+        /// https://github.com/pointfreeco/swift-snapshot-testing
+        .package(url: "https://github.com/pointfreeco/swift-snapshot-testing.git", from: "1.17.0")
+    ],
+    targets: [
+
+        // MARK: Common - Base
+        /// The main target for the base framework.
+        /// This target is available on all platforms.
+        /// This target is the base for all other targets.
+        .target(
+            name: "PVUIBase",
+            dependencies: [
+                "ActivityIndicatorView",
+                "AnimatedGradient",
+                "FloatingButton",
+                "FreemiumKit",
+                "MarkdownView",
+                "PVCoreAudio",
+                "PVCoreBridge",
+                "PVCoreLoader",
+                "PVEmulatorCore",
+                "PVFeatureFlags",
+                "PVHelp",
+                "PVArchiving",
+                "PVLibrary",
+                .product(name: "PVMediaCache", package: "PVLibrary"),
+                .product(name: "PVPrimitives", package: "PVPrimitives"),
+                "PVLogging",
+                .product(name: "PVAppIntents", package: "PVAppIntents", condition: .when(platforms: [.iOS, .tvOS, .macOS, .macCatalyst, .visionOS])),
+                .product(name: "PVLibrarySnapshot", package: "PVAppIntents"),
+                .product(name: "PVLiveActivities", package: "PVLiveActivities", condition: .when(platforms: [.iOS])),
+                .product(name: "PVNetplay", package: "PVNetplay", condition: .when(platforms: [.iOS, .tvOS, .macOS, .macCatalyst, .visionOS])),
+                "PVSettings",
+                "PVSupport",
+                "PVShaders",
+                "PVThemes",
+                "PVUIObjC",
+                "PVWebServer",
+                .product(name: "PVWebServerObjC", package: "PVWebServer"),
+                "PVCheevos",
+                .product(name: "PVRcheevos", package: "PVRcheevos"),
+                .product(name: "PVJIT", package: "PVJIT", condition: .when(platforms: [.iOS, .tvOS])),
+                .product(name: "JITManager", package: "PVJIT", condition: .when(platforms: [.iOS, .tvOS])),
+                .product(name: "Reachability", package: "reachability.swift"),
+                .byNameItem(name: "DateRangePicker", condition: .when(platforms: [.iOS, .macCatalyst, .watchOS])),
+                .byNameItem(name: "MBProgressHUD", condition: .when(platforms: [.iOS, .macCatalyst, .tvOS, .watchOS])),
+                .byNameItem(name: "SwipeCellSUI", condition: .when(platforms: [.iOS, .macCatalyst, .watchOS])),
+                .byNameItem(name: "PVUI_AppKit", condition: .when(platforms: [.macOS])),
+                .byNameItem(name: "PVUI_IOS", condition: .when(platforms: [.iOS, .macCatalyst, .visionOS])),
+                .byNameItem(name: "PVUI_TV", condition: .when(platforms: [.tvOS])),
+//                .product(name: "Dependencies", package: "swift-dependencies")
+            ],
+            resources: [
+                .copy("Resources/Shaders/fsh"),
+                .copy("Resources/Shaders/GLES"),
+                .copy("Resources/Sounds"),
+                .process("Resources/SystemIcons.xcassets"),
+                .process("Resources/Assets.xcassets"),
+                .copy("Resources/PrivacyInfo.xcprivacy"),
+                .copy("Resources/catalog_seed.json"),
+                .copy("Resources/system-native-resolutions.json"),
+                .copy("Resources/DefaultSkins"),
+                .process("Resources/en.lproj"),
+                .process("Resources/Metal"),
+            ],
+            cSettings: [
+                .define("GL_SILENCE_DEPRECATION", to: "1"),
+                .define("GLES_SILENCE_DEPRECATION", to: "1"),
+                .define("CI_SILENCE_GL_DEPRECATION", to: "1")
+            ],
+            swiftSettings: [
+                .define("USE_OPENGL", .when(platforms: [.macCatalyst, .macOS])),
+                .define("USE_OPENGLES", .when(platforms: [.iOS, .tvOS, .visionOS])),
+                .define("USE_METAL", .when(platforms: [.macCatalyst, .macOS])),
+                .define("USE_EFFECT", .when(platforms: [.iOS, .tvOS, .visionOS, .macCatalyst])),
+                .define("GL_SILENCE_DEPRECATION"),
+                .define("GLES_SILENCE_DEPRECATION"),
+                .define("CI_SILENCE_GL_DEPRECATION")
+            ] +
+            (USE_DISPLAY_LINK ? [.define("USE_DISPLAY_LINK")] : []),
+            plugins: [
+                .plugin(name: "PackageBuildInfoPlugin", package: "PackageBuildInfo"),
+                .plugin(name: "BuildEnvPlugin", package: "BuildEnvironment")
+            ]
+        ),
+
+        .testTarget(
+            name: "PVUIBaseTests",
+            dependencies: [
+                "PVUIBase",
+                "PVCoreBridge",
+                "PVLogging",
+            ]
+        ),
+
+        // MARK: Common - UIKit
+        /// The main target for the UIKit framework.
+        /// This conditionally includes resources for each platform.
+        /// This target is only available on iOS, tvOS, visionOS, and macCatalyst.
+        .target(
+            name: "PVUIKit",
+            dependencies: [
+                "PVAudio",
+                "PVCoreAudio",
+                "PVUIBase",
+                "PVLogging",
+                "PVCoreBridge",
+                "PVEmulatorCore",
+                "PVSupport",
+                "PVShaders",
+                "PVLibrary",
+                "PVThemes",
+                "PVWebServer",
+                "MBProgressHUD",
+                "FreemiumKit",
+                "PVFeatureFlags",
+                "PVCheevos",
+                .product(name: "Reachability", package: "reachability.swift"),
+                "RxDataSources",
+//                .product(name: "Dependencies", package: "swift-dependencies")
+            ],
+            resources: [
+                .copy("Resources/PrivacyInfo.xcprivacy")
+            ],
+            cSettings: [
+                .define("GL_SILENCE_DEPRECATION", to: "1"),
+                .define("GLES_SILENCE_DEPRECATION", to: "1"),
+                .define("CI_SILENCE_GL_DEPRECATION", to: "1")
+            ],
+            swiftSettings: [
+                .define("USE_OPENGL", .when(platforms: [.macCatalyst, .macOS])),
+                .define("USE_OPENGLES", .when(platforms: [.iOS, .tvOS, .visionOS])),
+                .define("USE_METAL", .when(platforms: [.macCatalyst, .macOS])),
+                .define("USE_EFFECT", .when(platforms: [.iOS, .tvOS, .visionOS, .macCatalyst])),
+                .define("GL_SILENCE_DEPRECATION"),
+                .define("GLES_SILENCE_DEPRECATION"),
+                .define("CI_SILENCE_GL_DEPRECATION")
+            ]
+        ),
+
+        .testTarget(
+            name: "PVUIKitTests",
+            dependencies: [
+                "PVUIKit",
+            ]
+        ),
+
+        // MARK: Common - SwiftUI
+        /// A small amount of elements are shared between UIKit and SwiftUI
+        .target(
+            name: "PVSwiftUI",
+            dependencies: [
+                "PVUIBase",
+                "PVUIKit",
+                .product(name: "PVWebServerObjC", package: "PVWebServer"),
+                "PVLogging",
+                "PVCoreBridge",
+                "PVEmulatorCore",
+                "PVSettings",
+                "PVSupport",
+                "PVShaders",
+                "PVLibrary",
+                "PVThemes",
+                "PVHelp",
+                "MBProgressHUD",
+                "FreemiumKit",
+                "AnimatedGradient",
+                "FloatingButton",
+                "ActivityIndicatorView",
+                "PVFeatureFlags",
+                .product(name: "PVNetplay", package: "PVNetplay", condition: .when(platforms: [.iOS, .tvOS, .macOS, .macCatalyst, .visionOS])),
+                "PVCheevos",
+                .product(name: "PVJIT", package: "PVJIT", condition: .when(platforms: [.iOS, .tvOS])),
+                .product(name: "JITManager", package: "PVJIT", condition: .when(platforms: [.iOS, .tvOS])),
+                .product(name: "WhatsNewKit", package: "whatsnewkit", condition: .when(platforms: [.iOS, .macCatalyst, .visionOS])),
+                .product(name: "SiriusRating", package: "siriusrating-ios", condition: .when(platforms: [.iOS])),
+                .byNameItem(name: "SwipeCellSUI", condition: .when(platforms: [.iOS, .macCatalyst, .watchOS])),
+                .byNameItem(name: "DateRangePicker", condition: .when(platforms: [.iOS, .macCatalyst, .watchOS])),
+                "PVOpticalDiscReader",
+                /// Same static `Sentry` product the app targets link — SPM dedupes it in the
+                /// unified workspace graph, so no duplicate linkage.
+                .product(name: "Sentry", package: "sentry-cocoa")
+            ],
+            resources: [
+                .copy("Resources/whats-new.json"),
+                .copy("Resources/roadmap.json"),
+                .process("Resources/en.lproj"),
+                .process("Resources/ar.lproj"),
+                .process("Resources/ko.lproj"),
+            ]
+        ),
+
+        .testTarget(
+            name: "PVSwiftUITests",
+            dependencies: [
+                "PVSwiftUI",
+            ]
+        ),
+
+        // MARK: Snapshot tests (Milestone 3)
+        // Prefire plugin scans #Preview macros in PVSwiftUI and generates
+        // PrefireTests.generated.swift at build time via xcodebuild/Xcode.
+        // Run baseline capture:
+        //   xcodebuild test -workspace Provenance.xcworkspace \
+        //     -scheme Provenance-Screenshots \
+        //     -destination "platform=iOS Simulator,name=iPhone 16 Pro" \
+        //     -only-testing PVSwiftUISnapshotTests \
+        //     -recordMode YES
+        .testTarget(
+            name: "PVSwiftUISnapshotTests",
+            dependencies: [
+                "PVSwiftUI",
+                .product(name: "Prefire", package: "Prefire"),
+                .product(name: "SnapshotTesting", package: "swift-snapshot-testing"),
+            ],
+            resources: [
+                // Baseline PNG snapshots are stored here; committed to track visual regressions.
+                .copy("__Snapshots__")
+            ],
+            plugins: [
+                .plugin(name: "PrefireTestsPlugin", package: "Prefire")
+            ]
+        ),
+
+        // MARK: iOS
+        /// Allows for conditional use of resources that can only be included with iOS
+        /// compatible targets.
+        /// This target is only available on iOS.
+        .target(
+            name: "PVUI_IOS",
+            dependencies: [
+//                .product(name: "Dependencies", package: "swift-dependencies")
+            ],
+            resources: [
+                .process("Resources/StoryBoards/"),
+                .process("Resources/XIBs/")
+            ]
+        ),
+
+        .testTarget(
+            name: "PVUI_IOSTests",
+            dependencies: [
+                "PVUI_IOS"
+            ]
+        ),
+
+        // MARK: TVOS
+        /// Allows for conditional use of resources that can only be included with tvO
+        /// compatible targets.
+        /// This target is only available on tvOS.
+        .target(
+            name: "PVUI_TV",
+            dependencies: [
+                "PVLibrary",
+                "PVSupport",
+                "RxDataSources"
+//                .product(name: "Dependencies", package: "swift-dependencies")
+            ],
+            resources: [
+                .process("Resources/StoryBoards/"),
+                .process("Resources/XIBs"),
+                .process("Resources/TVAssets.xcassets"),
+                .process("Resources/LaunchImageTV.png")
+            ]
+        ),
+
+        .testTarget(
+            name: "PVUI_TVTests",
+            dependencies: [
+                "PVUI_TV"
+            ]
+        ),
+
+        // MARK: AppKit
+        /// Allows for conditional use of resources that can only be included with iOS
+        /// compatible targets.
+        /// This target is only available on iOS.
+        .target(
+            name: "PVUI_AppKit",
+            dependencies: [
+//                .product(name: "Dependencies", package: "swift-dependencies")
+            ]
+        ),
+
+        .testTarget(
+            name: "PVUI_AppKitTests",
+            dependencies: [
+                "PVUI_AppKit"
+            ]
+        ),
+
+        // MARK: ObjC for very basic hack to GLES
+        .target(
+            name: "PVUIObjC"
+        ),
+    ],
+    swiftLanguageModes: [.v5]
+)

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 240" width="400" height="240">
+  <!-- tvOS layered icon, front layer: the trail capsule, always Ember. Same transform as the lead. -->
+  <g transform="translate(200 122) scale(2.0) rotate(-45)">
+    <rect x="2" y="4" width="44" height="14" rx="7" fill="#FF6A45"/>
+  </g>
+</svg>
